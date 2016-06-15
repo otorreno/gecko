@@ -10,7 +10,7 @@ if [ $# != 6 ]; then
    exit -1
 fi
 
-{
+#{
 
 dirNameX=$(readlink -f $1 | xargs dirname)
 seqXName=$(basename "$1")
@@ -52,19 +52,19 @@ cd intermediateFiles/${seqXName}-${seqYName}
 echo "${BINDIR}/reverseComplement ${seqYName}.${extensionX} ${seqYName}-revercomp.${extensionY}"
 ${BINDIR}/reverseComplement ${seqYName}.${extensionX} ${seqYName}-revercomp.${extensionY}
 
-if [[ ! -f ../dictionaries/${seqXName}.d2hP ]];	then
-	echo "${BINDIR}/dictionary.sh ${seqXName}.${extensionX} &"
-	${BINDIR}/dictionary.sh ${seqXName}.${extensionX} &		
+if [[ ! -f ../dictionaries/${seqXName}.dict ]];	then
+	echo "${BINDIR}/dictionary.sh ${seqXName}.${extensionX} 2 &"
+	${BINDIR}/dictionary.sh ${seqXName}.${extensionX} 2 &		
 fi
 		
-if [[ ! -f ../dictionaries/${seqYName}.d2hP ]];	then
-	echo "${BINDIR}/dictionary.sh ${seqYName}.${extensionY} &"
-	${BINDIR}/dictionary.sh ${seqYName}.${extensionY} &
+if [[ ! -f ../dictionaries/${seqYName}.dict ]];	then
+	echo "${BINDIR}/dictionary.sh ${seqYName}.${extensionY} 2 &"
+	${BINDIR}/dictionary.sh ${seqYName}.${extensionY} 2 &
 fi
 		
-if [[ ! -f ../dictionaries/${seqYName}-revercomp.d2hP ]];	then
-	echo "${BINDIR}/dictionary.sh ${seqYName}-revercomp.${extensionY} &"
-	${BINDIR}/dictionary.sh ${seqYName}-revercomp.${extensionY} &
+if [[ ! -f ../dictionaries/${seqYName}-revercomp.dict ]];	then
+	echo "${BINDIR}/dictionary.sh ${seqYName}-revercomp.${extensionY} 2 &"
+	${BINDIR}/dictionary.sh ${seqYName}-revercomp.${extensionY} 2 &
 fi		
 
 echo "Waiting for the calculation of the dictionaries"
@@ -76,22 +76,16 @@ do
 done
 
 
-mv ${seqXName}.d2hP ../dictionaries/
-mv ${seqXName}.d2hW ../dictionaries/
-mv ${seqYName}.d2hP ../dictionaries/
-mv ${seqYName}.d2hW ../dictionaries/
-mv ${seqYName}-revercomp.d2hP ../dictionaries/
-mv ${seqYName}-revercomp.d2hW ../dictionaries/
+mv ${seqXName}.dict ../dictionaries/
+mv ${seqYName}.dict ../dictionaries/
+mv ${seqYName}-revercomp.dict ../dictionaries/
 		
 # Hacemos enlace simbolico
-ln -s ../dictionaries/${seqXName}.d2hP .
-ln -s ../dictionaries/${seqXName}.d2hW .
+ln -s ../dictionaries/${seqXName}.dict .
 
-ln -s ../dictionaries/${seqYName}.d2hP .
-ln -s ../dictionaries/${seqYName}.d2hW .
+ln -s ../dictionaries/${seqYName}.dict .
 
-ln -s ../dictionaries/${seqYName}-revercomp.d2hP .
-ln -s ../dictionaries/${seqYName}-revercomp.d2hW .
+ln -s ../dictionaries/${seqYName}-revercomp.dict .
 
 echo "${BINDIR}/comparison.sh ${seqXName}.${extensionX} ${seqYName}.${extensionY} ${length} ${similarity} ${WL} ${fixedL} f &"
 ${BINDIR}/comparison.sh ${seqXName}.${extensionX} ${seqYName}.${extensionY} ${length} ${similarity} ${WL} ${fixedL} f &
@@ -148,4 +142,4 @@ mv ${seqXName}-${seqYName}.csv ../../results
 cd ..
 #rm -rf ${seqXName}-${seqYName}
 
-} &> /dev/null
+#} &> /dev/null

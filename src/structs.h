@@ -115,4 +115,29 @@ struct Sequence{
     char datos[MAXLS];
 };
 
+//Structs for the binaryTree program to calculate the dictionary
+typedef struct l {
+        //Word ocurrence
+        location loc;
+        //Pointer to the next node in the list
+        struct l *next;
+} list_node;
+
+typedef struct n {
+        //Word without compression to speed up the process
+        char key_value[33];
+        //Pointer to the left node in the tree
+        struct n *left;
+        //Pointer to the right node in the tree
+        struct n *right;
+        //Number of ocurrences of the given word
+        int64_t ocurrences;
+        //Pointer to the word list of ocurrences
+        list_node *positions;
+        //Pointer to the last node in the list
+        //to speed up the insertion
+        list_node *last;
+} node;
+
+
 #endif

@@ -1,12 +1,11 @@
 #!/bin/bash 
 
-FL=1000   # frequency limit
 BINDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-if [ $# != 1 ]; then
+if [ $# != 2 ]; then
    echo " ==== ERROR ... you called this script inappropriately."
    echo ""
-   echo "   usage:  $0 seqXName.fasta"
+   echo "   usage:  $0 seqXName.fasta prefixSize(to split the work in the binary tree)"
    echo ""
    exit -1
 fi
@@ -15,13 +14,9 @@ seqName=$(basename "$1")
 extension="${seqName##*.}"
 seqName="${seqName%.*}"
 
-# find words and order
-echo "${BINDIR}/words $1 ${seqName}.words.unsort"
-${BINDIR}/words $1 ${seqName}.words.unsort
-echo "${BINDIR}/sortWords 10000000 32 ${seqName}.words.unsort ${seqName}.words.sort"
-${BINDIR}/sortWords 10000000 32 ${seqName}.words.unsort ${seqName}.words.sort
+WL=32
+prefixSize=$2
 
-# Create hash table in disk
-echo "${BINDIR}/w2hd ${seqName}.words.sort ${seqName}"
-${BINDIR}/w2hd ${seqName}.words.sort ${seqName}
-
+# create the dictionary
+echo "${BINDIR}/dictionary ${seqName}.${extension} 32 ${prefixSize} ${seqName}"
+${BINDIR}/dictionary ${seqName}.${extension} 32 ${prefixSize} ${seqName}

@@ -1,20 +1,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <inttypes.h>
+#include <ctype.h>
+
 #include "structs.h"
+#include "dictionaryFunctions.h"
 #include "commonFunctions.h"
 
 int seq2word(char* buf, int wsize, word* w) {
 	int i;
 	int b = 6;
+
 	memset(w, 0, sizeof(word));
 
 	for (i = 0; i < wsize; i++) {
-		if (buf[i] >= 4)
-			return -1;
-		w->b[i / 4] |= buf[i] << b;
+		w->b[i / 4] |= letterToIndex(buf[i]) << b;
 		b -= 2;
 		if (b < 0)
 			b = 6;
@@ -41,14 +42,12 @@ int letterToIndex(char c) {
 		return 2;
 	case 'T':
 		return 3;
-	case '>':
-		return 4;
 	default:
-		return 9;
+		return -1;
 	}
 }
 
-int loadSequence(char *fileName, char *seq, uint64_t *Tot) {
+void loadSequence(char *fileName, char *seq, uint64_t *Tot) {
 	FILE *fIn;
 	char c;
 
@@ -60,16 +59,16 @@ int loadSequence(char *fileName, char *seq, uint64_t *Tot) {
 	skipIDLine(fIn);
 
 	// Load Sequence into memory
-	c = fgetc(fIn);
+	c = toupper(fgetc(fIn));
 	while (!feof(fIn)) {
 		//Check if is a letter
-		if (!isupper(c)) {
+		if (c < 65 || c > 90) {
 			/*
 			 * If not is a start of a sequence,
 			 * then read a new char and continue
 			 */
 			if (c != '>') {
-				c = fgetc(fIn);
+				c = toupper(fgetc(fIn));
 				continue;
 			}
 		}
@@ -83,28 +82,15 @@ int loadSequence(char *fileName, char *seq, uint64_t *Tot) {
 		}
 
 		(*Tot)++;
-		c = fgetc(fIn);
+		c = toupper(fgetc(fIn));
 	}
 
 	fclose(fIn);
-	return 0;
 }
 
-int wordcmp(unsigned char *w1, unsigned char *w2, int n) {
-
-	int i = 0, limit;
-
-	if(n%4 != 0){
-		w1[n/4] = w1[n/4] >> (2*(3-((n-1)%4)));
-		w1[n/4] = w1[n/4] << (2*(3-((n-1)%4)));
-		w2[n/4] = w2[n/4] >> (2*(3-((n-1)%4)));
-		w2[n/4] = w2[n/4] << (2*(3-((n-1)%4)));
-		limit=(n/4)+1;
-	} else {
-		limit = n/4;
-	}
-
-	for (i=0;i<limit;i++) {
+int wordcmp(unsigned char *w1, unsigned char*w2, int n) {
+	int i;
+	for (i=0;i<n;i++) {
 		if (w1[i]<w2[i]) return -1;
 		if (w1[i]>w2[i]) return +1;
 	}
@@ -132,5 +118,79 @@ void showWord(word* w, char *ws) {
 		c = c << 6;
 		c = c >> 6;
 		ws[4*i+3] = Alf[(int) c];
+	}
+}
+
+void destroy_tree(node **leaf) {
+	if (*leaf != NULL) {
+		destroy_tree(&(*leaf)->left);
+		destroy_tree(&(*leaf)->right);
+		while ((*leaf)->positions != NULL) {
+			(*leaf)->positions = (*leaf)->positions->next;
+		}
+		(*leaf)->last = NULL;
+		(*leaf) = NULL;
+	}
+}
+
+int insert(char *key, int wsize, location loc, node **leaf, node *nodePool,
+		int *actualNodes, list_node *locationPool, int *actualLocations) {
+	if (*leaf == NULL) {
+		*leaf = &nodePool[(*actualNodes)++];
+		memcpy((*leaf)->key_value, key, wsize);
+		//initialize the children to null
+		(*leaf)->left = NULL;
+		(*leaf)->right = NULL;
+		(*leaf)->ocurrences = 1;
+		//Insert the position in the list
+		(*leaf)->positions = (*leaf)->last =
+				&locationPool[(*actualLocations)++];
+		(*leaf)->positions->next = (*leaf)->last->next = NULL;
+		memcpy(&(*leaf)->last->loc, &loc, sizeof(location));
+
+		//Returning 1 to add it to the var controlling the number of words in the tree
+		return 1;
+	}
+	int cmp = strncmp(key, (*leaf)->key_value, wsize);
+	if (cmp < 0) {
+		return insert(key, wsize, loc, &(*leaf)->left, nodePool, actualNodes,
+				locationPool, actualLocations);
+	} else if (cmp > 0) {
+		return insert(key, wsize, loc, &(*leaf)->right, nodePool, actualNodes,
+				locationPool, actualLocations);
+	} else {
+		//The node is already in the tree, just add the location
+		(*leaf)->ocurrences++;
+		(*leaf)->last->next = &locationPool[(*actualLocations)++];
+		(*leaf)->last = (*leaf)->last->next;
+		(*leaf)->last->next = NULL;
+		memcpy(&(*leaf)->last->loc, &loc, sizeof(location));
+
+		//Returning 0 because the word is already in the tree
+		return 0;
+	}
+
+	return -1;
+}
+
+void printRoot(node *leaf, FILE* fOut) {
+	hashentry he;
+
+	seq2word(leaf->key_value, 33, &he.w);
+	he.num = leaf->ocurrences;
+	fwrite(&he, sizeof(hashentry), 1, fOut);
+	list_node *aux = leaf->positions;
+	while (aux != NULL) {
+		fwrite(&aux->loc, sizeof(location), 1, fOut);
+		aux = aux->next;
+	}
+
+}
+
+void write(node *leaf, FILE* fOut) {
+	if (leaf != NULL) {
+		write(leaf->left, fOut);
+		printRoot(leaf, fOut);
+		write(leaf->right, fOut);
 	}
 }

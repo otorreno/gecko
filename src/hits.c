@@ -38,21 +38,20 @@ int main(int ac, char** av) {
 	int hitsInBuf = 0;
 	int i, j;
 	int comp;
-	int firstMatch = 0, endMatch = 0;
-	uint64_t freqThr;
+	int freqThr;
 	uint64_t nHits = 0, wordMatches = 0;
 	int wSize;
 	int stepX, stepY;
-	long offsetWordBefore, offsetWordAfter, offsetLocationBefore, offsetLocationAfter;
-	FILE *fX1, *fX2, *fY1, *fY2, *fOut;
+	FILE *fX, *fY, *fOut;
 
 	location *posX = NULL, *posY = NULL;
 	hashentry heX, heY;
 	hit *hBuf;
 
 	if (ac != 6)
-		terror("USE: hits prefixNameX prefixNameY  Outfile FreqThre PrefixSize");
-	freqThr = (uint64_t) atoi(av[4]);
+		terror(
+				"USE: hits prefixNameX prefixNameY  Outfile FreqThre PrefixSize");
+	freqThr = atoi(av[4]);
 	wSize = atoi(av[5]);
 
 	// I-O buffer
@@ -64,74 +63,49 @@ int main(int ac, char** av) {
 	if ((posY = (location*) calloc(MAXBUF, sizeof(location))) == NULL)
 		terror("memory for posY buffer.. using MAXBUF=10MB");
 
-	// Sequence X files
-	sprintf(fname, "%s.d2hW", av[1]);
-	if ((fX1 = fopen(fname, "rb")) == NULL)
-		terror("opening seqX.d2hW file");
-	sprintf(fname, "%s.d2hP", av[1]);
-	if ((fX2 = fopen(fname, "rb")) == NULL)
-		terror("opening seqX.d2hP file");
+	// Sequence X file
+	sprintf(fname, "%s.dict", av[1]);
+	if ((fX = fopen(fname, "rb")) == NULL) {
+		terror("opening seqX.dict file");
+	}
 
-	// Sequence Y files
-	sprintf(fname, "%s.d2hW", av[2]);
-	if ((fY1 = fopen(fname, "rb")) == NULL)
-		terror("opening seqY.d2hW file");
-	sprintf(fname, "%s.d2hP", av[2]);
-	if ((fY2 = fopen(fname, "rb")) == NULL)
-		terror("opening seqY.d2hP file");
+	// Sequence Y file
+	sprintf(fname, "%s.dict", av[2]);
+	if ((fY = fopen(fname, "rb")) == NULL) {
+		terror("opening seqX.dict file");
+	}
 
 	// OUT file
 	if ((fOut = fopen(av[3], "wb")) == NULL)
 		terror("opening OUT file");
 
 	// kick-off
-	if (readHashEntry(&heX, fX1, freqThr) == -1)
+	if (readHashEntry(&heX, fX, freqThr) == -1)
 		terror("no hash (1)");
-	if (readHashEntry(&heY, fY1, freqThr) == -1)
+	if (readHashEntry(&heY, fY, freqThr) == -1)
 		terror("no hash (2)");
 
-	while (!feof(fX1) && !feof(fY1)) {
+	while (!feof(fX) && !feof(fY)) {
 
 		comp = wordcmp(&heX.w.b[0], &heY.w.b[0], wSize);
 		if (comp < 0) {
-			readHashEntry(&heX, fX1, freqThr);
-			//Save position of first missmatch after matches and rewind
-			if(firstMatch){
-				offsetWordAfter = ftell(fY1) - sizeof(hashentry);
-				offsetLocationAfter = ftell(fY2);
-				fseek(fY1, offsetWordBefore, SEEK_SET);
-				readHashEntry(&heY, fY1, freqThr);
-				fseek(fY2, offsetLocationBefore, SEEK_SET);
-				firstMatch = 0;
-				endMatch = 1;
-			}
+			if (fread(posX, sizeof(location), heX.num, fX) != heX.num)
+				terror("Error reading word occurrences in seqX");
+			readHashEntry(&heX, fX, freqThr);
 			continue;
 		}
 		if (comp > 0) {
-			//No more matches, go to the next word
-			if(endMatch){
-				fseek(fY1, offsetWordAfter, SEEK_SET);
-				fseek(fY2, offsetLocationAfter, SEEK_SET);
-				endMatch = 0;
-			}
-			readHashEntry(&heY, fY1, freqThr);
+			if (fread(posY, sizeof(location), heY.num, fY) != heY.num)
+				terror("Error reading word occurrences in seqY");
+			readHashEntry(&heY, fY, freqThr);
 			continue;
 		}
-
 		wordMatches++;
 
 		// Load word position for seqX
-		if(!firstMatch)loadWordOcurrences(heX, &posX, &fX2);
-
-		// Saving the offset of the first match
-		if(wSize < 32 && !firstMatch){
-			offsetWordBefore = ftell(fY1) - sizeof(hashentry);
-			offsetLocationBefore = ftell(fY2);
-			firstMatch = 1;
-		}
-
+		loadWordOcurrences(heX, &posX, &fX);
 		// Load word position for seqY
-		loadWordOcurrences(heY, &posY, &fY2);
+		loadWordOcurrences(heY, &posY, &fY);
 
 		// Hits-----------------------
 		if (heX.num > MaxREP)
@@ -160,16 +134,14 @@ int main(int ac, char** av) {
 
 		nHits += ((heX.num / stepX) * (heY.num / stepY));
 
-		if(!firstMatch)readHashEntry(&heX, fX1, freqThr);
-		readHashEntry(&heY, fY1, freqThr);
+		readHashEntry(&heX, fX, freqThr);
+		readHashEntry(&heY, fY, freqThr);
 
 	}
 
 	//Closing dictionary files
-	fclose(fX1);
-	fclose(fY1);
-	fclose(fX2);
-	fclose(fY2);
+	fclose(fX);
+	fclose(fY);
 
 	//Checking if there is something still at the buffer
 	if (hitsInBuf != 0) {

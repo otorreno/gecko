@@ -23,7 +23,7 @@ int letterToIndex(char c);
  * Function to load the sequence.
  * The code was present inside words.c program
  */
-int loadSequence(char *fileName, char *seq, uint64_t *Tot);
+void loadSequence(char *fileName, char *seq, uint64_t *Tot);
 
 /**
  * Function to print in stdout the given compressed word
@@ -36,5 +36,21 @@ void showWord(word* w, char *ws);
  * than and -1 otherwise
  */
 int wordcmp(unsigned char *w1, unsigned char*w2, int n);
+
+/**
+ * Function to destroy the binary tree
+ */
+void destroy_tree(node **leaf);
+
+/**
+ * Insert the given word 'key' in the binary tree
+ */
+int insert(char *key, int wsize, location loc, node **leaf, node *nodePool, int *actualNodes, list_node *locationPool, int *actualLocations);
+
+/**
+ * Write the binary tree in order (left,
+ * root, right)
+ */
+void write(node *leaf, FILE* fOut);
 
 #endif /* DICTIONARY_FUNCTIONS_H */

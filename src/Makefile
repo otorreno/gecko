@@ -5,8 +5,6 @@ BIN=../bin
 
 all: reverseComplement words sortWords w2hd wordsStat hits sortHits filterHits FragHits combineFrags hitsStat hdStat fragStat getInfoCSB
 
-png: af2pngrev aMf2pngrev
-
 hits: hits.c
 	$(CC) $(CFLAGS) hits.c comparisonFunctions.c dictionaryFunctions.c commonFunctions.c -o $(BIN)/hits
 
@@ -31,12 +29,6 @@ hdStat: hdStat.c
 fragStat: fragStat.c
 	$(CC) $(CFLAGS) fragStat.c comparisonFunctions.c commonFunctions.c -o $(BIN)/fragStat
 	
-af2pngrev: af2pngrev.cpp
-	$(CXX) $(CFLAGS) -Wno-write-strings af2pngrev.cpp commonFunctions.c comparisonFunctions.c -I/usr/include/freetype2  -L/usr/local/lib -lpngwriter -lz -lm -lfreetype -o $(BIN)/af2pngrev -lpng 
-
-aMf2pngrev: aMf2pngrev.cpp
-	$(CXX) $(CFLAGS) -Wno-write-strings aMf2pngrev.cpp commonFunctions.c comparisonFunctions.c -I/usr/include/freetype2  -L/usr/local/lib -lpngwriter -lz -lm -lfreetype -o $(BIN)/aMf2pngrev -lpng 
-
 reverseComplement: reverseComplement.c
 	$(CC) $(CFLAGS) reverseComplement.c commonFunctions.c -o $(BIN)/reverseComplement
 
@@ -52,13 +44,10 @@ w2hd: w2hd.c
 wordsStat: wordsStat.c
 	$(CC) $(CFLAGS) wordsStat.c dictionaryFunctions.c commonFunctions.c -o $(BIN)/wordsStat
 
-sortFragsBySeqX: sortFragsBySeqX.c
-	$(CC) $(CFLAGS) -D'BaseType=struct FragFile' sortFragsBySeqX.c commonFunctions.c quicksort.c comparisonFunctions.c -lpthread -o $(BIN)/sortFragsBySeqX
-
 getInfoCSB:
 	$(CC) $(CFLAGS) getInfoCSB.c fragmentv2.c commonFunctions.c comparisonFunctions.c -lm -o $(BIN)/getInfo
 
 clean:
 	rm -rf $(BIN)/getInfo
 	rm -rf $(BIN)/reverseComplement $(BIN)/words $(BIN)/sortWords $(BIN)/w2hd $(BIN)/wordsStat
-	rm -rf $(BIN)/hits $(BIN)/sortHits $(BIN)/filterHits $(BIN)/FragHits $(BIN)/combineFrags $(BIN)/hitsStat $(BIN)/fragStat $(BIN)/hdStat $(BIN)/af2pngrev $(BIN)/aMf2pngrev
+	rm -rf $(BIN)/hits $(BIN)/sortHits $(BIN)/filterHits $(BIN)/FragHits $(BIN)/combineFrags $(BIN)/hitsStat $(BIN)/fragStat $(BIN)/hdStat

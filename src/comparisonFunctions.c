@@ -13,6 +13,9 @@ int readHashEntry(hashentry *h, FILE *f, uint64_t freqThr) {
 		if(fread(h, sizeof(hashentry), 1, f)!=1){
 			if(ferror(f))terror("Error reading hash entry from the file");
 		}
+		if(h->num > freqThr){
+			fseek(f, h->num, SEEK_CUR);
+		}
 	} while (!feof(f) && h->num > freqThr);
 
 	if (feof(f))

@@ -38,10 +38,12 @@ int main(int ac, char** av) {
 	int hitsInBuf = 0;
 	int i, j;
 	int comp;
-	int freqThr;
+	int firstMatch = 0, endMatch = 0;
+	uint64_t freqThr;
 	uint64_t nHits = 0, wordMatches = 0;
 	int wSize;
 	int stepX, stepY;
+	long offsetWordBefore, offsetWordAfter;
 	FILE *fX, *fY, *fOut;
 
 	location *posX = NULL, *posY = NULL;
@@ -86,24 +88,46 @@ int main(int ac, char** av) {
 		terror("no hash (2)");
 
 	while (!feof(fX) && !feof(fY)) {
-
 		comp = wordcmp(&heX.w.b[0], &heY.w.b[0], wSize);
 		if (comp < 0) {
-			if (fread(posX, sizeof(location), heX.num, fX) != heX.num)
-				terror("Error reading word occurrences in seqX");
+			if(!firstMatch)
+				if (fread(posX, sizeof(location), heX.num, fX) != heX.num)
+					terror("Error reading word occurrences in seqX");
 			readHashEntry(&heX, fX, freqThr);
+			//Save position of first missmatch after matches and rewind
+			if(firstMatch){
+				offsetWordAfter = ftell(fY) - sizeof(hashentry);
+				fseek(fY, offsetWordBefore, SEEK_SET);
+				readHashEntry(&heY, fY, freqThr);
+				firstMatch = 0;
+				endMatch = 1;
+			}
 			continue;
 		}
 		if (comp > 0) {
-			if (fread(posY, sizeof(location), heY.num, fY) != heY.num)
-				terror("Error reading word occurrences in seqY");
+			//No more matches, go to the next word
+			if(endMatch){
+				fseek(fY, offsetWordAfter, SEEK_SET);
+				endMatch = 0;
+			} else {
+				if (fread(posY, sizeof(location), heY.num, fY) != heY.num)
+					terror("Error reading word occurrences in seqY");
+			}
 			readHashEntry(&heY, fY, freqThr);
 			continue;
 		}
+
 		wordMatches++;
 
 		// Load word position for seqX
-		loadWordOcurrences(heX, &posX, &fX);
+		if(!firstMatch)loadWordOcurrences(heX, &posX, &fX);
+
+		// Saving the offset of the first match
+		if(wSize < 32 && !firstMatch){
+			offsetWordBefore = ftell(fY) - sizeof(hashentry);
+			firstMatch = 1;
+		}
+
 		// Load word position for seqY
 		loadWordOcurrences(heY, &posY, &fY);
 
@@ -134,7 +158,7 @@ int main(int ac, char** av) {
 
 		nHits += ((heX.num / stepX) * (heY.num / stepY));
 
-		readHashEntry(&heX, fX, freqThr);
+		if(!firstMatch)readHashEntry(&heX, fX, freqThr);
 		readHashEntry(&heY, fY, freqThr);
 
 	}

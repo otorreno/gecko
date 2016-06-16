@@ -88,9 +88,21 @@ void loadSequence(char *fileName, char *seq, uint64_t *Tot) {
 	fclose(fIn);
 }
 
-int wordcmp(unsigned char *w1, unsigned char*w2, int n) {
-	int i;
-	for (i=0;i<n;i++) {
+int wordcmp(unsigned char *w1, unsigned char *w2, int n) {
+
+	int i = 0, limit;
+
+	if(n%4 != 0){
+		w1[n/4] = w1[n/4] >> (2*(3-((n-1)%4)));
+		w1[n/4] = w1[n/4] << (2*(3-((n-1)%4)));
+		w2[n/4] = w2[n/4] >> (2*(3-((n-1)%4)));
+		w2[n/4] = w2[n/4] << (2*(3-((n-1)%4)));
+		limit=(n/4)+1;
+	} else {
+		limit = n/4;
+	}
+
+	for (i=0;i<limit;i++) {
 		if (w1[i]<w2[i]) return -1;
 		if (w1[i]>w2[i]) return +1;
 	}
@@ -178,6 +190,7 @@ void printRoot(node *leaf, FILE* fOut) {
 
 	seq2word(leaf->key_value, 33, &he.w);
 	he.num = leaf->ocurrences;
+	he.pos = ftell(fOut) + sizeof(hashentry);
 	fwrite(&he, sizeof(hashentry), 1, fOut);
 	list_node *aux = leaf->positions;
 	while (aux != NULL) {

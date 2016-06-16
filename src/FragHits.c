@@ -82,7 +82,7 @@ int HitsControl(char **av) {
 	//Initialize values
 	Lmin = atoi(av[5]);
 	SimTh = atoi(av[6]);
-	WL = POINT * atoi(av[7]);
+	WL = atoi(av[7]);
 	fixedL = atoi(av[8]);
 	strand = av[9][0];
 

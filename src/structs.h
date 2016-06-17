@@ -28,19 +28,6 @@ typedef struct {
 
 //Struct for w2hd program
 typedef struct {
-	//Word compressed in binary format
-    word w;
-    //Ocurrence position in the sequence
-    uint64_t pos;
-    //Number of ocurrences inside the
-    //sequence. This is used to know the
-    //number of locations stored in the
-    //positions file
-    uint64_t num;
-} hashentry;
-
-//Struct for w2hd program
-typedef struct {
     //Ocurrence position in the sequence
 	uint64_t pos;
     //For multiple sequence files this var
@@ -48,6 +35,20 @@ typedef struct {
     //word
     uint64_t seq;
 } location;
+
+//Struct for w2hd program
+typedef struct {
+    //Word compressed in binary format
+    word w;
+    //Number of ocurrences inside the
+    //sequence. This is used to know the
+    //number of locations stored in the
+    //positions file
+    uint64_t num;
+    //The ocurrences with position and
+    //sequence
+    location* locs;
+} hashentry;
 
 //Struct for hits, sortHits and filterHits programs
 typedef struct {

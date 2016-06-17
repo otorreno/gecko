@@ -1,6 +1,16 @@
 #ifndef DICTIONARY_FUNCTIONS_H
 #define DICTIONARY_FUNCTIONS_H
 
+#define WORD_SIZE 32
+//static int BITS_PER_BASE=2;
+#define BYTES_IN_WORD 8//(int)ceil(WORD_SIZE/8.*BITS_PER_BASE);
+#define SIZE_LOC 20
+
+typedef struct {
+    char* seqFile;
+    uint64_t* nEntries;
+} DictionaryArgs;
+
 /**
  * Compress the word stored in 'buf' using 2 bits per letter
  * The result will be at word 'w'
@@ -36,5 +46,11 @@ void showWord(word* w, char *ws);
  * than and -1 otherwise
  */
 int wordcmp(unsigned char *w1, unsigned char*w2, int n);
+
+/**
+ * Function to be executed by a pthread to calculate
+ * a sequence dictionary
+ */
+void *dictionary(void *a);
 
 #endif /* DICTIONARY_FUNCTIONS_H */

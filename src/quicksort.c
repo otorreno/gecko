@@ -5,11 +5,11 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include "structs.h"
 #include "commonFunctions.h"
 #include "quicksort.h"
 
-#define BUF_SIZE 1024
 #define SWAP(a,b,t) t=a; a=b; b=t;
 #define STRING_SIZE 1024
 
@@ -19,12 +19,6 @@ typedef struct {
 	int r;
 	int nth;
 } PQSortArgs;
-
-typedef struct {
-	char fin1[STRING_SIZE];
-	char fin2[STRING_SIZE];
-	char fout[STRING_SIZE];
-} PMergeArgs;
 
 void assertNotNull(void* p, char* msg){
 	if(p==NULL){
@@ -42,118 +36,6 @@ void assertIntGE(int a, int b, char* msg){
 	if(a<b){
 		terror(msg);
 	}
-}
-
-int bufMerge(BaseType* a1, int n1, BaseType* a2, int n2, BaseType* m){
-	int i1=0,i2=0;
-	int j=0;
-
-	while(i1<n1 && i2<n2){
-		if(GT(a1[i1],a2[i2])){
-			m[j]=a2[i2];
-			i2++;
-			j++;
-		}else{
-			m[j]=a1[i1];
-			i1++;
-			j++;
-		}
-	}
-
-	while(i1<n1){
-		m[j]=a1[i1];
-		i1++;
-		j++;
-	}
-
-	while(i2<n2){
-		m[j]=a2[i2];
-		i2++;
-		j++;
-	}
-
-	return j;
-}
-
-void *PMerge(void* a){
-	PMergeArgs* args = (PMergeArgs*)a;
-
-	FILE* fin1 = fopen(args->fin1,"rb");
-	assertNotNull(fin1,args->fin1);
-
-	FILE* fin2 = fopen(args->fin2,"rb");
-	assertNotNull(fin2,args->fin2);
-
-	FILE* fout = fopen(args->fout,"wb");
-	assertNotNull(fout,args->fout);
-
-	BaseType *a1 = (BaseType*)calloc(BUF_SIZE,sizeof(BaseType));
-	assertNotNull(a1,"calloc");
-
-	BaseType *a2 = (BaseType*)calloc(BUF_SIZE,sizeof(BaseType));
-	assertNotNull(a2,"calloc");
-
-	BaseType *m = (BaseType*)calloc(2*BUF_SIZE,sizeof(BaseType));
-	assertNotNull(m,"calloc");
-
-	int i,j,k;
-	int r1,r2,tmp;
-
-	r1=fread(a1,sizeof(BaseType),BUF_SIZE,fin1);
-	r2=fread(a2,sizeof(BaseType),BUF_SIZE,fin2);
-
-	i=j=k=0;
-	while(r1>0 && r2>0){
-		while(i<r1 && j<r2){
-			if(GT(a1[i],a2[j])){
-				m[k]=a2[j];
-				j++;
-			}else{
-				m[k]=a1[i];
-				i++;
-			}
-			k++;
-			if(k>=2*BUF_SIZE){
-				tmp=fwrite(m,sizeof(BaseType),k,fout);
-		    assertIntEQ(tmp,k,"fwrite");
-				k=0;
-			}
-		}
-
-		if(i>=r1){
-			r1=fread(a1,sizeof(BaseType),BUF_SIZE,fin1);
-			i=0;
-		}
-
-		if(j>=r2){
-			r2=fread(a2,sizeof(BaseType),BUF_SIZE,fin2);
-			j=0;
-		}
-	}
-
-	if(k>0){
-		tmp=fwrite(m,sizeof(BaseType),k,fout);
-		assertIntEQ(tmp,k,"fwrite");
-	}
-
-	if(i<r1){
-		tmp=fwrite(a1+i,sizeof(BaseType),r1-i,fout);
-		assertIntEQ(tmp,r1-i,"fwrite");
-	}
-
-	if(j<r2){
-		tmp=fwrite(a2+j,sizeof(BaseType),r2-j,fout);
-		assertIntEQ(tmp,r2-j,"fwrite");
-	}
-
-	assertIntEQ(fclose(fin1),0,"fclose");
-	assertIntEQ(fclose(fin2),0,"fclose");
-	assertIntEQ(fclose(fout),0,"fclose");
-
-	assertIntEQ(unlink(args->fin1),0,args->fin1);
-	assertIntEQ(unlink(args->fin2),0,args->fin2);
-
-	pthread_exit(NULL);
 }
 
 int partition(BaseType* a, int l, int r) {
@@ -270,122 +152,32 @@ unsigned long timestop(unsigned long start){
 	return (tv.tv_usec/1000) + (tv.tv_sec*1000) - start;
 }
 
-int psort(int maxsize, int nproc, char* ifile, char* ofile){
+int psort(int nproc, BaseType* a, uint64_t n){
+    fprintf(stdout, "en psort\n");
 	int tmp;
-	int max=maxsize;
 	int np=nproc;
 	if(np<1) np=1;
 
-	printf("Allocating %lu bytes.\n",max*sizeof(BaseType));
-	BaseType* a = (BaseType*)calloc(max,sizeof(BaseType));
-	assertNotNull(a,"calloc");
-
-	FILE* fin=fopen(ifile,"rt");
-	assertNotNull(fin,ifile);
-
 	printf("Stage1: Quicksorts\n");
 	unsigned long t = timestart();
-	//Read + Quicksort + Write:
-	char fname[strlen(ofile)+10];
-	int nfile=0;
 
-	do {
-		//Read:
-		// printf("Reading...\n");
-		int n=fread(a,sizeof(BaseType),max,fin);
-		if(n==0) break;
+    //Quicksort:
+    // printf("Quicksort %d\n",n);
+    pthread_t th;
+    PQSortArgs args;
 
-		//Quicksort:
-		// printf("Quicksort %d\n",n);
-		pthread_t th;
-		PQSortArgs args;
+    args.a=a;
+    args.l=0;
+    args.r=n-1;
+    args.nth=np;
+    tmp=pthread_create(&th,NULL,PQSort,(void*)(&args));
+    assertIntEQ(tmp,0,"pthread_create");
 
-		args.a=a;
-		args.l=0;
-		args.r=n-1;
-		args.nth=np;
-		tmp=pthread_create(&th,NULL,PQSort,(void*)(&args));
-		assertIntEQ(tmp,0,"pthread_create");
-
-		//Wait:
-		tmp=pthread_join(th,NULL);
-		assertIntEQ(tmp,0,"pthread_join");
-
-		//Write:
-		// printf("Writing...\n");
-		sprintf(fname,"%s.%06d",ofile,nfile);
-		FILE* fout=fopen(fname,"wb");
-		assertNotNull(fout,"fname");
-
-		tmp=fwrite(a,sizeof(BaseType),n,fout);
-		assertIntEQ(tmp,n,"fwrite");
-
-		tmp=fclose(fout);
-		assertIntEQ(tmp,0,"fclose");
-
-		nfile++;
-	}while(!feof(fin));
-
-	tmp=fclose(fin);
-	assertIntEQ(tmp,0,"fclose");
-
-	free(a);
-
-	tmp=unlink(ifile);
-	assertIntEQ(tmp,0,"unlink");
+    //Wait:
+    tmp=pthread_join(th,NULL);
+    assertIntEQ(tmp,0,"pthread_join");
 
 	printf("Stage1: %lu\n\n",timestop(t));
-
-	//Merge:
-	printf("Stage2: Merge\n");
-	t = timestart();
-
-	int curf=0;
-	int i=0;
-	int j=0;
-	pthread_t th[np];
-	PMergeArgs args[np];
-
-	curf=0;
-	while(nfile-curf>1){
-		j=0;
-		while(curf<nfile-1 && j<np){
-			sprintf(args[j].fin1,"%s.%06d",ofile,curf);
-			sprintf(args[j].fin2,"%s.%06d",ofile,curf+1);
-			sprintf(args[j].fout,"%s.%06d",ofile,nfile+j);
-
-			// printf("Merge(%d, %d) -> %d\n",curf,curf+1,nfile+j);
-			tmp=pthread_create(th+j,NULL,PMerge,(void*)(args+j));
-			assertIntEQ(tmp,0,"pthread_create");
-			curf+=2;
-			j++;
-		}
-
-		for(i=0;i<j;i++){
-			tmp=pthread_join(th[i],NULL);
-			assertIntEQ(tmp,0,"pthread_join");
-		}
-
-		nfile+=j;
-	}
-
-	printf("Stage2: %lu\n\n",timestop(t));
-
-	//Bin2Text:
-	printf("Stage3: Write output file\n");
-	t = timestart();
-
-	sprintf(fname,"%s.%06d",ofile,curf);
-	if(nfile>0){
-		tmp=rename(fname,ofile);
-		assertIntEQ(tmp,0,"rename");
-	} else {
-		FILE *fout=fopen(ofile, "wb");
-		assertNotNull(fout,"fopen");
-		fclose(fout);
-	}
-
-	printf("Stage3: %lu\n",timestop(t));
 
 	return 0;
 

@@ -1,12 +1,13 @@
 #ifndef QUICKSORT_H
 #define QUICKSORT_H
 
+#include <inttypes.h>
+
 /**
- * Function to order the ifile using a buffer size of
- * 'maxsize' and a thread number of 'nproc'. the result
- * will be written to ofile
+ * Function to order 'array' in memory with
+ * a thread number of 'nproc'. 'array' has 'n' elements
  */
-int psort(int maxsize, int nproc, char* ifile, char* ofile);
+int psort(int nproc, BaseType* array, uint64_t n);
 
 /**
  * Function to determine if object 1 is strictly greater than 2.

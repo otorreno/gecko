@@ -3,7 +3,7 @@ CXX=g++
 CFLAGS=-O3 -D_FILE_OFFSET_BITS=64 -Wall
 BIN=../bin
 
-all: reverseComplement words sortWords w2hd wordsStat hits sortHits filterHits FragHits combineFrags hitsStat hdStat fragStat getInfoCSB
+all: reverseComplement gecko hits sortHits filterHits FragHits combineFrags hitsStat hdStat fragStat getInfoCSB
 
 hits: hits.c
 	$(CC) $(CFLAGS) hits.c comparisonFunctions.c dictionaryFunctions.c commonFunctions.c -o $(BIN)/hits
@@ -32,22 +32,13 @@ fragStat: fragStat.c
 reverseComplement: reverseComplement.c
 	$(CC) $(CFLAGS) reverseComplement.c commonFunctions.c -o $(BIN)/reverseComplement
 
-words: words.c
-	$(CC) $(CFLAGS) words.c dictionaryFunctions.c commonFunctions.c -o $(BIN)/words
-
-sortWords: sortWords.c
-	$(CC) $(CFLAGS) -DBaseType=wentry sortWords.c dictionaryFunctions.c commonFunctions.c quicksort.c -lpthread -o $(BIN)/sortWords
-
-w2hd: w2hd.c
-	$(CC) $(CFLAGS) w2hd.c dictionaryFunctions.c commonFunctions.c -o $(BIN)/w2hd
-
-wordsStat: wordsStat.c
-	$(CC) $(CFLAGS) wordsStat.c dictionaryFunctions.c commonFunctions.c -o $(BIN)/wordsStat
+gecko: gecko.c
+	$(CC) $(CFLAGS) -DBaseType=wentry gecko.c dictionaryFunctions.c commonFunctions.c quicksort.c -lpthread -o $(BIN)/gecko
 
 getInfoCSB:
 	$(CC) $(CFLAGS) getInfoCSB.c fragmentv2.c commonFunctions.c comparisonFunctions.c -lm -o $(BIN)/getInfo
 
 clean:
 	rm -rf $(BIN)/getInfo
-	rm -rf $(BIN)/reverseComplement $(BIN)/words $(BIN)/sortWords $(BIN)/w2hd $(BIN)/wordsStat
+	rm -rf $(BIN)/reverseComplement $(BIN)/gecko
 	rm -rf $(BIN)/hits $(BIN)/sortHits $(BIN)/filterHits $(BIN)/FragHits $(BIN)/combineFrags $(BIN)/hitsStat $(BIN)/fragStat $(BIN)/hdStat

@@ -6,4 +6,8 @@
  */
 void terror(char *s);
 
+unsigned long timestart();
+
+unsigned long timestop(unsigned long start);
+
 #endif /* COMMON_FUNCTIONS_H */

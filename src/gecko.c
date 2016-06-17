@@ -6,6 +6,7 @@
 #include "structs.h"
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
+#include "comparisonFunctions.h"
 
 int main(int ac, char** av){
     if(ac!=3){
@@ -16,6 +17,8 @@ int main(int ac, char** av){
     hashentry *entriesX;
     uint64_t nEntriesY = 0;
     hashentry *entriesY;
+
+    uint64_t hitsInBuf;
 
     pthread_t thX,thY;
     DictionaryArgs argsX,argsY;
@@ -49,7 +52,13 @@ int main(int ac, char** av){
 //        fprintf(stdout, "\n");
 //	}
 
+    //Hits, SortHits and filterHits
+    hit *hBuf = hits(entriesX, nEntriesX, entriesY, nEntriesY, 32, &hitsInBuf);
     uint64_t i;
+
+//    for(i=0;i<hitsInBuf; i++) {
+//        fprintf(stdout, "d=%-7" PRId64 " pX=%-7" PRIu64 " pY=%-7" PRIu64 " seqX=%-7" PRIu64 " seqY=%-7" PRIu64 "\n", hBuf[i].diag, hBuf[i].posX, hBuf[i].posY, hBuf[i].seqX, hBuf[i].seqY);
+//    }
 	for(i=0;i<nEntriesX;i++){
         free(entriesX[i].locs);
     }
@@ -58,6 +67,10 @@ int main(int ac, char** av){
         free(entriesY[i].locs);
     }
     free(entriesY);
+
+
+
+    free(hBuf);
 
     return 0;
 }

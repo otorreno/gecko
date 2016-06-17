@@ -5,34 +5,13 @@
 #include <arpa/inet.h>
 #include "structs.h"
 #include "commonFunctions.h"
+#include "dictionaryFunctions.h"
+#include "quicksortHit.h"
 
 #define MAXBUF 10000000
+#define MaxREP 10000
 
-int readHashEntry(hashentry *h, FILE *f, uint64_t freqThr) {
-	do {
-		if(fread(h, sizeof(hashentry), 1, f)!=1){
-			if(ferror(f))terror("Error reading hash entry from the file");
-		}
-	} while (!feof(f) && h->num > freqThr);
-
-	if (feof(f))
-		return -1;
-
-	return h->num;
-}
-
-void loadWordOcurrences(hashentry he, location** pos, FILE** f) {
-	// Load word position for he.word
-	if (he.num > MAXBUF) {
-		*pos = (location*) realloc(pos, he.num * sizeof(location));
-		if (pos == NULL)
-			terror("memory for position array");
-	}
-	fseek(*f, he.pos, SEEK_SET);
-	if(fread(*pos, sizeof(location), he.num, *f)!=he.num){
-		terror("Not possible to read the number of elements described");
-	}
-}
+#define BaseType hit
 
 unsigned long scoreMax(char *seq, char *seq2, uint64_t len, int point) {
 	//CHANGE WHEN USING PAM MATRIX
@@ -445,6 +424,159 @@ struct FragFile* readFragments(char* s,int* nf,uint64_t *xtotal,uint64_t *ytotal
 
 	fclose(fe);
 	return fs;
+}
+
+int differentSequences(hit h1, hit h2){
+    return h1.seqX != h2.seqX || h1.seqY != h2.seqY;
+}
+
+hit *hits(hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t *HIB){
+    int bufSize=MAXBUF;
+    uint64_t hitsInBuf = 0;
+    uint64_t i, j, k=0, l=0;
+    int comp;
+    int firstMatch = 0, endMatch = 0;
+    uint64_t nHits = 0, wordMatches = 0;
+    int stepX, stepY;
+    long offsetWordBefore, offsetWordAfter;
+    hit *hBuf;
+
+    if ((hBuf = (hit*) calloc(sizeof(hit), MAXBUF)) == NULL)
+        terror("HITS: memory for I-O buffer");
+
+//	fprintf(stdout, "Memoria reservada para el buffer de hits\n");
+
+    while (k < nEntriesX && l < nEntriesY){
+		comp = wordcmp(&entriesX[k].w.b[0], &entriesY[l].w.b[0], wSize);
+//		fprintf(stdout, "k: %" PRIu64 " l:%" PRIu64 "\n", k, l);
+		if (comp < 0) {
+			k++;
+			//Save position of first missmatch after matches and rewind
+			if (firstMatch) {
+				offsetWordAfter = l-1;
+				l = offsetWordBefore;
+				firstMatch = 0;
+				endMatch = 1;
+			}
+			continue;
+		}
+		if (comp > 0) {
+			//No more matches, go to the next word
+			if (endMatch) {
+				l = offsetWordAfter;
+				endMatch = 0;
+			}
+            l++;
+			continue;
+		}
+
+		wordMatches++;
+//		fprintf(stdout, "Hay match\n");
+
+		// Saving the offset of the first match
+		if (wSize < 32 && !firstMatch) {
+			offsetWordBefore = l-1;
+			firstMatch = 1;
+		}
+
+		// Hits-----------------------
+		if (entriesX[k].num > MaxREP)
+			stepX = entriesX[k].num / MaxREP;
+		else
+			stepX = 1;
+		if (entriesY[l].num > MaxREP)
+			stepY = entriesY[l].num / MaxREP;
+		else
+			stepY = 1;
+
+//		fprintf(stdout, "antes del for\n");
+
+		for (i = 0; i < entriesX[k].num; i += stepX)
+			for (j = 0; j < entriesY[l].num; j += stepY) {
+                hBuf[hitsInBuf].diag = entriesX[k].locs[i].pos - entriesY[l].locs[j].pos;
+                hBuf[hitsInBuf].posX = entriesX[k].locs[i].pos;
+                hBuf[hitsInBuf].seqX = entriesX[k].locs[i].seq;
+                hBuf[hitsInBuf].posY = entriesY[l].locs[j].pos;
+                hBuf[hitsInBuf].seqY = entriesY[l].locs[j].seq;
+
+                hitsInBuf++;
+				if (hitsInBuf >= bufSize ) {
+//                    fprintf(stdout, "reallocating\n");
+                    hBuf = realloc(hBuf,(hitsInBuf+MAXBUF)*sizeof(hit));
+					bufSize += MAXBUF;
+				}
+			}
+
+//        fprintf(stdout, "despues del for\n");
+
+        nHits += ((entriesX[k].num / stepX) * (entriesY[l].num / stepY));
+
+		if (!firstMatch)k++;
+		l++;
+	}
+
+    hBuf = realloc(hBuf,hitsInBuf*sizeof(hit));
+    fprintf(stdout, "hitsInBuf: %" PRIu64 "\n", hitsInBuf);
+
+    //SortHits
+    psortH(32,hBuf,hitsInBuf);
+
+    //FilterHits
+    hit *hBuf2 = (hit *)calloc(hitsInBuf, sizeof(hit));
+    if(hBuf2==NULL)
+        perror("Not enough memory for filtered hits buffer");
+
+    int64_t diagonal;
+    uint64_t lastPosition;
+    uint64_t originalNumberOfHits = 0, finalNumberOfHits = 0;
+
+    lastPosition = 0;
+
+    originalNumberOfHits = hitsInBuf;
+    i=0;
+    diagonal = hBuf[i].diag;
+    while (i < (hitsInBuf - 1)) {
+        if(differentSequences(hBuf[i], hBuf[i+1])){
+            lastPosition=0;
+            diagonal = hBuf[i].diag;
+            i++;
+            continue;
+        }
+
+        if (diagonal != hBuf[i+1].diag || hBuf[i+1].posX > lastPosition) {
+            memcpy(&hBuf2[finalNumberOfHits++],&hBuf[i], sizeof(hit));
+            lastPosition = hBuf[i].posX + (2 * wSize - 1);
+            diagonal = hBuf[i].diag;
+        }
+        i++;
+    }
+
+    if(diagonal != hBuf[i].diag || hBuf[i].posX > (lastPosition - wSize)){
+        memcpy(&hBuf2[finalNumberOfHits++],&hBuf[i], sizeof(hit));
+    }
+
+    hBuf2 = realloc(hBuf2,finalNumberOfHits*sizeof(hit));
+    free(hBuf);
+
+    fprintf(stdout,
+            "\nfilterHits\noriginal number of Hits=%" PRIu64 "  Final number of hits=%" PRIu64 "\n",
+            originalNumberOfHits, finalNumberOfHits);
+    //End of filterhits
+
+    *HIB = finalNumberOfHits;
+
+	return hBuf2;
+}
+
+int GTH(hit a1, hit a2) {
+    if(a1.diag > a2.diag)
+        return 1;
+    else if (a1.diag < a2.diag)
+        return 0;
+    if (a1.posX > a2.posX)
+        return 1;
+
+    return 0;
 }
 /************************/
 

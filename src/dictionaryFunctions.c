@@ -6,7 +6,7 @@
 #include "structs.h"
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
-#include "quicksort.h"
+#include "quicksortWord.h"
 
 int seq2word(char* buf, int wsize, word* w) {
 	int i;
@@ -137,7 +137,7 @@ void showWord(word* w, char *ws) {
 	}
 }
 
-int GT(BaseType a1, BaseType a2){
+int GTW(wentry a1, wentry a2){
 	if(a1.w.b[0] > a2.w.b[0]) return 1;
 	else if(a1.w.b[0] < a2.w.b[0]) return 0;
 
@@ -264,7 +264,7 @@ void *dictionary(void *a){
 
 //    fprintf(stdout, "Antes del sort\n");
 
-	psort(32,words,NW);
+	psortW(32,words,NW);
 
 //    fprintf(stdout, "Despues del sort\n");
 
@@ -291,7 +291,7 @@ void *dictionary(void *a){
 		loc.pos=words[i].pos;
 		loc.seq=words[i].seq;
 		if (wordcmp(&entries[j].w.b[0],&words[i].w.b[0],32)!=0) {
-			entries[j].locs = realloc(entries[j].locs,nLocs-1);
+			entries[j].locs = realloc(entries[j].locs,nLocs);
 			j++;
 			memcpy(&entries[j].w.b[0],&words[i].w.b[0],8);
 			entries[j].num=0;

@@ -33,7 +33,7 @@ reverseComplement: reverseComplement.c
 	$(CC) $(CFLAGS) reverseComplement.c commonFunctions.c -o $(BIN)/reverseComplement
 
 gecko: gecko.c
-	$(CC) $(CFLAGS) -DBaseType=wentry gecko.c dictionaryFunctions.c commonFunctions.c quicksort.c -lpthread -o $(BIN)/gecko
+	$(CC) $(CFLAGS) dictionaryFunctions.c commonFunctions.c comparisonFunctions.c quicksortWord.c quicksortHit.c gecko.c -lpthread -o $(BIN)/gecko
 
 getInfoCSB:
 	$(CC) $(CFLAGS) getInfoCSB.c fragmentv2.c commonFunctions.c comparisonFunctions.c -lm -o $(BIN)/getInfo

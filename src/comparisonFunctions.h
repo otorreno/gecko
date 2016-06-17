@@ -64,4 +64,10 @@ void writeSequenceLength(uint64_t *length, FILE *f);
  */
 long int sizeofFragment();
 
+/**
+ * Function to calculate the hits between two dictionaries
+ * in memory
+ */
+hit *hits(hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t *HIB);
+
 #endif /* COMPARISON_FUNCTIONS_H */

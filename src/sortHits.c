@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include "structs.h"
 #include "commonFunctions.h"
-#include "quicksort.h"
+#include "quicksortWord.h"
 
 int GT(BaseType a1, BaseType a2) {
 	if(a1.diag > a2.diag)

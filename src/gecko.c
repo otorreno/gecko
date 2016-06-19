@@ -9,9 +9,17 @@
 #include "comparisonFunctions.h"
 
 int main(int ac, char** av){
-    if(ac!=3){
-        terror("USE: gecko seqFileX.IN seqFileX.IN");
+    if(ac!=7){
+        terror("USE: gecko seqFileX.IN seqFileX.IN fragsFile.OUT Lmin SimTh WL");
     }
+
+    char *seqX = av[1];
+    char *seqY = av[2];
+    char *out = av[3];
+
+    uint64_t Lmin = atoi(av[4]);
+    uint64_t SimTh = atoi(av[5]);
+    int wSize = atoi(av[6]);
 
     uint64_t nEntriesX = 0;
     hashentry *entriesX;
@@ -23,15 +31,13 @@ int main(int ac, char** av){
     pthread_t thX,thY;
     DictionaryArgs argsX,argsY;
 
-    fprintf(stdout, "av[1]: %s\n", av[1]);
-    argsX.seqFile=strdup(av[1]);
-    fprintf(stdout, "argsX.seqFile: %s\n", argsX.seqFile);
+    argsX.seqFile=strdup(seqX);
     argsX.nEntries=&nEntriesX;
     pthread_create(&thX,NULL,dictionary,(void*)(&argsX));
 
-    argsY.seqFile=strdup(av[2]);
+    argsY.seqFile=strdup(seqY);
     argsY.nEntries=&nEntriesY;
-    pthread_create(&thY,NULL,dictionary,(void*)(&argsY));
+    pthread_create(&thY,NULL,dictionaryWithReverse,(void*)(&argsY));
 
     //Wait:
     pthread_join(thX,(void **)&entriesX);
@@ -53,7 +59,7 @@ int main(int ac, char** av){
 //	}
 
     //Hits, SortHits and filterHits
-    hit *hBuf = hits(entriesX, nEntriesX, entriesY, nEntriesY, 32, &hitsInBuf);
+    struct FragFile *fragsBuf = hitsAndFrags(seqX, seqY, out, entriesX, nEntriesX, entriesY, nEntriesY, wSize, &hitsInBuf, Lmin, SimTh);
     uint64_t i;
 
 //    for(i=0;i<hitsInBuf; i++) {
@@ -70,7 +76,7 @@ int main(int ac, char** av){
 
 
 
-    free(hBuf);
+    free(fragsBuf);
 
     return 0;
 }

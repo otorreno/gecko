@@ -206,6 +206,7 @@ void *dictionary(void *a){
 	}
 
 	wentry WE;
+    WE.strand = 'f';
 	WE.seq=0;
 	unsigned long index=0;
 	unsigned long inEntry=0;
@@ -332,4 +333,194 @@ void *dictionary(void *a){
 	free(words);
 	*(args->nEntries)=j;
 	return entries;
+}
+
+void shift_word_right(word * w){
+    int i;
+    for(i=BYTES_IN_WORD-1;i>0;i--){
+        w->b[i]>>=2;
+        w->b[i]|=(w->b[i-1]<<6);
+    }
+    w->b[i]>>=2;
+}
+
+void *dictionaryWithReverse(void *a){
+    DictionaryArgs *args=(DictionaryArgs*)a;
+    FILE *f;
+    char c;
+    wentry *words = NULL;
+    unsigned long Tot=0;
+
+    if ((f=fopen(args->seqFile,"rt"))==NULL){
+        fprintf(stdout, "opening sequence file: %s\n", args->seqFile);
+        perror("opening sequence file");
+    }
+
+//    fprintf(stdout, "Memoria reservada: %" PRIu64 "\n", SIZE);
+
+    c=fgetc(f);
+    while(c!='\n'){
+        c=fgetc(f);
+    }
+
+    long temp = ftell(f);
+    c=fgetc(f);
+    while(!feof(f)){
+        if (!isupper(toupper(c))) {
+            if (c == '>') {
+                c = fgetc(f);
+                while (c != '\n')
+                    c = fgetc(f);
+                c = fgetc(f);
+                continue;
+            }
+        }
+        Tot++;
+        c=fgetc(f);
+    }
+
+    fseek(f,temp,SEEK_SET);
+
+    if((words = calloc(2*Tot, sizeof(wentry)))==NULL){
+        perror("not enough memory for words array");
+    }
+
+    wentry WE, WER;
+    WE.strand = 'f';
+    WER.strand = 'r';
+    WE.seq=0;
+    WER.seq=0;
+    unsigned long index=0;
+    unsigned long inEntry=0;
+    uint64_t NW=0;
+    unsigned long NoACGT=0;
+    unsigned long NoC=0;
+    unsigned long nLocs = 0;
+    unsigned long loc_size = 0;
+    c=fgetc(f);
+    while(!feof(f)){
+        if (!isupper(toupper(c))){
+            if(c=='>'){
+                c = fgetc(f);
+                while (c != '\n')
+                    c = fgetc(f);
+                WE.seq++;
+                WER.seq++;
+                inEntry=0;
+                index++;
+            }
+            NoC++;
+            c=fgetc(f);
+            continue;
+        }
+        shift_word(&WE.w);
+        shift_word_right(&WER.w);
+        switch (c) {
+            case 'A':
+                WER.w.b[0]|=192;
+                inEntry++;
+                break;
+            case 'C':
+                WER.w.b[0]|=128;
+                WE.w.b[BYTES_IN_WORD-1]|=1;
+                inEntry++;
+                break;
+            case 'G':
+                WER.w.b[0]|=64;
+                WE.w.b[BYTES_IN_WORD-1]|=2;
+                inEntry++;
+                break;
+            case 'T':
+                WE.w.b[BYTES_IN_WORD-1]|=3;
+                inEntry++;
+                break;
+            default :
+                inEntry=0; NoACGT++; break;
+        }
+        index++;
+//        Tot++;
+        if(inEntry>=(unsigned long)WORD_SIZE){
+            WE.pos=index-WORD_SIZE;
+            WER.pos=Tot-index-(WORD_SIZE-1);
+            memcpy(&words[NW++],&WE,sizeof(wentry));
+            memcpy(&words[NW++],&WER,sizeof(wentry));
+        }
+        c=fgetc(f);
+    }
+    //printf("FILE: Create %d Words --(seqLen=%d NoACGT=%d noChar=%d\n",NW,Tot,NoACGT, NoC);
+    fclose(f);
+
+    words = (wentry *)realloc(words,NW*sizeof(wentry));
+
+//    fprintf(stdout, "Antes del sort\n");
+
+    psortW(32,words,NW);
+
+//    fprintf(stdout, "Despues del sort\n");
+
+//    fprintf(stdout, "Antes del w2hd\n");
+    hashentry* entries = NULL;
+    if((entries = calloc(NW, sizeof(hashentry)))==NULL){
+        perror("not enough memory for hashentry array");
+    }
+
+    memcpy(&entries[0].w.b[0],&words[0].w.b[0],8);
+    entries[0].num=0;
+    entries[0].locs = NULL;
+    if((entries[0].locs = calloc(SIZE_LOC, sizeof(location)))==NULL){
+        perror("not enough memory for locs array");
+    }
+    loc_size=SIZE_LOC;
+
+//    fprintf(stdout, "memoria reservada w2hd\n");
+
+    uint64_t i=0;
+    uint64_t j=0;
+    location loc;
+    while (i<NW){
+        loc.pos=words[i].pos;
+        loc.seq=words[i].seq;
+        loc.strand=words[i].strand;
+        if (wordcmp(&entries[j].w.b[0],&words[i].w.b[0],32)!=0) {
+            entries[j].locs = realloc(entries[j].locs,nLocs);
+            j++;
+            memcpy(&entries[j].w.b[0],&words[i].w.b[0],8);
+            entries[j].num=0;
+            nLocs=0;
+            if((entries[j].locs = calloc(SIZE_LOC, sizeof(location)))==NULL){
+                perror("not enough memory for locs array");
+            }
+            loc_size=SIZE_LOC;
+        }
+
+        if(nLocs >= loc_size){
+            loc_size += SIZE_LOC;
+//            fprintf(stdout, "Reallocating memory from: %lu to: %lu\n",loc_size-SIZE_LOC,loc_size);
+            entries[j].locs = realloc(entries[j].locs,loc_size*sizeof(location));
+            if(entries[j].locs == NULL){
+                perror("Error re-allocation location array");
+            }
+
+        }
+        memcpy(&entries[j].locs[nLocs++],&loc,sizeof(location));
+        entries[j].num++;
+        i++;
+    }
+//    fprintf(stdout, "Despues del w2hd\n");
+
+//    char wordString[33];
+//	wordString[32] = '\0';
+//    uint64_t nEntries = j;
+//	for(i=0;i<nEntries;i++){
+//		showWord(&entries[i].w, wordString);
+//		fprintf(stdout, "Words(%" PRIu64 "):%s Repetitions: %" PRIu64 "Positions: ", i, wordString, entries[i].num);
+//        for(j=0;j<entries[i].num;j++){
+//            fprintf(stdout,"(%" PRIu64 ",%" PRIu64 ", %c) ",entries[i].locs[j].pos,entries[i].locs[j].seq,entries[i].locs[j].strand);
+//        }
+//        fprintf(stdout, "\n");
+//	}
+
+    free(words);
+    *(args->nEntries)=j;
+    return entries;
 }

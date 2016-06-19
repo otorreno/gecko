@@ -24,6 +24,9 @@ typedef struct {
     //reflects in what sequence occurs the
     //word
     uint64_t seq;
+    //Using this field to store the sme word in reverse
+    //in the same iteration. Either 'f' or 'r'
+    char strand;
 } wentry;
 
 //Struct for w2hd program
@@ -34,6 +37,9 @@ typedef struct {
     //reflects in what sequence occurs the
     //word
     uint64_t seq;
+    //Using this field to store the sme word in reverse
+    //in the same iteration. Either 'f' or 'r'
+    char strand;
 } location;
 
 //Struct for w2hd program
@@ -68,6 +74,9 @@ typedef struct {
     //reflects in what sequence of Y file
     //occurs the word
     uint64_t seqY;
+    //Using this field to store the sme word in reverse
+    //in the same iteration. Either 'f' or 'r'
+    char strand;
 } hit;
 
 //Struct for FragHits, af2png and leeFrag programs

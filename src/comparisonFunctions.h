@@ -21,23 +21,6 @@ void loadWordOcurrences(hashentry he, location** pos, FILE** f);
 unsigned long scoreMax(char *seq, char *seq2, uint64_t len, int point);
 
 /**
- * Read the sequence from disk and store it in a list of Sequence struct
- * n: sequence length
- * ns: number of nodes in the list
- */
-struct Sequence* LeeSeqDB(FILE *f, uint64_t *n, uint64_t *nStruct, uint64_t *nSeqs, int fAst);
-
-/**
- * Get the value of the sequence in a given position of the list node ns
- */
-char getValue(struct Sequence *s, uint64_t pos, int ns);
-
-/**
- * Get the length of the sequence 's'
- */
-long getSeqLength(struct Sequence *s, uint64_t start, int ns);
-
-/**
  * Function to read a fragment from the specified file
  */
 void readFragment(struct FragFile *frag, FILE *f);
@@ -68,6 +51,6 @@ long int sizeofFragment();
  * Function to calculate the hits between two dictionaries
  * in memory
  */
-hit *hits(hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t *HIB);
+struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t *HIB, uint64_t Lmin, uint64_t SimTh);
 
 #endif /* COMPARISON_FUNCTIONS_H */

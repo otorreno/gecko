@@ -30,12 +30,6 @@ void skipIDLine(FILE *fIn);
 int letterToIndex(char c);
 
 /**
- * Function to load the sequence.
- * The code was present inside words.c program
- */
-int loadSequence(char *fileName, char *seq, uint64_t *Tot);
-
-/**
  * Function to print in stdout the given compressed word
  */
 void showWord(word* w, char *ws);
@@ -52,5 +46,11 @@ int wordcmp(unsigned char *w1, unsigned char*w2, int n);
  * a sequence dictionary
  */
 void *dictionary(void *a);
+
+/**
+ * Function to be executed by a pthread to calculate
+ * a sequence dictionary
+ */
+void *dictionaryWithReverse(void *a);
 
 #endif /* DICTIONARY_FUNCTIONS_H */

@@ -7,11 +7,16 @@
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
 #include "quicksortHit.h"
+#include "comparisonFunctions.h"
 
 #define MAXBUF 10000000
 #define MaxREP 10000
+#define POINT 4
 
-#define BaseType hit
+int FragFromHit(long M[1000][100], struct FragFile *myF, hit *H, struct Sequence *sX,
+                uint64_t n0, uint64_t nsx, struct Sequence *sY,
+                uint64_t n1, uint64_t nsy, uint64_t nSeqs1, uint64_t LenOrPer, uint64_t SimTh, int WL);
+struct FragFile *frags(char *seqX, char *seqY, char *out, hit *hits, uint64_t nHits, uint64_t Lmin, uint64_t SimTh, int WL, uint64_t *nF) ;
 
 unsigned long scoreMax(char *seq, char *seq2, uint64_t len, int point) {
 	//CHANGE WHEN USING PAM MATRIX
@@ -25,125 +30,6 @@ unsigned long scoreMax(char *seq, char *seq2, uint64_t len, int point) {
 	/**********************/
 
 	return len * point;
-}
-
-struct Sequence* LeeSeqDB(FILE *f, uint64_t *n, uint64_t *nStruct, uint64_t *nSeqs,
-		int fAst) {
-	char c;
-	uint64_t lon = 0, k = 0, ns, seqs = 0;
-	uint64_t lonFinal = 0;
-	struct Sequence *sX, *sX2; //sX will be the first elem. sX2 will generate all the structure
-
-	//Initialize
-	*n = 0;
-	*nStruct = 0;
-
-	//Memory
-	ns = 1;
-	if ((sX = (struct Sequence*) malloc(sizeof(struct Sequence))) == NULL)
-		terror("Memory...");
-
-	if (!fAst)
-		while ((c = getc(f)) != '>' && !feof(f))
-			; //start seq
-	if (feof(f))
-		return 0;
-	while ((c = getc(f)) == ' ')
-		;
-
-	while (k < MAXLID && c != '\n' && c != ' ') {
-		if (feof(f))
-			return 0;
-
-		sX->ident[k++] = c;
-		c = getc(f);
-	}
-
-	sX->ident[k] = 0; //end of data.
-	while (c != '\n')
-		c = getc(f);
-	c = getc(f);
-
-	//start list with sX2
-	sX2 = sX;
-	while (/*c!='*'&&*/!feof(f)) {
-		c = toupper(c);
-		if (c == '>') {
-			fAst = 1;
-			seqs++;
-			sX2->datos[lon++] = '*';
-			while (c != '\n') {
-				if (feof(f))
-					return 0;
-				c = getc(f);
-			}
-			//break;
-		}
-		if (isupper(c))
-			sX2->datos[lon++] = c;
-		if (c == '*') {
-			sX2->datos[lon++] = c;
-		}
-		c = getc(f);
-
-		//Check if the length is the end of this struct
-		if (lon >= MAXLS) {
-			lonFinal += lon;
-			lon = 0;
-			ns++;
-			if ((sX = (struct Sequence*) realloc(sX,
-					ns * sizeof(struct Sequence))) == NULL)
-				terror("Memory...");
-			sX2 = sX + ns - 1;
-		}
-	}
-
-	if (lon < MAXLS)
-		sX2->datos[lon] = 0x00;
-
-	lonFinal += lon;
-	*nStruct = ns;
-	*nSeqs = seqs + 1;
-	*n = lonFinal - seqs;
-	return sX;
-}
-
-char getValue(struct Sequence *s, uint64_t pos, int ns) {
-	struct Sequence *aux = s;
-	int nActual = 1;
-
-	while (pos >= MAXLS) {
-		aux++;
-		pos -= MAXLS;
-		nActual++;
-		if (nActual > ns){
-			terror("out of sequence.");
-		}
-	}
-
-	return aux->datos[pos];
-}
-
-long getSeqLength(struct Sequence *s, uint64_t start, int ns) {
-	int nActual = 1;
-	struct Sequence *aux = s;
-	while (start >= MAXLS) {
-		aux++;
-		start -= MAXLS;
-		nActual++;
-		if (nActual > ns)
-			terror("out of sequence.");
-	}
-	uint64_t s1 = start;
-	while (s1 > 0 && aux->datos[s1] != '*') {
-		s1--;
-	}
-	s1++;
-	char *tmp = strchr(aux->datos + s1, '*');
-	if (tmp == NULL) {
-		return strlen(aux->datos) - s1 + 1;
-	}
-	return tmp - (aux->datos + s1) + 1;
 }
 
 void endianessConversion(char *source, char *target, int numberOfBytes){
@@ -430,9 +316,9 @@ int differentSequences(hit h1, hit h2){
     return h1.seqX != h2.seqX || h1.seqY != h2.seqY;
 }
 
-hit *hits(hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t *HIB){
+struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t *HIB, uint64_t Lmin, uint64_t SimTh){
     int bufSize=MAXBUF;
-    uint64_t hitsInBuf = 0;
+    uint64_t hitsInBuf = 0, nFrags;
     uint64_t i, j, k=0, l=0;
     int comp;
     int firstMatch = 0, endMatch = 0;
@@ -498,6 +384,7 @@ hit *hits(hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t
                 hBuf[hitsInBuf].seqX = entriesX[k].locs[i].seq;
                 hBuf[hitsInBuf].posY = entriesY[l].locs[j].pos;
                 hBuf[hitsInBuf].seqY = entriesY[l].locs[j].seq;
+				hBuf[hitsInBuf].strand = entriesY[l].locs[j].strand;
 
                 hitsInBuf++;
 				if (hitsInBuf >= bufSize ) {
@@ -536,7 +423,7 @@ hit *hits(hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t
     i=0;
     diagonal = hBuf[i].diag;
     while (i < (hitsInBuf - 1)) {
-        if(differentSequences(hBuf[i], hBuf[i+1])){
+        if(differentSequences(hBuf[i], hBuf[i+1]) || hBuf[i].strand != hBuf[i+1].strand){
             lastPosition=0;
             diagonal = hBuf[i].diag;
             i++;
@@ -565,8 +452,273 @@ hit *hits(hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t
 
     *HIB = finalNumberOfHits;
 
-	return hBuf2;
+    struct FragFile *fragsBuf = frags(seqX, seqY, out, hBuf2, finalNumberOfHits, Lmin, SimTh, wSize, &nFrags);
+
+    free(hBuf2);
+
+	return fragsBuf;
 }
+
+struct FragFile *frags(char *seqX, char *seqY, char *out, hit *hits, uint64_t nHits, uint64_t Lmin, uint64_t SimTh, int WL, uint64_t *nF) {
+    struct Sequence *sX, *sY;
+    uint64_t n0, n1, ns0, ns1, nSeqs0, nSeqs1;
+    uint64_t i, j;
+    int newFrag;
+    uint64_t nFrags = 0, nHitsUsed = 0;
+    int64_t lastOffset, lastDiagonal;
+    struct FragFile myF;
+    char infoFileName[200], matFileName[200];
+    FILE *f, *fOut, *fInf, *fMat;
+
+    //MAT
+    long coverage[1000][100];
+    for(i=0; i<1000; i++){
+        for(j=0; j<100; j++){
+            coverage[i][j]=0;
+        }
+    }
+    //---
+
+    struct FragFile *fragsBuf;
+    fragsBuf = (struct FragFile *)calloc(nHits, sizeof(struct FragFile));
+    if(fragsBuf == NULL)
+        terror("Not enough memory for frags array");
+
+    //Open files
+    if ((f = fopen(seqX, "rt")) == NULL)
+        terror("opening seqX file");
+    sX = LeeSeqDB(f, &n0, &ns0, &nSeqs0, 0);
+    fclose(f);
+
+    if ((f = fopen(seqY, "rt")) == NULL)
+        terror("opening seqY file");
+    sY = LeeSeqDB(f, &n1, &ns1, &nSeqs1, 0);
+    fclose(f);
+
+    if ((fOut = fopen(out, "wb")) == NULL)
+        terror("opening output file");
+
+    //Write sequence lengths
+    writeSequenceLength(&n0, fOut);
+    writeSequenceLength(&n1, fOut);
+
+    n0 += nSeqs0 - 1;
+    n1 += nSeqs1 - 1;
+
+    // read Hits
+    if(nHits == 0){
+        terror("Empty hits file");
+    }
+    lastDiagonal = hits[0].diag;
+    lastOffset = hits[0].posX - 1;
+
+    while (i < nHits) {
+        if (lastDiagonal != hits[i].diag) {
+            //Different diagonal update the variables
+            lastDiagonal = hits[i].diag;
+            lastOffset = hits[i].posX - 1;
+        }
+        //We have a casting here because of a funny error
+        //where the program was saying that -1 > 0
+        if (lastOffset > ((int64_t) hits[i].posX) || hits[i].strand != 'f') {
+            //The hit is covered by a previous frag in the same diagonal
+            i++;
+            continue;
+        }
+
+        nHitsUsed++;
+        newFrag = FragFromHit(coverage, &myF, &hits[i], sX, n0, ns0, sY, n1, ns1, nSeqs1, Lmin, SimTh,
+                              WL);
+        if (newFrag) {
+            memcpy(&fragsBuf[nFrags],&myF,sizeof(struct FragFile));
+            writeFragment(&myF, fOut);
+            lastOffset = hits[i].posX + myF.length;
+            nFrags++;
+        }
+        i++;
+    }
+
+    fclose(fOut);
+
+    sprintf(matFileName, "%s.MAT", out);
+    if ((fMat = fopen(matFileName, "wt")) == NULL)
+        terror("opening MAT file");
+
+    for(i=0; i<1000; i++){
+        for(j=0; j<100; j++){
+            fprintf(fMat, "%ld\t", coverage[i][j]);
+        }
+        fprintf(fMat, "\n");
+    }
+
+    fclose(fMat);
+
+    // metadata info
+    sprintf(infoFileName, "%s.INF", out);
+    if ((fInf = fopen(infoFileName, "wt")) == NULL)
+        terror("opening INFO file");
+
+    fprintf(fInf, "All by-Identity Ungapped Fragments (Hits based approach)\n");
+    fprintf(fInf, "[Abr.98/Apr.2010/Dec.2011 -- <ortrelles@uma.es>\n");
+    fprintf(fInf, "SeqX filename        : %s\n", seqX);
+    fprintf(fInf, "SeqY filename        : %s\n", seqY);
+    fprintf(fInf, "SeqX name            : %s\n", sX->ident);
+    fprintf(fInf, "SeqY name            : %s\n", sY->ident);
+    fprintf(fInf, "SeqX length          : %" PRIu64 "\n", n0);
+    fprintf(fInf, "SeqY length          : %" PRIu64 "\n", n1);
+    fprintf(fInf, "Min.fragment.length  : %" PRIu64 "\n", Lmin);
+    fprintf(fInf, "Min.Identity         : %" PRIu64 "\n", SimTh);
+    fprintf(fInf, "Tot Hits (seeds)     : %" PRIu64 "\n", nHits);
+    fprintf(fInf, "Tot Hits (seeds) used: %" PRIu64 "\n", nHitsUsed);
+    fprintf(fInf, "Total fragments      : %" PRIu64 "\n", nFrags);
+    fprintf(fInf, "========================================================\n");
+    fclose(fInf);
+
+    *nF = nFrags;
+
+    return fragsBuf;
+}
+
+/**
+ * Compute a fragments from one seed point
+ * Similarirty thershold and length > mimL
+ */
+int FragFromHit(long M[1000][100], struct FragFile *myF, hit *H, struct Sequence *sX,
+                uint64_t n0, uint64_t nsx, struct Sequence *sY,
+                uint64_t n1, uint64_t nsy, uint64_t nSeqs1, uint64_t Lm, uint64_t SimTh, int WL) {
+    int64_t ldiag, ldiag2;
+    int64_t xfil, ycol;
+    /* for version with backward search */
+    int64_t xfil2, ycol2;
+    int fragmentLength = 0;
+    /* for version Maximum global---*/
+    int64_t xfilmax, ycolmax;
+    /* for version with backward search */
+    int64_t xfilmax2, ycolmax2;
+    int nIdentities = 0, maxIdentities = 0;
+    char valueX, valueY;
+    int fscore = 0, fscoreMax = 0; // full score
+
+    uint64_t minLength = Lm;
+
+    // Initialize values
+    ldiag = min(n0 - H->posX, n1 - H->posY);
+    //var to know how much we have until we reach the origin of coordinates
+    ldiag2 = min(H->posX, H->posY);
+    xfil = H->posX + WL;
+    xfil2 = H->posX - 1;
+    ycol = H->posY + WL;
+    ycol2 = H->posY - 1;
+    fragmentLength += WL;
+    xfilmax = xfil;
+    xfilmax2 = xfil2;
+    ycolmax = ycol;
+    ycolmax2 = ycol2;
+    nIdentities = maxIdentities = WL;
+    fscore = POINT * WL;
+    fscoreMax = fscore;
+
+    // now, looking for end_frag---
+    while (fragmentLength < ldiag) {
+        valueX = getValue(sX, xfil, nsx);
+        valueY = getValue(sY, ycol, nsy);
+        if (valueX == '*' || valueY == '*') {
+            //separator between sequences
+            break;
+        }
+
+        if (valueX == 'N' || valueY == 'N') {
+            fscore -= 1;
+        } else {
+            if (valueX == valueY) {
+                // match
+                fscore += POINT;
+                nIdentities++;
+                if (fscoreMax < fscore) {
+                    fscoreMax = fscore;
+                    xfilmax = xfil;
+                    ycolmax = ycol;
+                    maxIdentities = nIdentities;
+                }
+            } else {
+                fscore -= POINT;
+            }
+        }
+
+        xfil++;
+        ycol++;
+        fragmentLength++;
+        if (fscore < 0)
+            break;
+    }
+
+    /**
+     * Backward search --- Oscar (Sept.2013)
+     **/
+    fragmentLength = 0;
+    fscore = fscoreMax;
+    xfilmax2 = H->posX;
+    ycolmax2 = H->posY;
+    nIdentities = maxIdentities;
+    if (xfil2 >= 0 && ycol2 >= 0)
+        while (fragmentLength < ldiag2) {
+            valueX = getValue(sX, xfil2, nsx);
+            valueY = getValue(sY, ycol2, nsy);
+            if (valueX == '*' || valueY == '*') {
+                //separator between sequences
+                break;
+            }
+
+            if (valueX == 'N' || valueY == 'N') {
+                fscore -= 1;
+            } else {
+                if (valueX == valueY) {
+                    // matches----
+                    fscore += POINT;
+                    nIdentities++;
+                    if (fscoreMax < fscore) {
+                        fscoreMax = fscore;
+                        xfilmax2 = xfil2;
+                        ycolmax2 = ycol2;
+                        maxIdentities = nIdentities;
+                    }
+                } else {
+                    fscore -= POINT;
+                }
+            }
+
+            xfil2--;
+            ycol2--;
+            fragmentLength++;
+            if (fscore < 0)
+                break;
+        }
+
+    // Set the values of the FragFile
+    myF->diag = H->diag;
+    myF->xStart = (uint64_t) xfilmax2 - H->seqX;
+    myF->yStart = (uint64_t) ycolmax2 - H->seqY;
+    myF->xEnd = (uint64_t) xfilmax - H->seqX;
+    myF->yEnd = (uint64_t) ycolmax - H->seqY;;
+    myF->length = myF->xEnd - myF->xStart + 1;
+    myF->score = fscoreMax;
+    myF->ident = maxIdentities;
+    myF->similarity = myF->score * 100.0
+                      / scoreMax(&sX->datos[myF->xStart], &sY->datos[myF->yStart],
+                                 myF->length, POINT);
+    myF->seqX = H->seqX;
+    myF->seqY = H->seqY;
+    myF->block = 0;
+    myF->strand = H->strand;
+
+    M[min(myF->length, 999)][(int)myF->similarity]++;
+
+    if (myF->length > minLength && myF->similarity > SimTh)
+        return 1;
+    else
+        return 0;
+}
+
 
 int GTH(hit a1, hit a2) {
     if(a1.diag > a2.diag)

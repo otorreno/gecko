@@ -350,6 +350,8 @@ void *dictionaryWithReverse(void *a){
     char c;
     wentry *words = NULL;
     unsigned long Tot=0;
+	uint64_t i=0;
+	uint64_t j=0;
 
     if ((f=fopen(args->seqFile,"rt"))==NULL){
         fprintf(stdout, "opening sequence file: %s\n", args->seqFile);
@@ -438,7 +440,6 @@ void *dictionaryWithReverse(void *a){
                 inEntry=0; NoACGT++; break;
         }
         index++;
-//        Tot++;
         if(inEntry>=(unsigned long)WORD_SIZE){
             WE.pos=index-WORD_SIZE;
             WER.pos=Tot-index-(WORD_SIZE-1);
@@ -451,14 +452,20 @@ void *dictionaryWithReverse(void *a){
     fclose(f);
 
     words = (wentry *)realloc(words,NW*sizeof(wentry));
+//    fprintf(stdout, "Tot: %" PRIu64 " NW: %" PRIu64 "\n", Tot, NW);
+//    char wordString[33];
+//	wordString[32] = '\0';
+//    for(i=0;i<NW;i++){
+//        showWord(&words[i].w, wordString);
+//        fprintf(stdout, "Words(%" PRIu64 "):%s Position: %" PRIu64 " Sequence: %" PRIu64 " Strand: %c\n", i, wordString, words[i].pos, words[i].seq, words[i].strand);
+//    }
 
-//    fprintf(stdout, "Antes del sort\n");
-
+//    fprintf(stdout, "Before sorting\n");
     psortW(32,words,NW);
 
-//    fprintf(stdout, "Despues del sort\n");
+//    fprintf(stdout, "After sorting\n");
 
-//    fprintf(stdout, "Antes del w2hd\n");
+//    fprintf(stdout, "Before w2hd\n");
     hashentry* entries = NULL;
     if((entries = calloc(NW, sizeof(hashentry)))==NULL){
         perror("not enough memory for hashentry array");
@@ -472,17 +479,15 @@ void *dictionaryWithReverse(void *a){
     }
     loc_size=SIZE_LOC;
 
-//    fprintf(stdout, "memoria reservada w2hd\n");
+//    fprintf(stdout, "memory allocated w2hd\n");
 
-    uint64_t i=0;
-    uint64_t j=0;
     location loc;
     while (i<NW){
         loc.pos=words[i].pos;
         loc.seq=words[i].seq;
         loc.strand=words[i].strand;
         if (wordcmp(&entries[j].w.b[0],&words[i].w.b[0],32)!=0) {
-            entries[j].locs = realloc(entries[j].locs,nLocs);
+            entries[j].locs = realloc(entries[j].locs,nLocs*sizeof(location));
             j++;
             memcpy(&entries[j].w.b[0],&words[i].w.b[0],8);
             entries[j].num=0;
@@ -506,14 +511,14 @@ void *dictionaryWithReverse(void *a){
         entries[j].num++;
         i++;
     }
-//    fprintf(stdout, "Despues del w2hd\n");
+//    fprintf(stdout, "After w2hd\n");
 
 //    char wordString[33];
 //	wordString[32] = '\0';
 //    uint64_t nEntries = j;
 //	for(i=0;i<nEntries;i++){
 //		showWord(&entries[i].w, wordString);
-//		fprintf(stdout, "Words(%" PRIu64 "):%s Repetitions: %" PRIu64 "Positions: ", i, wordString, entries[i].num);
+//		fprintf(stdout, "Words(%" PRIu64 "):%s Repetitions: %" PRIu64 " Positions: ", i, wordString, entries[i].num);
 //        for(j=0;j<entries[i].num;j++){
 //            fprintf(stdout,"(%" PRIu64 ",%" PRIu64 ", %c) ",entries[i].locs[j].pos,entries[i].locs[j].seq,entries[i].locs[j].strand);
 //        }

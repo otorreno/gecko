@@ -3,6 +3,17 @@
 
 #define min(x,y)    (((x) < (y)) ? (x) : (y))
 
+typedef struct {
+    char *seqX;
+    char *seqY;
+    hit *hits;
+    uint64_t nHits;
+    uint64_t Lmin;
+    uint64_t SimTh;
+    int wSize;
+    uint64_t* nFrags;
+} ComparisonArgs;
+
 /**
  * Read a new hash entry from 'f' with no more occurences
  * than 'freqThr'
@@ -51,6 +62,6 @@ long int sizeofFragment();
  * Function to calculate the hits between two dictionaries
  * in memory
  */
-struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t *HIB, uint64_t Lmin, uint64_t SimTh);
+struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t Lmin, uint64_t SimTh);
 
 #endif /* COMPARISON_FUNCTIONS_H */

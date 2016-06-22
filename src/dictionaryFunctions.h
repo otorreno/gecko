@@ -9,6 +9,7 @@
 typedef struct {
     char* seqFile;
     uint64_t* nEntries;
+    uint64_t* seqLen;
 } DictionaryArgs;
 
 /**

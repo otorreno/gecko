@@ -8,6 +8,7 @@ typedef struct {
     char *seqY;
     hit *hits;
     uint64_t nHits;
+    uint64_t *nHitsUsed;
     uint64_t Lmin;
     uint64_t SimTh;
     int wSize;
@@ -62,6 +63,8 @@ long int sizeofFragment();
  * Function to calculate the hits between two dictionaries
  * in memory
  */
-struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t Lmin, uint64_t SimTh);
+struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen, hashentry *entriesX,
+                              uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t Lmin,
+                              uint64_t SimTh, uint64_t *nFrags);
 
 #endif /* COMPARISON_FUNCTIONS_H */

@@ -262,6 +262,8 @@ void *dictionary(void *a){
 	fclose(f);
 
 	words = (wentry *)realloc(words,NW*sizeof(wentry));
+    if(words == NULL)
+        perror("Error reallocating words of seqX array");
 
 //    fprintf(stdout, "Antes del sort\n");
 
@@ -292,7 +294,9 @@ void *dictionary(void *a){
 		loc.pos=words[i].pos;
 		loc.seq=words[i].seq;
 		if (wordcmp(&entries[j].w.b[0],&words[i].w.b[0],32)!=0) {
-			entries[j].locs = realloc(entries[j].locs,nLocs);
+			entries[j].locs = realloc(entries[j].locs,nLocs*sizeof(location));
+            if(entries[j].locs == NULL)
+                perror("Error reallocating location array");
 			j++;
 			memcpy(&entries[j].w.b[0],&words[i].w.b[0],8);
 			entries[j].num=0;
@@ -330,8 +334,12 @@ void *dictionary(void *a){
 //        fprintf(stdout, "\n");
 //	}
 
+	entries = realloc(entries, j * sizeof(hashentry));
+    if(entries == NULL)
+        perror("Error reallocating entries of seqX array");
 	free(words);
 	*(args->nEntries)=j;
+	*(args->seqLen)=Tot;
 	return entries;
 }
 
@@ -442,7 +450,10 @@ void *dictionaryWithReverse(void *a){
         index++;
         if(inEntry>=(unsigned long)WORD_SIZE){
             WE.pos=index-WORD_SIZE;
-            WER.pos=Tot-index-(WORD_SIZE-1);
+//            fprintf(stdout, "Tot: %" PRIu64 " index: %" PRIu64 "\n", Tot, index);
+            WER.pos=index-1;
+//            fprintf(stdout, "WE.pos: %" PRIu64 " WER.pos: %" PRIu64 "\n", WE.pos, WER.pos);
+//            getchar();
             memcpy(&words[NW++],&WE,sizeof(wentry));
             memcpy(&words[NW++],&WER,sizeof(wentry));
         }
@@ -452,6 +463,8 @@ void *dictionaryWithReverse(void *a){
     fclose(f);
 
     words = (wentry *)realloc(words,NW*sizeof(wentry));
+    if(words == NULL)
+        perror("Error reallocating words of seqY array");
 //    fprintf(stdout, "Tot: %" PRIu64 " NW: %" PRIu64 "\n", Tot, NW);
 //    char wordString[33];
 //	wordString[32] = '\0';
@@ -488,6 +501,8 @@ void *dictionaryWithReverse(void *a){
         loc.strand=words[i].strand;
         if (wordcmp(&entries[j].w.b[0],&words[i].w.b[0],32)!=0) {
             entries[j].locs = realloc(entries[j].locs,nLocs*sizeof(location));
+            if(entries[j].locs == NULL)
+                perror("Error reallocating location array");
             j++;
             memcpy(&entries[j].w.b[0],&words[i].w.b[0],8);
             entries[j].num=0;
@@ -525,7 +540,11 @@ void *dictionaryWithReverse(void *a){
 //        fprintf(stdout, "\n");
 //	}
 
+    entries = realloc(entries, j * sizeof(hashentry));
+    if(entries == NULL)
+        perror("Error reallocating entries of seqY array");
     free(words);
     *(args->nEntries)=j;
+    *(args->seqLen)=Tot;
     return entries;
 }

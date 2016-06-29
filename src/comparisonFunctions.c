@@ -382,7 +382,7 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize, hit **output) {
         perror("Error reallocating filtered hits array");
 
     fprintf(stdout,
-            "\nfilterHits\noriginal number of Hits=%"
+            "filterHits original number of Hits=%"
     PRIu64
     "  Final number of hits=%"
     PRIu64
@@ -399,20 +399,26 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
     hit *hBuf2;
 
     if (args->nHits > 0) {
+#ifdef VERBOSE
         fprintf(stdout, "Sorting Hits 1\n");
+#endif
         psortH(32, args->hits, args->nHits);
 #ifdef VERBOSE
         fprintf(stdout, "End of Sorting Hits 1\n");
 #endif
 
+#ifdef VERBOSE
         fprintf(stdout, "Filtering Hits 1\n");
+#endif
         HIB = filterHits(args->hits, args->nHits, args->wSize, &hBuf2);
 #ifdef VERBOSE
         fprintf(stdout, "End of filtering Hits 1\n");
 #endif
         free(args->hits);
 
+#ifdef VERBOSE
         fprintf(stdout, "Frag Hits 1\n");
+#endif
         struct FragFile *fragsBuf = frags(args->seqX, args->seqY, hBuf2, HIB, args->Lmin, args->SimTh,
                                           args->wSize, args->nFrags, args->nHitsUsed);
 #ifdef VERBOSE
@@ -469,7 +475,7 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
         terror("HITS: memory for I-O buffer");
 
 #ifdef VERBOSE
-    fprintf(stdout, "Memoria reservada para el buffer de hits\n");
+    fprintf(stdout, "Memoria allocated for the hits buffer\n");
 #endif
 
     while (k < nEntriesX && l < nEntriesY) {
@@ -560,16 +566,20 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     hBufForward = realloc(hBufForward, hitsInBufForward * sizeof(hit));
     if (hBufForward == NULL)
         perror("Error reallocating forward hits buffer");
+#ifdef VERBOSE
     fprintf(stdout, "hitsInBufForward: %"
     PRIu64
     "\n", hitsInBufForward);
+#endif
 
     hBufReverse = realloc(hBufReverse, hitsInBufReverse * sizeof(hit));
     if (hBufReverse == NULL)
         perror("Error reallocating reverse complement hits buffer");
+#ifdef VERBOSE
     fprintf(stdout, "hitsInBufReverse: %"
     PRIu64
     "\n", hitsInBufReverse);
+#endif
 
     ComparisonArgs argsForward, argsReverse;
     pthread_t thF, thR;
@@ -617,11 +627,13 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     if ((fOut = fopen(out, "wb")) == NULL)
         terror("opening fragments output file");
 
+#ifdef VERBOSE
     fprintf(stdout, "SeqXLen: %"
     PRIu64
     " SeqYLen: %"
     PRIu64
     "\n", seqXLen, seqYLen);
+#endif
 
     writeSequenceLength(&seqXLen, fOut);
     writeSequenceLength(&seqYLen, fOut);

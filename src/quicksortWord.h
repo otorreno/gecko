@@ -7,7 +7,7 @@
  * Function to order 'array' in memory with
  * a thread number of 'nproc'. 'array' has 'n' elements
  */
-int psortW(int nproc, wentry* array, uint64_t n);
+int psortW(int nproc, wentry *array, uint64_t n);
 
 /**
  * Function to determine if object 1 is strictly greater than 2.

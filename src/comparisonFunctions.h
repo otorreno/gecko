@@ -1,7 +1,7 @@
 #ifndef COMPARISON_FUNCTIONS_H
 #define COMPARISON_FUNCTIONS_H
 
-#define min(x,y)    (((x) < (y)) ? (x) : (y))
+#define min(x, y)    (((x) < (y)) ? (x) : (y))
 
 typedef struct {
     char *seqX;
@@ -12,7 +12,7 @@ typedef struct {
     uint64_t Lmin;
     uint64_t SimTh;
     int wSize;
-    uint64_t* nFrags;
+    uint64_t *nFrags;
 } ComparisonArgs;
 
 /**
@@ -25,7 +25,7 @@ int readHashEntry(hashentry *h, FILE *f, uint64_t freqThr);
  * Read the ocurrences of the given hash entry from the
  * ocurrences file 'f' and stored them in 'pos'
  */
-void loadWordOcurrences(hashentry he, location** pos, FILE** f);
+void loadWordOcurrences(hashentry he, location **pos, FILE **f);
 
 /**
  * Get the maximum score possible between the two sequences
@@ -63,7 +63,8 @@ long int sizeofFragment();
  * Function to calculate the hits between two dictionaries
  * in memory
  */
-struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen, hashentry *entriesX,
+struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
+                              hashentry *entriesX,
                               uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t Lmin,
                               uint64_t SimTh, uint64_t *nFrags);
 

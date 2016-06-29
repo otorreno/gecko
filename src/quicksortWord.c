@@ -114,8 +114,8 @@ int psortW(int nproc, wentry* a, uint64_t n){
 	int np=nproc;
 	if(np<1) np=1;
 
-	printf("Stage1: Quicksorts\n");
-	unsigned long t = timestart();
+//	printf("Stage1: Quicksorts\n");
+//	unsigned long t = timestart();
 
     //Quicksort:
     // printf("Quicksort %d\n",n);
@@ -131,7 +131,7 @@ int psortW(int nproc, wentry* a, uint64_t n){
     //Wait:
     pthread_join(th,NULL);
 
-	printf("Stage1: %lu\n\n",timestop(t));
+//	printf("Stage1: %lu\n\n",timestop(t));
 
 	return 0;
 

@@ -8,15 +8,15 @@
 
 //Struct for words program
 typedef struct {
-	//Each letter is stored using 2 bits
-	//We have 4 letters per byte and a
-	//maximum of 32 in 'b'
+    //Each letter is stored using 2 bits
+    //We have 4 letters per byte and a
+    //maximum of 32 in 'b'
     unsigned char b[8];
 } word;
 
 //Struct for words and sort program
 typedef struct {
-	//Word compressed in binary format
+    //Word compressed in binary format
     word w;
     //Ocurrence position in the sequence
     uint64_t pos;
@@ -32,7 +32,7 @@ typedef struct {
 //Struct for w2hd program
 typedef struct {
     //Ocurrence position in the sequence
-	uint64_t pos;
+    uint64_t pos;
     //For multiple sequence files this var
     //reflects in what sequence occurs the
     //word
@@ -53,15 +53,15 @@ typedef struct {
     uint64_t num;
     //The ocurrences with position and
     //sequence
-    location* locs;
+    location *locs;
 } hashentry;
 
 //Struct for hits, sortHits and filterHits programs
 typedef struct {
-	//Diagonal where the hit is located
-	//This value is calculated as:
-	//posX - posY
-	int64_t diag;
+    //Diagonal where the hit is located
+    //This value is calculated as:
+    //posX - posY
+    int64_t diag;
     //Ocurrence position in sequence X
     uint64_t posX;
     //Ocurrence position in sequence Y
@@ -78,9 +78,9 @@ typedef struct {
 
 //Struct for FragHits, af2png and leeFrag programs
 struct FragFile {
-	//Diagonal where the frag is located
-	//This value is calculated as:
-	//posX - posY
+    //Diagonal where the frag is located
+    //This value is calculated as:
+    //posX - posY
     int64_t diag;
     //Start position in sequence X
     uint64_t xStart;
@@ -117,8 +117,8 @@ struct FragFile {
 };
 
 //Struct for leeSeqDB function
-struct Sequence{
-    char ident[MAXLID+1];
+struct Sequence {
+    char ident[MAXLID + 1];
     char datos[MAXLS];
 };
 

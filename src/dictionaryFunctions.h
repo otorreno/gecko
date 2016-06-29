@@ -7,16 +7,16 @@
 #define SIZE_LOC 20
 
 typedef struct {
-    char* seqFile;
-    uint64_t* nEntries;
-    uint64_t* seqLen;
+    char *seqFile;
+    uint64_t *nEntries;
+    uint64_t *seqLen;
 } DictionaryArgs;
 
 /**
  * Compress the word stored in 'buf' using 2 bits per letter
  * The result will be at word 'w'
  */
-int seq2word(char* buf, int wsize, word* w);
+int seq2word(char *buf, int wsize, word *w);
 
 /**
  * Function to skip the identification line of a fasta sequence
@@ -33,14 +33,14 @@ int letterToIndex(char c);
 /**
  * Function to print in stdout the given compressed word
  */
-void showWord(word* w, char *ws);
+void showWord(word *w, char *ws);
 
 /**
  * Function to compare two k-mers
  * The function returns 0 if equal, 1 if greater
  * than and -1 otherwise
  */
-int wordcmp(unsigned char *w1, unsigned char*w2, int n);
+int wordcmp(unsigned char *w1, unsigned char *w2, int n);
 
 /**
  * Function to be executed by a pthread to calculate

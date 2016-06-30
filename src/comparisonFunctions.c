@@ -260,90 +260,15 @@ long int sizeofFragment() {
     return 9 * sizeof(uint64_t) + 2 * sizeof(int64_t) + 1 * sizeof(float) + 1 * sizeof(char);
 }
 
-/**************** ARJONA *******************/
-void cpyFrag2(struct FragFile *f, struct FragFile g) {
-
-    f->diag = g.diag;
-    f->xStart = g.xStart;
-    f->xEnd = g.xEnd;
-    f->yStart = g.yStart;
-    f->yEnd = g.yEnd;
-    f->length = g.length;
-    f->score = g.score;
-    f->similarity = g.similarity;
-    f->seqX = g.seqX;
-    f->seqY = g.seqY;
-    f->ident = g.ident;
-    f->block = g.block;
-    f->strand = g.strand;
-}
-
-/******/
-struct FragFile *readFragments(char *s, int *nf, uint64_t *xtotal, uint64_t *ytotal) {
-//Fragment* readFragments(char* s,int* nf,int *xtotal,int *ytotal){
-
-    FILE *fe;
-
-    struct FragFile *fs, f;
-    int n;
-
-    if ((fe = fopen(s, "rb")) == NULL) {
-        printf("***ERROR Opening input file");
-        exit(-1);
-    }
-    n = 0;
-    readSequenceLength(xtotal, fe);
-    readSequenceLength(ytotal, fe);
-//	long int longFile;
-//	fseek(fe,0,SEEK_END);
-//	longFile=ftell(fe);
-//	n=(int)(longFile-2*sizeof(uint64_t))/sizeof(struct FragFile);
-//	printf("\n ReadFragments Complete\nnum: %d\n",n);
-
-    // Alternativa +++++++++++++++++
-    n = 0;
-    readFragment(&f, fe);
-    while (!feof(fe)) {
-        readFragment(&f, fe);
-        n++;
-    }
-//	printf("\n ReadFragments Complete\nnum: %d\n",n);
-    //+++++++++++++
-    rewind(fe);
-    fs = (struct FragFile *) malloc(sizeof(struct FragFile) * (n));
-    if (fs == NULL) {
-        printf("****ERROR: Out of memory\n");
-        exit(-1);
-    }
-
-    *nf = n;
-    readSequenceLength(xtotal, fe);
-    readSequenceLength(ytotal, fe);
-    n = 0;
-    readFragment(&f, fe);
-    while (!feof(fe)) {
-
-
-        if (f.length > 0) {
-            cpyFrag2(&fs[n], f);
-        }
-        n++;
-        readFragment(&f, fe);
-        //fprintf(stdout,"%d\t%" PRId64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%c" "\t%" PRIu64 "\n",n,fs[n].xStart, fs[n].yStart, fs[n].xEnd, fs[n].yEnd, fs[n].length, fs[n].strand, fs[n].ident);
-
-    }
-    *nf = n;
-
-
-    fclose(fe);
-    return fs;
-}
-
 int differentSequences(hit h1, hit h2) {
     return h1.seqX != h2.seqX || h1.seqY != h2.seqY;
 }
 
 uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize, hit **output) {
+    if (hitsInBuf == 0 || hBuf == NULL) {
+        *output = NULL;
+        return 0;
+    }
     hit *hBuf2 = (hit *) calloc(hitsInBuf, sizeof(hit));
     if (hBuf2 == NULL)
         perror("Not enough memory for filtered hits buffer");
@@ -377,6 +302,9 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize, hit **output) {
         memcpy(&hBuf2[finalNumberOfHits++], &hBuf[i], sizeof(hit));
     }
 
+    if (finalNumberOfHits == 0) {
+        perror("0 Hits. At least one hit should be kept in the filtering");
+    }
     *output = hBuf2 = realloc(hBuf2, finalNumberOfHits * sizeof(hit));
     if (hBuf2 == NULL)
         perror("Error reallocating filtered hits array");
@@ -401,30 +329,46 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
     if (args->nHits > 0) {
 #ifdef VERBOSE
         fprintf(stdout, "Sorting Hits 1\n");
+        fflush(stdout);
 #endif
         psortH(32, args->hits, args->nHits);
 #ifdef VERBOSE
         fprintf(stdout, "End of Sorting Hits 1\n");
+        fflush(stdout);
 #endif
 
 #ifdef VERBOSE
         fprintf(stdout, "Filtering Hits 1\n");
+        fflush(stdout);
 #endif
+
         HIB = filterHits(args->hits, args->nHits, args->wSize, &hBuf2);
+
 #ifdef VERBOSE
         fprintf(stdout, "End of filtering Hits 1\n");
+        fflush(stdout);
 #endif
+
         free(args->hits);
 
 #ifdef VERBOSE
         fprintf(stdout, "Frag Hits 1\n");
+        fflush(stdout);
 #endif
-        struct FragFile *fragsBuf = frags(args->seqX, args->seqY, hBuf2, HIB, args->Lmin, args->SimTh,
-                                          args->wSize, args->nFrags, args->nHitsUsed);
+
+        struct FragFile *fragsBuf = NULL;
+        if (HIB > 0) {
+            fragsBuf = frags(args->seqX, args->seqY, hBuf2, HIB, args->Lmin, args->SimTh,
+                             args->wSize, args->nFrags, args->nHitsUsed);
+        }
+
 #ifdef VERBOSE
         fprintf(stdout, "End of Frag Hits 1\n");
+        fflush(stdout);
 #endif
-        free(hBuf2);
+
+        if (hBuf2 != NULL)
+            free(hBuf2);
         return fragsBuf;
     }
 
@@ -442,9 +386,15 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
         HIB = filterHits(args->hits, args->nHits, args->wSize, &hBuf2);
         free(args->hits);
 
-        struct FragFile *fragsBuf = fragsReverse(args->seqX, args->seqY, hBuf2, HIB, args->Lmin, args->SimTh,
-                                                 args->wSize, args->nFrags, args->nHitsUsed);
-        free(hBuf2);
+        struct FragFile *fragsBuf = NULL;
+        if (HIB > 0) {
+            fragsBuf = fragsReverse(args->seqX, args->seqY, hBuf2, HIB, args->Lmin, args->SimTh,
+                                    args->wSize, args->nFrags, args->nHitsUsed);
+        }
+
+        if (hBuf2 != NULL)
+            free(hBuf2);
+
         return fragsBuf;
     }
 
@@ -475,7 +425,8 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
         terror("HITS: memory for I-O buffer");
 
 #ifdef VERBOSE
-    fprintf(stdout, "Memoria allocated for the hits buffer\n");
+    fprintf(stdout, "Memory allocated for the hits buffer\n");
+    fflush(stdout);
 #endif
 
     while (k < nEntriesX && l < nEntriesY) {
@@ -532,8 +483,7 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
 
                     hitsInBufForward++;
                     if (hitsInBufForward >= bufSizeForward) {
-//                    fprintf(stdout, "reallocating\n");
-                        hBufForward = realloc(hBufForward, (hitsInBufForward + MAXBUF) * sizeof(hit));
+                        hBufForward = realloc(hBufForward, (bufSizeForward + MAXBUF) * sizeof(hit));
                         if (hBufForward == NULL)
                             perror("Error reallocating forward hits buffer");
                         bufSizeForward += MAXBUF;
@@ -549,7 +499,7 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
                     hitsInBufReverse++;
                     if (hitsInBufReverse >= bufSizeReverse) {
 //                    fprintf(stdout, "reallocating\n");
-                        hBufReverse = realloc(hBufReverse, (hitsInBufReverse + MAXBUF) * sizeof(hit));
+                        hBufReverse = realloc(hBufReverse, (bufSizeReverse + MAXBUF) * sizeof(hit));
                         if (hBufReverse == NULL)
                             perror("Error reallocating reverse complement hits buffer");
                         bufSizeReverse += MAXBUF;
@@ -563,22 +513,28 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
         l++;
     }
 
-    hBufForward = realloc(hBufForward, hitsInBufForward * sizeof(hit));
+    if (hitsInBufForward > 0)
+        hBufForward = realloc(hBufForward, hitsInBufForward * sizeof(hit));
     if (hBufForward == NULL)
         perror("Error reallocating forward hits buffer");
+
 #ifdef VERBOSE
     fprintf(stdout, "hitsInBufForward: %"
     PRIu64
     "\n", hitsInBufForward);
+    fflush(stdout);
 #endif
 
-    hBufReverse = realloc(hBufReverse, hitsInBufReverse * sizeof(hit));
+    if (hitsInBufReverse > 0)
+        hBufReverse = realloc(hBufReverse, hitsInBufReverse * sizeof(hit));
     if (hBufReverse == NULL)
         perror("Error reallocating reverse complement hits buffer");
+
 #ifdef VERBOSE
     fprintf(stdout, "hitsInBufReverse: %"
     PRIu64
     "\n", hitsInBufReverse);
+    fflush(stdout);
 #endif
 
     ComparisonArgs argsForward, argsReverse;
@@ -617,11 +573,13 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     "; Frags in reverse: %"
     PRIu64
     "\n", nFragsForward, nFragsReverse);
+    fflush(stdout);
 
     *nFrags = nFragsForward + nFragsReverse;
 
 #ifdef VERBOSE
     fprintf(stdout, "Writing fragments to disk\n");
+    fflush(stdout);
 #endif
 
     if ((fOut = fopen(out, "wb")) == NULL)
@@ -633,21 +591,44 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     " SeqYLen: %"
     PRIu64
     "\n", seqXLen, seqYLen);
+    fflush(stdout);
 #endif
 
     writeSequenceLength(&seqXLen, fOut);
     writeSequenceLength(&seqYLen, fOut);
 
-    for (i = 0; i < nFragsForward; i++) {
-        writeFragment(&fragsBufForward[i], fOut);
+#ifdef VERBOSE
+    fprintf(stdout, "Writting forward frags\n");
+    fflush(stdout);
+#endif
+
+    if (fragsBufForward != NULL) {
+        for (i = 0; i < nFragsForward; i++) {
+            writeFragment(&fragsBufForward[i], fOut);
+        }
+        free(fragsBufForward);
     }
-    for (i = 0; i < nFragsReverse; i++) {
-        uint64_t tmp;
-        tmp = seqYLen - fragsBufReverse[i].yEnd;
-        fragsBufReverse[i].yStart = seqYLen - fragsBufReverse[i].yStart;
-        fragsBufReverse[i].yEnd = tmp;
-        writeFragment(&fragsBufReverse[i], fOut);
+
+#ifdef VERBOSE
+    fprintf(stdout, "Forward frags written\n");
+    fflush(stdout);
+#endif
+
+    if (fragsBufReverse != NULL) {
+        for (i = 0; i < nFragsReverse; i++) {
+            uint64_t tmp;
+            tmp = seqYLen - fragsBufReverse[i].yEnd;
+            fragsBufReverse[i].yStart = seqYLen - fragsBufReverse[i].yStart;
+            fragsBufReverse[i].yEnd = tmp;
+            writeFragment(&fragsBufReverse[i], fOut);
+        }
+        free(fragsBufReverse);
     }
+
+#ifdef VERBOSE
+    fprintf(stdout, "Reverse frags written\n");
+    fflush(stdout);
+#endif
 
     fclose(fOut);
 
@@ -688,6 +669,7 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
 
 #ifdef VERBOSE
     fprintf(stdout, "End of hits and frags function\n");
+    fflush(stdout);
 #endif
 
     //TODO change if we want to have the fragments outside this function
@@ -713,6 +695,12 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
         }
     }
     //---
+
+    if (!nHits) {
+        *nHU = 0;
+        *nF = 0;
+        return NULL;
+    }
 
     struct FragFile *fragsBuf;
     fragsBuf = (struct FragFile *) calloc(nHits, sizeof(struct FragFile));
@@ -771,11 +759,19 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
 
 #ifdef VERBOSE
     fprintf(stdout, "Forward strand frags calculated\n");
+    fflush(stdout);
 #endif
 
-    fragsBuf = realloc(fragsBuf, nFrags * sizeof(struct FragFile));
+    if (nFrags > 0)
+        fragsBuf = realloc(fragsBuf, nFrags * sizeof(struct FragFile));
     if (fragsBuf == NULL)
         perror("Error reallocating memory of forward frags array");
+
+    if (sX != NULL)
+        free(sX);
+
+    if (sY != NULL)
+        free(sY);
 
     return fragsBuf;
 }
@@ -799,6 +795,12 @@ struct FragFile *fragsReverse(char *seqX, char *seqY, hit *hits, uint64_t nHits,
         }
     }
     //---
+
+    if (!nHits) {
+        *nHU = 0;
+        *nF = 0;
+        return NULL;
+    }
 
     struct FragFile *fragsBuf;
     fragsBuf = (struct FragFile *) calloc(nHits, sizeof(struct FragFile));
@@ -857,11 +859,19 @@ struct FragFile *fragsReverse(char *seqX, char *seqY, hit *hits, uint64_t nHits,
 
 #ifdef VERBOSE
     fprintf(stdout, "Reverse strand frags calculated\n");
+    fflush(stdout);
 #endif
 
-    fragsBuf = realloc(fragsBuf, nFrags * sizeof(struct FragFile));
+    if (nFrags > 0)
+        fragsBuf = realloc(fragsBuf, nFrags * sizeof(struct FragFile));
     if (fragsBuf == NULL)
         perror("Error reallocating memory of reverse frags array");
+
+    if (sX != NULL)
+        free(sX);
+
+    if (sY != NULL)
+        free(sY);
 
     return fragsBuf;
 }
@@ -1147,7 +1157,7 @@ int FragFromHitReverse(long M[1000][100], struct FragFile *myF, hit *H, struct S
         return 0;
 }
 
-int GTH(hit a1, hit a2) {
+int64_t GTH(hit a1, hit a2) {
     if (a1.diag > a2.diag)
         return 1;
     else if (a1.diag < a2.diag)

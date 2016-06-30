@@ -187,19 +187,23 @@ void *dictionary(void *a) {
 
     if ((f = fopen(args->seqFile, "rt")) == NULL) {
         fprintf(stdout, "opening sequence file: %s\n", args->seqFile);
-        perror("opening sequence file");
+        terror("opening sequence file");
     }
 
     fseek(f, 0, SEEK_END);
     SIZE = ftell(f);
     fseek(f, 0, SEEK_SET);
 
+    if (SIZE == 0)
+        terror("Empty sequence X file");
+
     if ((words = calloc(SIZE, sizeof(wentry))) == NULL) {
-        perror("not enough memory for words array");
+        terror("not enough memory for words array");
     }
 
 #ifdef VERBOSE
     fprintf(stdout, "Memory allocated: %" PRIu64 "\n", SIZE);
+    fflush(stdout);
 #endif
 
     c = fgetc(f);
@@ -259,41 +263,54 @@ void *dictionary(void *a) {
         Tot++;
         if (inEntry >= (unsigned long) WORD_SIZE) {
             WE.pos = index - WORD_SIZE;
-            NW++;
             memcpy(&words[NW], &WE, sizeof(wentry));
+            NW++;
         }
         c = fgetc(f);
+
     }
     //printf("FILE: Create %d Words --(seqLen=%d NoACGT=%d noChar=%d\n",NW,Tot,NoACGT, NoC);
     fclose(f);
 
+    if (NW == 0)
+        terror("Words array empty");
+
+#ifdef VERBOSE
+    fprintf(stdout, "Reallocating words of SeqX to: %" PRIu64 "\n", NW);
+    fflush(stdout);
+#endif
+
     words = (wentry *) realloc(words, NW * sizeof(wentry));
     if (words == NULL)
-        perror("Error reallocating words of seqX array");
+        terror("Error reallocating words of seqX array");
 
 #ifdef VERBOSE
     fprintf(stdout, "Before sorting words\n");
+    fflush(stdout);
 #endif
 
     psortW(32, words, NW);
 
 #ifdef VERBOSE
     fprintf(stdout, "After sorting words\n");
+    fflush(stdout);
 #endif
 
 #ifdef VERBOSE
     fprintf(stdout, "Before w2hd\n");
 #endif
     hashentry *entries = NULL;
+    if (NW == 0)
+        terror("Words array empty");
     if ((entries = calloc(NW, sizeof(hashentry))) == NULL) {
-        perror("not enough memory for hashentry array");
+        terror("not enough memory for hashentry array");
     }
 
     memcpy(&entries[0].w.b[0], &words[0].w.b[0], 8);
     entries[0].num = 0;
     entries[0].locs = NULL;
     if ((entries[0].locs = calloc(SIZE_LOC, sizeof(location))) == NULL) {
-        perror("not enough memory for locs array");
+        terror("not enough memory for locs array");
     }
     loc_size = SIZE_LOC;
 
@@ -308,15 +325,17 @@ void *dictionary(void *a) {
         loc.pos = words[i].pos;
         loc.seq = words[i].seq;
         if (wordcmp(&entries[j].w.b[0], &words[i].w.b[0], 32) != 0) {
+            if (nLocs == 0)
+                terror("nLocs is 0");
             entries[j].locs = realloc(entries[j].locs, nLocs * sizeof(location));
             if (entries[j].locs == NULL)
-                perror("Error reallocating location array");
+                terror("Error reallocating location array");
             j++;
             memcpy(&entries[j].w.b[0], &words[i].w.b[0], 8);
             entries[j].num = 0;
             nLocs = 0;
             if ((entries[j].locs = calloc(SIZE_LOC, sizeof(location))) == NULL) {
-                perror("not enough memory for locs array");
+                terror("not enough memory for locs array");
             }
             loc_size = SIZE_LOC;
         }
@@ -326,7 +345,7 @@ void *dictionary(void *a) {
 //            fprintf(stdout, "Reallocating memory from: %lu to: %lu\n",loc_size-SIZE_LOC,loc_size);
             entries[j].locs = realloc(entries[j].locs, loc_size * sizeof(location));
             if (entries[j].locs == NULL) {
-                perror("Error re-allocation location array");
+                terror("Error re-allocation location array");
             }
 
         }
@@ -338,9 +357,12 @@ void *dictionary(void *a) {
     fprintf(stdout, "After w2hd\n");
 #endif
 
+    if (j == 0)
+        terror("Number of entries in the hash table is 0");
+    free(entries[j].locs);
     entries = realloc(entries, j * sizeof(hashentry));
     if (entries == NULL)
-        perror("Error reallocating entries of seqX array");
+        terror("Error reallocating entries of seqX array");
     free(words);
     *(args->nEntries) = j;
     *(args->seqLen) = Tot;
@@ -367,7 +389,7 @@ void *dictionaryWithReverse(void *a) {
 
     if ((f = fopen(args->seqFile, "rt")) == NULL) {
         fprintf(stdout, "opening sequence file: %s\n", args->seqFile);
-        perror("opening sequence file");
+        terror("opening sequence file");
     }
 
     c = fgetc(f);
@@ -377,6 +399,7 @@ void *dictionaryWithReverse(void *a) {
 
 #ifdef VERBOSE
     fprintf(stdout, "Calculating sequence length of SeqY\n");
+    fflush(stdout);
 #endif
 
     long temp = ftell(f);
@@ -397,18 +420,24 @@ void *dictionaryWithReverse(void *a) {
 
 #ifdef VERBOSE
     fprintf(stdout, "SeqY Len: %" PRIu64 "\n", Tot);
+    fflush(stdout);
 #endif
 
     fseek(f, temp, SEEK_SET);
 
 #ifdef VERBOSE
     fprintf(stdout, "Allocating memory for words of seqY (including reverse). Size: %" PRIu64 "\n", 2 * Tot);
+    fflush(stdout);
 #endif
+    if (Tot == 0)
+        terror("Empty sequence Y file");
+
     if ((words = calloc(2 * Tot, sizeof(wentry))) == NULL) {
-        perror("not enough memory for words array");
+        terror("not enough memory for words array");
     }
 #ifdef VERBOSE
     fprintf(stdout, "Allocated memory for words of seqY (including reverse).\n");
+    fflush(stdout);
 #endif
 
 
@@ -478,35 +507,49 @@ void *dictionaryWithReverse(void *a) {
             memcpy(&words[NW++], &WER, sizeof(wentry));
         }
         c = fgetc(f);
+
     }
     fclose(f);
 
+    if (NW == 0)
+        terror("Words array empty");
+
+#ifdef VERBOSE
+    fprintf(stdout, "Reallocating words of SeqY to: %" PRIu64 "\n", NW);
+    fflush(stdout);
+#endif
+
     words = (wentry *) realloc(words, NW * sizeof(wentry));
     if (words == NULL)
-        perror("Error reallocating words of seqY array");
+        terror("Error reallocating words of seqY array");
 
 #ifdef VERBOSE
     fprintf(stdout, "Before sorting\n");
+    fflush(stdout);
 #endif
+
     psortW(32, words, NW);
 
 #ifdef VERBOSE
     fprintf(stdout, "After sorting\n");
+    fflush(stdout);
 #endif
 
 #ifdef VERBOSE
     fprintf(stdout, "Before w2hd\n");
 #endif
     hashentry *entries = NULL;
+    if (NW == 0)
+        terror("Words array empty");
     if ((entries = calloc(NW, sizeof(hashentry))) == NULL) {
-        perror("not enough memory for hashentry array");
+        terror("not enough memory for hashentry array");
     }
 
     memcpy(&entries[0].w.b[0], &words[0].w.b[0], 8);
     entries[0].num = 0;
     entries[0].locs = NULL;
     if ((entries[0].locs = calloc(SIZE_LOC, sizeof(location))) == NULL) {
-        perror("not enough memory for locs array");
+        terror("not enough memory for locs array");
     }
     loc_size = SIZE_LOC;
 
@@ -520,15 +563,17 @@ void *dictionaryWithReverse(void *a) {
         loc.seq = words[i].seq;
         loc.strand = words[i].strand;
         if (wordcmp(&entries[j].w.b[0], &words[i].w.b[0], 32) != 0) {
+            if (nLocs == 0)
+                terror("nLocs is 0");
             entries[j].locs = realloc(entries[j].locs, nLocs * sizeof(location));
             if (entries[j].locs == NULL)
-                perror("Error reallocating location array");
+                terror("Error reallocating location array");
             j++;
             memcpy(&entries[j].w.b[0], &words[i].w.b[0], 8);
             entries[j].num = 0;
             nLocs = 0;
             if ((entries[j].locs = calloc(SIZE_LOC, sizeof(location))) == NULL) {
-                perror("not enough memory for locs array");
+                terror("not enough memory for locs array");
             }
             loc_size = SIZE_LOC;
         }
@@ -538,7 +583,7 @@ void *dictionaryWithReverse(void *a) {
 //            fprintf(stdout, "Reallocating memory from: %lu to: %lu\n",loc_size-SIZE_LOC,loc_size);
             entries[j].locs = realloc(entries[j].locs, loc_size * sizeof(location));
             if (entries[j].locs == NULL) {
-                perror("Error re-allocation location array");
+                terror("Error re-allocation location array");
             }
 
         }
@@ -550,9 +595,12 @@ void *dictionaryWithReverse(void *a) {
     fprintf(stdout, "After w2hd\n");
 #endif
 
+    if (j == 0)
+        terror("Number of entries in the hash table is 0");
+    free(entries[j].locs);
     entries = realloc(entries, j * sizeof(hashentry));
     if (entries == NULL)
-        perror("Error reallocating entries of seqY array");
+        terror("Error reallocating entries of seqY array");
     free(words);
     *(args->nEntries) = j;
     *(args->seqLen) = Tot;

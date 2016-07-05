@@ -2,9 +2,13 @@
 #define STRUCTS_H
 
 #include <inttypes.h>
+
+#pragma pack(push, 1)
+
 //Structs required for the dotplot workflow
 #define MAXLID 200
-#define MAXLS 1000000000
+#define READBUF 100000
+#define REALLOC_FREQ 10000
 
 //Struct for words program
 typedef struct {
@@ -58,10 +62,6 @@ typedef struct {
 
 //Struct for hits, sortHits and filterHits programs
 typedef struct {
-    //Diagonal where the hit is located
-    //This value is calculated as:
-    //posX - posY
-    int64_t diag;
     //Ocurrence position in sequence X
     uint64_t posX;
     //Ocurrence position in sequence Y
@@ -119,7 +119,7 @@ struct FragFile {
 //Struct for leeSeqDB function
 struct Sequence {
     char ident[MAXLID + 1];
-    char datos[MAXLS];
+    char *datos;
 };
 
 #endif

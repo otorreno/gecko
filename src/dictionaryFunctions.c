@@ -8,90 +8,6 @@
 #include "dictionaryFunctions.h"
 #include "quicksortWord.h"
 
-int seq2word(char *buf, int wsize, word *w) {
-    int i;
-    int b = 6;
-    memset(w, 0, sizeof(word));
-
-    for (i = 0; i < wsize; i++) {
-        if (buf[i] >= 4)
-            return -1;
-        w->b[i / 4] |= buf[i] << b;
-        b -= 2;
-        if (b < 0)
-            b = 6;
-    }
-    return 0;
-}
-
-void skipIDLine(FILE *fIn) {
-    char c;
-    // first line (skip ID fasta Line)
-    c = fgetc(fIn);
-    while (c != '\n')
-        c = fgetc(fIn);
-}
-
-int letterToIndex(char c) {
-    // coding (a=0,c=1,g=2,t=3,'>'=4 others=9 )
-    switch (c) {
-        case 'A':
-            return 0;
-        case 'C':
-            return 1;
-        case 'G':
-            return 2;
-        case 'T':
-            return 3;
-        case '>':
-            return 4;
-        default:
-            return 9;
-    }
-}
-
-int loadSequence(char *fileName, char *seq, uint64_t *Tot) {
-    FILE *fIn;
-    char c;
-
-    //Opening input and output files
-    if ((fIn = fopen(fileName, "rt")) == NULL)
-        terror("opening sequence file");
-
-    //Skip the identification of the sequence
-    skipIDLine(fIn);
-
-    // Load Sequence into memory
-    c = fgetc(fIn);
-    while (!feof(fIn)) {
-        //Check if is a letter
-        if (!isupper(c)) {
-            /*
-             * If not is a start of a sequence,
-             * then read a new char and continue
-             */
-            if (c != '>') {
-                c = fgetc(fIn);
-                continue;
-            }
-        }
-
-        //Get the index of the letter
-        seq[*Tot] = letterToIndex(c);
-
-        //Check if is a multi-sequence file
-        if (c == '>') {
-            skipIDLine(fIn);
-        }
-
-        (*Tot)++;
-        c = fgetc(fIn);
-    }
-
-    fclose(fIn);
-    return 0;
-}
-
 int wordcmp(unsigned char *w1, unsigned char *w2, int n) {
 
     int i = 0, limit;
@@ -184,6 +100,9 @@ void *dictionary(void *a) {
     char c;
     uint64_t SIZE = 0;
     wentry *words = NULL;
+    wentry *more_words = NULL;
+    char *seq = NULL;
+    uint64_t i = 0, r = 0;
 
     if ((f = fopen(args->seqFile, "rt")) == NULL) {
         fprintf(stdout, "opening sequence file: %s\n", args->seqFile);
@@ -201,40 +120,47 @@ void *dictionary(void *a) {
         terror("not enough memory for words array");
     }
 
+    if ((seq = calloc(READBUF, sizeof(char))) == NULL) {
+        terror("not enough memory for read buffer");
+    }
+
 #ifdef VERBOSE
-    fprintf(stdout, "Memory allocated: %" PRIu64 "\n", SIZE);
+    fprintf(stdout, "Memory allocated: %" PRIu64 "\n", SIZE * sizeof(wentry));
     fflush(stdout);
 #endif
 
-    c = fgetc(f);
+    //To force the read
+    i = READBUF + 1;
+
+    c = buffered_fgetc(seq, &i, &r, f);
     while (c != '\n') {
-        c = fgetc(f);
+        c = buffered_fgetc(seq, &i, &r, f);
     }
 
     wentry WE;
     WE.strand = 'f';
     WE.seq = 0;
-    unsigned long index = 0;
-    unsigned long inEntry = 0;
+    uint64_t index = 0;
+    uint64_t inEntry = 0;
     uint64_t NW = 0;
-    unsigned long Tot = 0;
-    unsigned long NoACGT = 0;
-    unsigned long NoC = 0;
-    unsigned long nLocs = 0;
-    unsigned long loc_size = 0;
-    c = fgetc(f);
+    uint64_t Tot = 0;
+    uint64_t NoACGT = 0;
+    uint64_t NoC = 0;
+    uint64_t nLocs = 0;
+    uint64_t loc_size = 0;
+    c = buffered_fgetc(seq, &i, &r, f);
     while (!feof(f)) {
         if (!isupper(toupper(c))) {
             if (c == '>') {
-                c = fgetc(f);
+                c = buffered_fgetc(seq, &i, &r, f);
                 while (c != '\n')
-                    c = fgetc(f);
+                    c = buffered_fgetc(seq, &i, &r, f);
                 WE.seq++;
                 inEntry = 0;
                 index++;
             }
             NoC++;
-            c = fgetc(f);
+            c = buffered_fgetc(seq, &i, &r, f);
             continue;
         }
         shift_word(&WE.w);
@@ -261,15 +187,16 @@ void *dictionary(void *a) {
         }
         index++;
         Tot++;
-        if (inEntry >= (unsigned long) WORD_SIZE) {
+        if (inEntry >= (uint64_t) WORD_SIZE) {
             WE.pos = index - WORD_SIZE;
             memcpy(&words[NW], &WE, sizeof(wentry));
             NW++;
         }
-        c = fgetc(f);
+        c = buffered_fgetc(seq, &i, &r, f);
 
     }
     //printf("FILE: Create %d Words --(seqLen=%d NoACGT=%d noChar=%d\n",NW,Tot,NoACGT, NoC);
+    free(seq);
     fclose(f);
 
     if (NW == 0)
@@ -302,7 +229,7 @@ void *dictionary(void *a) {
     hashentry *entries = NULL;
     if (NW == 0)
         terror("Words array empty");
-    if ((entries = calloc(NW, sizeof(hashentry))) == NULL) {
+    if ((entries = calloc(REALLOC_FREQ, sizeof(hashentry))) == NULL) {
         terror("not enough memory for hashentry array");
     }
 
@@ -318,20 +245,29 @@ void *dictionary(void *a) {
     fprintf(stdout, "memory allocated w2hd\n");
 #endif
 
-    uint64_t i = 0;
+    i = 0;
     uint64_t j = 0;
+    uint64_t k = 0;
+    uint64_t l = REALLOC_FREQ;
     location loc;
     while (i < NW) {
-        loc.pos = words[i].pos;
-        loc.seq = words[i].seq;
-        if (wordcmp(&entries[j].w.b[0], &words[i].w.b[0], 32) != 0) {
+        loc.pos = words[k].pos;
+        loc.seq = words[k].seq;
+        if (wordcmp(&entries[j].w.b[0], &words[k].w.b[0], 32) != 0) {
             if (nLocs == 0)
                 terror("nLocs is 0");
             entries[j].locs = realloc(entries[j].locs, nLocs * sizeof(location));
             if (entries[j].locs == NULL)
                 terror("Error reallocating location array");
             j++;
-            memcpy(&entries[j].w.b[0], &words[i].w.b[0], 8);
+            if (j >= l) {
+                l += REALLOC_FREQ;
+                entries = realloc(entries, l * sizeof(hashentry));
+                if (entries == NULL) {
+                    terror("Error reallocating entries of seqX array");
+                }
+            }
+            memcpy(&entries[j].w.b[0], &words[k].w.b[0], 8);
             entries[j].num = 0;
             nLocs = 0;
             if ((entries[j].locs = calloc(SIZE_LOC, sizeof(location))) == NULL) {
@@ -352,6 +288,18 @@ void *dictionary(void *a) {
         memcpy(&entries[j].locs[nLocs++], &loc, sizeof(location));
         entries[j].num++;
         i++;
+        k++;
+        if (i % REALLOC_FREQ == 0) {
+            memmove(words, words + REALLOC_FREQ, NW - i);
+            more_words = realloc(words, (NW - i) * sizeof(wentry));
+            if (more_words == NULL) {
+                free(words);
+                terror("Error reallocating words of seqX array");
+            } else {
+                words = more_words;
+            }
+            k -= REALLOC_FREQ;
+        }
     }
 #ifdef VERBOSE
     fprintf(stdout, "After w2hd\n");
@@ -383,18 +331,29 @@ void *dictionaryWithReverse(void *a) {
     FILE *f;
     char c;
     wentry *words = NULL;
-    unsigned long Tot = 0;
-    uint64_t i = 0;
+    wentry *more_words = NULL;
+    char *seq = NULL;
+    uint64_t Tot = 0;
+    uint64_t i = 0, r = 0;
     uint64_t j = 0;
+    uint64_t k = 0;
+    uint64_t l = REALLOC_FREQ;
 
     if ((f = fopen(args->seqFile, "rt")) == NULL) {
         fprintf(stdout, "opening sequence file: %s\n", args->seqFile);
         terror("opening sequence file");
     }
 
-    c = fgetc(f);
+    if ((seq = calloc(READBUF, sizeof(char))) == NULL) {
+        terror("not enough memory for read buffersequence");
+    }
+
+    //To force read
+    i = READBUF + 1;
+
+    c = buffered_fgetc(seq, &i, &r, f);
     while (c != '\n') {
-        c = fgetc(f);
+        c = buffered_fgetc(seq, &i, &r, f);
     }
 
 #ifdef VERBOSE
@@ -402,20 +361,19 @@ void *dictionaryWithReverse(void *a) {
     fflush(stdout);
 #endif
 
-    long temp = ftell(f);
-    c = fgetc(f);
+    c = buffered_fgetc(seq, &i, &r, f);
     while (!feof(f)) {
         if (!isupper(toupper(c))) {
             if (c == '>') {
-                c = fgetc(f);
+                c = buffered_fgetc(seq, &i, &r, f);
                 while (c != '\n')
-                    c = fgetc(f);
-                c = fgetc(f);
+                    c = buffered_fgetc(seq, &i, &r, f);
+                c = buffered_fgetc(seq, &i, &r, f);
                 continue;
             }
         }
         Tot++;
-        c = fgetc(f);
+        c = buffered_fgetc(seq, &i, &r, f);
     }
 
 #ifdef VERBOSE
@@ -423,7 +381,14 @@ void *dictionaryWithReverse(void *a) {
     fflush(stdout);
 #endif
 
-    fseek(f, temp, SEEK_SET);
+    fseek(f, 0, SEEK_SET);
+    //To force read
+    i = READBUF + 1;
+
+    c = buffered_fgetc(seq, &i, &r, f);
+    while (c != '\n') {
+        c = buffered_fgetc(seq, &i, &r, f);
+    }
 
 #ifdef VERBOSE
     fprintf(stdout, "Allocating memory for words of seqY (including reverse). Size: %" PRIu64 "\n", 2 * Tot);
@@ -446,27 +411,27 @@ void *dictionaryWithReverse(void *a) {
     WER.strand = 'r';
     WE.seq = 0;
     WER.seq = 0;
-    unsigned long index = 0;
-    unsigned long inEntry = 0;
+    uint64_t index = 0;
+    uint64_t inEntry = 0;
     uint64_t NW = 0;
-    unsigned long NoACGT = 0;
-    unsigned long NoC = 0;
-    unsigned long nLocs = 0;
-    unsigned long loc_size = 0;
-    c = fgetc(f);
+    uint64_t NoACGT = 0;
+    uint64_t NoC = 0;
+    uint64_t nLocs = 0;
+    uint64_t loc_size = 0;
+    c = buffered_fgetc(seq, &i, &r, f);
     while (!feof(f)) {
         if (!isupper(toupper(c))) {
             if (c == '>') {
-                c = fgetc(f);
+                c = buffered_fgetc(seq, &i, &r, f);
                 while (c != '\n')
-                    c = fgetc(f);
+                    c = buffered_fgetc(seq, &i, &r, f);
                 WE.seq++;
                 WER.seq++;
                 inEntry = 0;
                 index++;
             }
             NoC++;
-            c = fgetc(f);
+            c = buffered_fgetc(seq, &i, &r, f);
             continue;
         }
         shift_word(&WE.w);
@@ -496,7 +461,7 @@ void *dictionaryWithReverse(void *a) {
                 break;
         }
         index++;
-        if (inEntry >= (unsigned long) WORD_SIZE) {
+        if (inEntry >= (uint64_t) WORD_SIZE) {
             WE.pos = index - WORD_SIZE;
             if (WE.pos > Tot)
                 terror("position of forward word out of the sequence");
@@ -506,10 +471,11 @@ void *dictionaryWithReverse(void *a) {
             memcpy(&words[NW++], &WE, sizeof(wentry));
             memcpy(&words[NW++], &WER, sizeof(wentry));
         }
-        c = fgetc(f);
-
+        c = buffered_fgetc(seq, &i, &r, f);
     }
+
     fclose(f);
+    free(seq);
 
     if (NW == 0)
         terror("Words array empty");
@@ -541,7 +507,7 @@ void *dictionaryWithReverse(void *a) {
     hashentry *entries = NULL;
     if (NW == 0)
         terror("Words array empty");
-    if ((entries = calloc(NW, sizeof(hashentry))) == NULL) {
+    if ((entries = calloc(REALLOC_FREQ, sizeof(hashentry))) == NULL) {
         terror("not enough memory for hashentry array");
     }
 
@@ -558,18 +524,27 @@ void *dictionaryWithReverse(void *a) {
 #endif
 
     location loc;
+    i = 0;
+    k = 0;
     while (i < NW) {
-        loc.pos = words[i].pos;
-        loc.seq = words[i].seq;
-        loc.strand = words[i].strand;
-        if (wordcmp(&entries[j].w.b[0], &words[i].w.b[0], 32) != 0) {
+        loc.pos = words[k].pos;
+        loc.seq = words[k].seq;
+        loc.strand = words[k].strand;
+        if (wordcmp(&entries[j].w.b[0], &words[k].w.b[0], 32) != 0) {
             if (nLocs == 0)
                 terror("nLocs is 0");
             entries[j].locs = realloc(entries[j].locs, nLocs * sizeof(location));
             if (entries[j].locs == NULL)
                 terror("Error reallocating location array");
             j++;
-            memcpy(&entries[j].w.b[0], &words[i].w.b[0], 8);
+            if (j >= l) {
+                l += REALLOC_FREQ;
+                entries = realloc(entries, l * sizeof(hashentry));
+                if (entries == NULL) {
+                    terror("Error reallocating entries of seqX array");
+                }
+            }
+            memcpy(&entries[j].w.b[0], &words[k].w.b[0], 8);
             entries[j].num = 0;
             nLocs = 0;
             if ((entries[j].locs = calloc(SIZE_LOC, sizeof(location))) == NULL) {
@@ -590,6 +565,18 @@ void *dictionaryWithReverse(void *a) {
         memcpy(&entries[j].locs[nLocs++], &loc, sizeof(location));
         entries[j].num++;
         i++;
+        k++;
+        if (i % REALLOC_FREQ == 0) {
+            memmove(words, words + REALLOC_FREQ, NW - i);
+            more_words = realloc(words, (NW - i) * sizeof(wentry));
+            if (more_words == NULL) {
+                free(words);
+                terror("Error reallocating words of seqY array");
+            } else {
+                words = more_words;
+            }
+            k -= REALLOC_FREQ;
+        }
     }
 #ifdef VERBOSE
     fprintf(stdout, "After w2hd\n");

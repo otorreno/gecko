@@ -13,6 +13,7 @@ typedef struct {
     uint64_t SimTh;
     int wSize;
     uint64_t *nFrags;
+    uint64_t minSeqLen;
 } ComparisonArgs;
 
 /**
@@ -30,7 +31,7 @@ void loadWordOcurrences(hashentry he, location **pos, FILE **f);
 /**
  * Get the maximum score possible between the two sequences
  */
-unsigned long scoreMax(char *seq, char *seq2, uint64_t len, int point);
+uint64_t scoreMax(char *seq, char *seq2, uint64_t len, int point);
 
 /**
  * Function to read a fragment from the specified file

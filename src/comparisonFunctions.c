@@ -463,7 +463,7 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
 }
 
 struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
-                              hashentry *entriesX, uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY,
+                              hashentryF *entriesX, uint64_t nEntriesX, hashentryR *entriesY, uint64_t nEntriesY,
                               int wSize, uint64_t Lmin, uint64_t SimTh, uint64_t *nFrags) {
     int bufSizeForward = MAXBUF, bufSizeReverse = MAXBUF;
     uint64_t hitsInBufForward = 0, hitsInBufReverse = 0, hitsInBufForwardUsed = 0, hitsInBufReverseUsed = 0,

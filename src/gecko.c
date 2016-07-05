@@ -23,10 +23,10 @@ int main(int ac, char **av) {
 
     uint64_t nEntriesX = 0;
     uint64_t seqXLen = 0;
-    hashentry *entriesX;
+    hashentryF *entriesX;
     uint64_t nEntriesY = 0;
     uint64_t seqYLen = 0;
-    hashentry *entriesY;
+    hashentryR *entriesY;
 
     uint64_t nFrags;
 

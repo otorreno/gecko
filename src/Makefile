@@ -6,7 +6,7 @@ BIN=../bin
 all: gecko
 
 gecko: gecko.c
-	$(CC) $(CFLAGS) dictionaryFunctions.c commonFunctions.c comparisonFunctions.c quicksortWord.c quicksortHit.c gecko.c -lpthread -o $(BIN)/gecko
+	$(CC) $(CFLAGS) dictionaryFunctions.c commonFunctions.c comparisonFunctions.c quicksortWordForward.c quicksortWordReverse.c quicksortHit.c gecko.c -lpthread -o $(BIN)/gecko
 
 clean:
 	rm -rf $(BIN)/gecko

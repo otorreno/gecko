@@ -17,18 +17,6 @@ typedef struct {
 } ComparisonArgs;
 
 /**
- * Read a new hash entry from 'f' with no more occurences
- * than 'freqThr'
- */
-int readHashEntry(hashentry *h, FILE *f, uint64_t freqThr);
-
-/**
- * Read the ocurrences of the given hash entry from the
- * ocurrences file 'f' and stored them in 'pos'
- */
-void loadWordOcurrences(hashentry he, location **pos, FILE **f);
-
-/**
  * Get the maximum score possible between the two sequences
  */
 uint64_t scoreMax(char *seq, char *seq2, uint64_t len, int point);
@@ -65,8 +53,8 @@ long int sizeofFragment();
  * in memory
  */
 struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
-                              hashentry *entriesX,
-                              uint64_t nEntriesX, hashentry *entriesY, uint64_t nEntriesY, int wSize, uint64_t Lmin,
+                              hashentryF *entriesX,
+                              uint64_t nEntriesX, hashentryR *entriesY, uint64_t nEntriesY, int wSize, uint64_t Lmin,
                               uint64_t SimTh, uint64_t *nFrags);
 
 #endif /* COMPARISON_FUNCTIONS_H */

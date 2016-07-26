@@ -10,7 +10,6 @@
 #include "quicksortWordReverse.h"
 
 int wordcmp(unsigned char *w1, unsigned char *w2, int n) {
-
     int i = 0, limit;
 
     if (n % 4 != 0) {
@@ -181,6 +180,7 @@ void *dictionary(void *a) {
     uint64_t nLocs = 0;
     uint64_t loc_size = 0;
     c = buffered_fgetc(seq, &i, &r, f);
+    //TODO check the loop conditions
     while (!feof(f)) {
         if (!isupper(toupper(c))) {
             if (c == '>') {

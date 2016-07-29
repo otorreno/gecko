@@ -43,33 +43,36 @@ int main(int ac, char** av) {
 	lastPosition = 0;
 
 	hitsRead = fread(&hits[0], sizeof(hit), 1, fIn);
-	originalNumberOfHits += hitsRead;
-	diagonal = hits[0].diag;
-	while (hitsRead > 0) {
-		hitsRead = fread(&hits[1], sizeof(hit), 1, fIn);
-		originalNumberOfHits += hitsRead;
+        originalNumberOfHits += hitsRead;
+        if(hitsRead>0)
+                finalNumberOfHits += fwrite(&hits[0], sizeof(hit), 1, fOut);
+        diagonal = hits[0].diag;
+        while (hitsRead > 0) {
+                hitsRead = fread(&hits[1], sizeof(hit), 1, fIn);
+                originalNumberOfHits += hitsRead;
 
-		if(differentSequences(hits[0], hits[1])){
-			lastPosition=0;
-			diagonal = hits[0].diag;
-			memcpy(&hits[0], &hits[1], sizeof(hit));
-			continue;
-		}
+                if(differentSequences(hits[0], hits[1])){
+                        lastPosition = hits[1].posX + (2 * wSize - 1);
+                        diagonal = hits[1].diag;
+                        finalNumberOfHits += fwrite(&hits[1], sizeof(hit), 1, fOut);
+                        memcpy(&hits[0], &hits[1], sizeof(hit));
+                        continue;
+                }
 
-		if (hitsRead == 0) {
-			if(diagonal != hits[0].diag || hits[0].posX > (lastPosition - wSize)){
-				finalNumberOfHits += fwrite(&hits[0], sizeof(hit), 1, fOut);
-			}
-			continue;
-		}
+                if (hitsRead == 0 && originalNumberOfHits > 1) {
+                        if(diagonal != hits[0].diag || hits[0].posX > (lastPosition)){
+                                finalNumberOfHits += fwrite(&hits[0], sizeof(hit), 1, fOut);
+                        }
+                        continue;
+                }
 
-		if (diagonal != hits[1].diag || hits[1].posX > lastPosition) {
-			finalNumberOfHits += fwrite(&hits[0], sizeof(hit), 1, fOut);
-			lastPosition = hits[0].posX + (2 * wSize - 1);
-			diagonal = hits[0].diag;
-		}
-		memcpy(&hits[0], &hits[1], sizeof(hit));
-	}
+                if (diagonal != hits[1].diag || hits[1].posX > lastPosition) {
+                        lastPosition = hits[1].posX + (2 * wSize - 1);
+                        diagonal = hits[1].diag;
+                        finalNumberOfHits += fwrite(&hits[1], sizeof(hit), 1, fOut);
+                        memcpy(&hits[0], &hits[1], sizeof(hit));
+                }
+        }
 
 	fprintf(stdout,
 			"\nfilterHits\noriginal number of Hits=%" PRIu64 "  Final number of hits=%" PRIu64 "\n",

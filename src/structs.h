@@ -7,8 +7,13 @@
 
 //Structs required for the dotplot workflow
 #define MAXLID 200
-#define READBUF 100000
-#define REALLOC_FREQ 10000
+//#define READBUF 2000000000 //2 GB
+#define READBUF 50000000 //50MB
+#define INITSEQS 300000 //Number of starting sequences (in database)
+#define REALLOC_FREQ 40000
+#define POINT 4
+
+#define MAXLID 200
 
 //Struct for words program
 typedef struct {
@@ -150,6 +155,8 @@ struct FragFile {
     int64_t block;
     //'f' for the forward strain and 'r' for the reverse
     char strand;
+    //E-value of fragment
+    long double evalue;
 };
 
 //Struct for leeSeqDB function
@@ -158,4 +165,31 @@ struct Sequence {
     char *datos;
 };
 
+//Struct for holding nucleotide frequencies
+struct tFreqs{
+    uint64_t A;
+    uint64_t C;
+    uint64_t G;
+    uint64_t T;
+    uint64_t total;
+};
+
+//Struct for calculating karlin and lambda parameters for different query/sequence and PAM matrix
+struct statsHSP{
+    struct tFreqs tf;
+    double karlin;
+    double lambda;
+    
+};
+
+//Struct for reads index tuple
+struct rIndex2 {
+    char id[MAXLID];
+    uint64_t  rNumber;
+    uint64_t  rLen;
+    uint64_t  rLmasked; //Masked positions
+    uint64_t  nonACGT;  //N's
+    uint64_t  pos;      //Start position of sequence
+    uint64_t  Lac;      //Accumulated length
+};
 #endif

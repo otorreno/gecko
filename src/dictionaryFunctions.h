@@ -10,6 +10,8 @@ typedef struct {
     char *seqFile;
     uint64_t *nEntries;
     uint64_t *seqLen;
+    struct statsHSP * seqStats;
+    uint64_t nSeqs;
 } DictionaryArgs;
 
 /**
@@ -53,5 +55,10 @@ void *dictionary(void *a);
  * a sequence dictionary
  */
 void *dictionaryWithReverse(void *a);
+
+/**
+ * Computes the karlin and lambda values from residues frequencies and PAM scoring matrix
+ */
+void computeKarlinLambda(struct statsHSP * seqStats, uint64_t nSeqs);
 
 #endif /* DICTIONARY_FUNCTIONS_H */

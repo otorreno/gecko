@@ -3,14 +3,15 @@
 #include <string.h>
 #include <ctype.h>
 #include <pthread.h>
+#include <float.h>
 #include "structs.h"
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
 #include "comparisonFunctions.h"
 
 int main(int ac, char **av) {
-    if (ac != 7) {
-        terror("USE: gecko seqFileX.IN seqFileX.IN fragsFile.OUT Lmin SimTh WL");
+    if (ac < 7) {
+        terror("USE: gecko seqFileX.IN seqFileX.IN fragsFile.OUT Lmin SimTh WL *min_e_value");
     }
 
     char *seqX = av[1];
@@ -20,6 +21,9 @@ int main(int ac, char **av) {
     uint64_t Lmin = atoi(av[4]);
     uint64_t SimTh = atoi(av[5]);
     int wSize = atoi(av[6]);
+
+    long double e_value = LDBL_MAX; //If no expected value was provided, use Long Double Max which will never happend
+    if(ac == 8) e_value = (long double) atof(av[7]);
 
     uint64_t nEntriesX = 0;
     uint64_t seqXLen = 0;
@@ -47,12 +51,14 @@ int main(int ac, char **av) {
     pthread_join(thX, (void **) &entriesX);
     pthread_join(thY, (void **) &entriesY);
 
+
     free(argsX.seqFile);
     free(argsY.seqFile);
 
+
     //Hits, SortHits and filterHits
     hitsAndFrags(seqX, seqY, out, seqXLen, seqYLen, entriesX, nEntriesX, entriesY, nEntriesY, wSize, Lmin, SimTh,
-                 &nFrags);
+                 &nFrags, argsX.seqStats, argsY.seqStats, e_value);
     uint64_t i;
 
     for (i = 0; i < nEntriesX; i++) {
@@ -63,6 +69,8 @@ int main(int ac, char **av) {
         free(entriesY[i].locs);
     }
     free(entriesY);
+
+    free(argsY.seqStats);
 
     return 0;
 }

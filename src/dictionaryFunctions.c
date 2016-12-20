@@ -3,11 +3,13 @@
 #include <string.h>
 #include <ctype.h>
 #include <inttypes.h>
+#include <math.h>
 #include "structs.h"
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
 #include "quicksortWordForward.h"
 #include "quicksortWordReverse.h"
+#include "karlin.h"
 
 int wordcmp(unsigned char *w1, unsigned char *w2, int n) {
     int i = 0, limit;
@@ -135,6 +137,7 @@ void *dictionary(void *a) {
     wentryF *more_words = NULL;
     char *seq = NULL;
     uint64_t i = 0, r = 0;
+    uint64_t Tot = 0;
 
     if ((f = fopen(args->seqFile, "rt")) == NULL) {
         fprintf(stdout, "opening sequence file: %s\n", args->seqFile);
@@ -164,30 +167,68 @@ void *dictionary(void *a) {
     //To force the read
     i = READBUF + 1;
 
+    #ifdef VERBOSE
+        fprintf(stdout, "Calculating sequence length of SeqX\n");
+        fflush(stdout);
+    #endif
+
+    args->nSeqs = 0;
+    c = buffered_fgetc(seq, &i, &r, f);
+    while ((!feof(f) || (feof(f) && i < r))) {
+        if (!isupper(toupper(c))) {
+            if (c == '>') {
+                args->nSeqs++;
+                c = buffered_fgetc(seq, &i, &r, f);
+                while (c != '\n')
+                    c = buffered_fgetc(seq, &i, &r, f);
+                c = buffered_fgetc(seq, &i, &r, f);
+                continue;
+            }
+        }
+        Tot++;
+        c = buffered_fgetc(seq, &i, &r, f);
+    }
+
+    fseek(f, 0, SEEK_SET);
+
+    //To force the read
+    i = READBUF + 1;
+
     c = buffered_fgetc(seq, &i, &r, f);
     while (c != '\n') {
         c = buffered_fgetc(seq, &i, &r, f);
     }
+
+    #ifdef VERBOSE
+        fprintf(stdout, "SeqX Len: %" PRIu64 " composed of %" PRIu64" sequence(s)\n", Tot, args->nSeqs);
+        fflush(stdout);
+    #endif
+
+    args->seqStats = (struct statsHSP *) malloc(args->nSeqs * sizeof(struct statsHSP));
+    if(args->seqStats == NULL) terror("Could not allocate memory for stats array");
 
     wentryF WE;
     WE.seq = 0;
     uint64_t index = 0;
     uint64_t inEntry = 0;
     uint64_t NW = 0;
-    uint64_t Tot = 0;
+    Tot = 0;
     uint64_t NoACGT = 0;
     uint64_t NoC = 0;
     uint64_t nLocs = 0;
     uint64_t loc_size = 0;
+    args->seqStats[0].tf.total = 0;
     c = buffered_fgetc(seq, &i, &r, f);
     //TODO check the loop conditions
-    while (!feof(f)) {
+    while (!feof(f) || (feof(f) && i < r)){
         if (!isupper(toupper(c))) {
             if (c == '>') {
                 c = buffered_fgetc(seq, &i, &r, f);
-                while (c != '\n')
+                while (c != '\n'){
                     c = buffered_fgetc(seq, &i, &r, f);
+                }
                 WE.seq++;
+                args->seqStats[WE.seq].tf.total = 0;
                 inEntry = 0;
                 index++;
             }
@@ -195,21 +236,26 @@ void *dictionary(void *a) {
             c = buffered_fgetc(seq, &i, &r, f);
             continue;
         }
+        args->seqStats[WE.seq].tf.total++;
         shift_word(&WE.w);
         switch (c) {
             case 'A':
                 inEntry++;
+                args->seqStats[WE.seq].tf.A++;
                 break;
             case 'C':
                 WE.w.b[BYTES_IN_WORD - 1] |= 1;
                 inEntry++;
+                args->seqStats[WE.seq].tf.C++;
                 break;
             case 'G':
                 WE.w.b[BYTES_IN_WORD - 1] |= 2;
                 inEntry++;
+                args->seqStats[WE.seq].tf.G++;
                 break;
             case 'T':
                 WE.w.b[BYTES_IN_WORD - 1] |= 3;
+                args->seqStats[WE.seq].tf.T++;
                 inEntry++;
                 break;
             default :
@@ -228,6 +274,10 @@ void *dictionary(void *a) {
 
     }
     //printf("FILE: Create %d Words --(seqLen=%d NoACGT=%d noChar=%d\n",NW,Tot,NoACGT, NoC);
+
+    //Compute karlin and lambda parameters. Not needed since PAM matrix uniquely determines a pair of Karlin,Lambda
+    //computeKarlinLambda(args->seqStats, args->nSeqs);
+
     free(seq);
     fclose(f);
 
@@ -244,19 +294,19 @@ void *dictionary(void *a) {
         terror("Error reallocating words of seqX array");
 
 #ifdef VERBOSE
-    fprintf(stdout, "Before sorting words\n");
+    fprintf(stdout, "Before sorting words of seqX\n");
     fflush(stdout);
 #endif
 
     psortWF(32, words, NW);
 
 #ifdef VERBOSE
-    fprintf(stdout, "After sorting words\n");
+    fprintf(stdout, "After sorting words of seqX\n");
     fflush(stdout);
 #endif
 
 #ifdef VERBOSE
-    fprintf(stdout, "Before w2hd\n");
+    fprintf(stdout, "Before w2hd of seqX\n");
 #endif
     hashentryF *entries = NULL;
     if (NW == 0)
@@ -274,7 +324,7 @@ void *dictionary(void *a) {
     loc_size = SIZE_LOC;
 
 #ifdef VERBOSE
-    fprintf(stdout, "memory allocated w2hd\n");
+    fprintf(stdout, "memory allocated w2hd for seqX\n");
 #endif
 
     i = 0;
@@ -321,8 +371,9 @@ void *dictionary(void *a) {
         entries[j].num++;
         i++;
         k++;
+	
         if (i % REALLOC_FREQ == 0) {
-            memmove(words, words + REALLOC_FREQ, NW - i);
+            memmove(words, words + REALLOC_FREQ, sizeof(wentryF)*(NW - i));
             more_words = realloc(words, (NW - i) * sizeof(wentryF));
             if (more_words == NULL) {
                 free(words);
@@ -332,9 +383,11 @@ void *dictionary(void *a) {
             }
             k -= REALLOC_FREQ;
         }
+	
+	
     }
 #ifdef VERBOSE
-    fprintf(stdout, "After w2hd\n");
+    fprintf(stdout, "After w2hd of seqX\n");
 #endif
 
     if (j == 0)
@@ -382,21 +435,24 @@ void *dictionaryWithReverse(void *a) {
 
     //To force read
     i = READBUF + 1;
-
+    /*
     c = buffered_fgetc(seq, &i, &r, f);
     while (c != '\n') {
         c = buffered_fgetc(seq, &i, &r, f);
     }
+    */
 
 #ifdef VERBOSE
     fprintf(stdout, "Calculating sequence length of SeqY\n");
     fflush(stdout);
 #endif
 
+    args->nSeqs = 0;
     c = buffered_fgetc(seq, &i, &r, f);
-    while (!feof(f)) {
+    while ((!feof(f) || (feof(f) && i < r))) {
         if (!isupper(toupper(c))) {
             if (c == '>') {
+                args->nSeqs++;
                 c = buffered_fgetc(seq, &i, &r, f);
                 while (c != '\n')
                     c = buffered_fgetc(seq, &i, &r, f);
@@ -409,9 +465,12 @@ void *dictionaryWithReverse(void *a) {
     }
 
 #ifdef VERBOSE
-    fprintf(stdout, "SeqY Len: %" PRIu64 "\n", Tot);
+    fprintf(stdout, "SeqY Len: %" PRIu64 " composed of %" PRIu64" sequence(s)\n", Tot, args->nSeqs);
     fflush(stdout);
 #endif
+
+    args->seqStats = (struct statsHSP *) malloc(args->nSeqs * sizeof(struct statsHSP));
+    if(args->seqStats == NULL) terror("Could not allocate memory for stats array");
 
     fseek(f, 0, SEEK_SET);
     //To force read
@@ -443,6 +502,7 @@ void *dictionaryWithReverse(void *a) {
     WER.strand = 'r';
     WE.seq = 0;
     WER.seq = 0;
+    args->seqStats[0].tf.total = 0;
     uint64_t index = 0;
     uint64_t inEntry = 0;
     uint64_t NW = 0;
@@ -451,12 +511,13 @@ void *dictionaryWithReverse(void *a) {
     uint64_t nLocs = 0;
     uint64_t loc_size = 0;
     c = buffered_fgetc(seq, &i, &r, f);
-    while (!feof(f)) {
-        if (!isupper(toupper(c))) {
+    while (!feof(f) || (feof(f) && i < r)){
+	if (!isupper(toupper(c))) {
             if (c == '>') {
                 c = buffered_fgetc(seq, &i, &r, f);
-                while (c != '\n')
+                while (c != '\n'){
                     c = buffered_fgetc(seq, &i, &r, f);
+                }
                 WE.seq++;
                 WER.seq++;
                 inEntry = 0;
@@ -466,26 +527,31 @@ void *dictionaryWithReverse(void *a) {
             c = buffered_fgetc(seq, &i, &r, f);
             continue;
         }
+        args->seqStats[WE.seq].tf.total++;
         shift_word(&WE.w);
         shift_word_right(&WER.w);
         switch (c) {
             case 'A':
                 WER.w.b[0] |= 192;
                 inEntry++;
+                args->seqStats[WE.seq].tf.A++;
                 break;
             case 'C':
                 WER.w.b[0] |= 128;
                 WE.w.b[BYTES_IN_WORD - 1] |= 1;
                 inEntry++;
+                args->seqStats[WE.seq].tf.C++;
                 break;
             case 'G':
                 WER.w.b[0] |= 64;
                 WE.w.b[BYTES_IN_WORD - 1] |= 2;
                 inEntry++;
+                args->seqStats[WE.seq].tf.G++;
                 break;
             case 'T':
                 WE.w.b[BYTES_IN_WORD - 1] |= 3;
                 inEntry++;
+                args->seqStats[WE.seq].tf.T++;
                 break;
             default :
                 inEntry = 0;
@@ -509,6 +575,9 @@ void *dictionaryWithReverse(void *a) {
     fclose(f);
     free(seq);
 
+    //Not needed since the karlin and lambda parameters do not change if PAM matrix is the same
+    //computeKarlinLambda(args->seqStats, args->nSeqs);
+
     if (NW == 0)
         terror("Words array empty");
 
@@ -522,19 +591,19 @@ void *dictionaryWithReverse(void *a) {
         terror("Error reallocating words of seqY array");
 
 #ifdef VERBOSE
-    fprintf(stdout, "Before sorting\n");
+    fprintf(stdout, "Before sorting seqY\n");
     fflush(stdout);
 #endif
 
     psortWR(32, words, NW);
 
 #ifdef VERBOSE
-    fprintf(stdout, "After sorting\n");
+    fprintf(stdout, "After sorting seqY\n");
     fflush(stdout);
 #endif
 
 #ifdef VERBOSE
-    fprintf(stdout, "Before w2hd\n");
+    fprintf(stdout, "Before w2hd seqY\n");
 #endif
     hashentryR *entries = NULL;
     if (NW == 0)
@@ -543,6 +612,7 @@ void *dictionaryWithReverse(void *a) {
         terror("not enough memory for hashentry array");
     }
 
+    //Copy first entry
     memcpy(&entries[0].w.b[0], &words[0].w.b[0], 8);
     entries[0].num = 0;
     entries[0].locs = NULL;
@@ -552,23 +622,29 @@ void *dictionaryWithReverse(void *a) {
     loc_size = SIZE_LOC;
 
 #ifdef VERBOSE
-    fprintf(stdout, "memory allocated w2hd\n");
+    fprintf(stdout, "memory allocated w2hd seqY\n");
 #endif
 
     locationR loc;
     i = 0;
     k = 0;
+    //While there are still words in the dictionary
     while (i < NW) {
+	//Copy current location to aux var loc
         loc.pos = words[k].pos;
         loc.seq = words[k].seq;
         loc.strand = words[k].strand;
+	//If the last added entry is not equal to the current word in the dictionary (new entry)
         if (wordcmp(&entries[j].w.b[0], &words[k].w.b[0], 32) != 0) {
             if (nLocs == 0)
                 terror("nLocs is 0");
+	    //Realloc the locations of the last entry to not consume that much memory
             entries[j].locs = realloc(entries[j].locs, nLocs * sizeof(locationR));
             if (entries[j].locs == NULL)
                 terror("Error reallocating location array");
+	    //Since its a new entry, increase j to work with this new one 
             j++;
+	    //If we have no more free allocated entries, realloc everything to get more
             if (j >= l) {
                 l += REALLOC_FREQ;
                 entries = realloc(entries, l * sizeof(hashentryR));
@@ -576,15 +652,17 @@ void *dictionaryWithReverse(void *a) {
                     terror("Error reallocating entries of seqX array");
                 }
             }
+	    //Copy the actual word to the new entry
             memcpy(&entries[j].w.b[0], &words[k].w.b[0], 8);
             entries[j].num = 0;
             nLocs = 0;
+	    //Allocate an initial SIZE_LOC of locations for the new entry
             if ((entries[j].locs = calloc(SIZE_LOC, sizeof(locationR))) == NULL) {
                 terror("not enough memory for locs array");
             }
             loc_size = SIZE_LOC;
         }
-
+	//If it was not a new entry, but it has too many repetitions, reallocate the locations with an extra SIZE_LOC
         if (nLocs >= loc_size) {
             loc_size += SIZE_LOC;
 //            fprintf(stdout, "Reallocating memory from: %lu to: %lu\n",loc_size-SIZE_LOC,loc_size);
@@ -594,12 +672,15 @@ void *dictionaryWithReverse(void *a) {
             }
 
         }
+	//Copy the new location (repetition) to the current entry
         memcpy(&entries[j].locs[nLocs++], &loc, sizeof(locationR));
         entries[j].num++;
         i++;
         k++;
+	//This part frees words while on runtime [Currently there is a bug]
+	
         if (i % REALLOC_FREQ == 0) {
-            memmove(words, words + REALLOC_FREQ, NW - i);
+            memmove(words, words + REALLOC_FREQ, sizeof(wentryR)*(NW - i));
             more_words = realloc(words, (NW - i) * sizeof(wentryR));
             if (more_words == NULL) {
                 free(words);
@@ -609,9 +690,10 @@ void *dictionaryWithReverse(void *a) {
             }
             k -= REALLOC_FREQ;
         }
+	
     }
 #ifdef VERBOSE
-    fprintf(stdout, "After w2hd\n");
+    fprintf(stdout, "After w2hd seqY\n");
 #endif
 
     if (j == 0)
@@ -623,5 +705,189 @@ void *dictionaryWithReverse(void *a) {
     free(words);
     *(args->nEntries) = j;
     *(args->seqLen) = Tot;
+
+
     return entries;
+}
+
+void computeKarlinLambda(struct statsHSP * seqStats, uint64_t nSeqs){
+       
+
+    int max_value = POINT;
+    int min_value = -POINT;
+    //Range from -POINT to POINT
+    double * prob_array_range = (double *) malloc((2*POINT + 1) * sizeof(double));
+
+    uint64_t i, j;
+
+    double prob_match = 0, prob_miss = 0;
+    double pA, pC, pG, pT;
+    double H; //Used in Karlin function
+    //double total;
+    //Compute K and lambda for each sequence
+    /*
+    for(i=0;i<nSeqs;i++){
+        total = seqStats[i].tf.A + seqStats[i].tf.C + seqStats[i].tf.G + seqStats[i].tf.T;
+        pA = ((double) seqStats[i].tf.A/total);
+        pC = ((double) seqStats[i].tf.C/total);
+        pG = ((double) seqStats[i].tf.G/total);
+        pT = ((double) seqStats[i].tf.T/total);
+        prob_match =  pA * pA + pC * pC + pG * pG + pT * pT;
+        prob_miss = pA * (pC + pG + pT) + pC * (pA + pG + pT) + pG * (pA + pC + pT) + pT * (pA + pC + pG);
+        prob_array_range[0] = prob_miss;
+        prob_array_range[2*POINT] = prob_match;
+        for(j=1;j<2*POINT;j++){
+            prob_array_range[j] = 0.0;
+        }
+        karlin(min_value, max_value, prob_array_range, &seqStats[i].lambda, &seqStats[i].karlin, &H);
+
+        fprintf(stdout, "[INFO] K: %e L:%e\n", seqStats[i].lambda, seqStats[i].karlin);
+        getchar();
+    }
+    */
+    
+    uint64_t tA=0, tC=0, tG=0, tT=0, all=0;
+    for(i=0;i<nSeqs;i++){
+        tA += seqStats[i].tf.A;
+        tC += seqStats[i].tf.C;
+        tG += seqStats[i].tf.G;
+        tT += seqStats[i].tf.T;
+        all = tA + tC + tG + tT;
+    }
+    pA = ((double) tA/all);
+    pC = ((double) tC/all);
+    pG = ((double) tG/all);
+    pT = ((double) tT/all);
+
+    prob_match =  pA * pA + pC * pC + pG * pG + pT * pT;
+    prob_miss = pA * (pC + pG + pT) + pC * (pA + pG + pT) + pG * (pA + pC + pT) + pT * (pA + pC + pG);
+    prob_array_range[0] = prob_miss;
+    prob_array_range[2*POINT] = prob_match;
+    for(j=1;j<2*POINT;j++){
+        prob_array_range[j] = 0.0;
+    }
+    karlin(min_value, max_value, prob_array_range, &seqStats[0].lambda, &seqStats[0].karlin, &H);
+    fprintf(stdout, "[INFO] K: %e L:%e\n", seqStats[0].lambda, seqStats[0].karlin);
+    
+    free(prob_array_range);
+}
+
+
+boolean karlin(int low,int high,double *pr,double *lambda,double *K,double *H)
+{
+    int i,j,range,lo,hi,first,last;
+    double up,new,sum,Sum,av,beta,oldsum,ratio,ftemp;
+    double *p,*P,*ptrP,*ptr1,*ptr2;
+
+    /* Check that scores and their associated probabilities are valid     */
+
+    if (low>=0) {
+       fprintf(stderr,"Lowest score must be negative.\n");
+       return FALSE;
+    }
+    for (i=range=high-low;i> -low && !pr[i];--i);
+    if (i<= -low) {
+       fprintf(stderr,"A positive score must be possible.\n");
+       return FALSE;
+    }
+    for (sum=i=0;i<=range;sum+=pr[i++]) if (pr[i]<0) {
+       fprintf(stderr,"Negative probabilities not allowed.\n");
+       return FALSE;
+    }
+    if (sum<0.99995 || sum>1.00005)
+       fprintf(stderr,"Probabilities sum to %.4f.  Normalizing.\n",sum);
+    //NEW(p,range+1,double);
+    p=(double *) calloc(range+1,sizeof(double));
+    if(p==NULL) fprintf(stderr,"Out of Memory.");
+
+    for (Sum=low,i=0;i<=range;++i) Sum+=i*(p[i]=pr[i]/sum);
+    if (Sum>=0) {
+       fprintf(stderr,"Invalid (non-negative) expected score:  %.3f\n",Sum);
+       return FALSE;
+    }
+
+    /* Calculate the parameter lambda */
+
+    up=0.5;
+    do {
+        up*=2;
+        ptr1=p;
+        beta=exp(up);
+        ftemp=exp(up*(low-1));
+        for (sum=i=0;i<=range;++i) sum+= *ptr1++ * (ftemp*=beta);
+    }
+    while (sum<1.0);
+    for (*lambda=j=0;j<25;++j) {
+        new=(*lambda+up)/2.0;
+        beta=exp(new);
+        ftemp=exp(new*(low-1));
+        ptr1=p;
+        for (sum=i=0;i<=range;++i) sum+= *ptr1++ * (ftemp*=beta);
+        if (sum>1.0) up=new;
+        else *lambda=new;
+    }
+
+    /* Calculate the pamameter K */
+
+    ptr1=p;
+    ftemp=exp(*lambda*(low-1));
+    for (av=0,i=low;i<=high;++i) av+= *ptr1++ *i*(ftemp*=beta);
+        *H= *lambda*av/log(2.0);
+    Sum=lo=hi=0;
+    
+    //NEW(P,KARLINMAXIT*range+1,double);
+    P=(double *) calloc(KARLINMAXIT*range+1,sizeof(double));
+
+
+    for (*P=sum=oldsum=j=1;j<=KARLINMAXIT && sum>0.001;Sum+=sum/=j++) {
+        first=last=range;
+        for (ptrP=P+(hi+=high)-(lo+=low);ptrP>=P;*ptrP-- =sum) {
+            ptr1=ptrP-first;
+            ptr2=p+first;
+            for (sum=0,i=first;i<=last;++i) sum+= *ptr1-- * *ptr2++;
+            if (first) --first;
+            if (ptrP-P<=range) --last;
+        }
+        ftemp=exp(*lambda*(lo-1));
+        for (sum=0,i=lo;i;++i) sum+= *++ptrP * (ftemp*=beta);
+        for (;i<=hi;++i) sum+= *++ptrP;
+        ratio=sum/oldsum;
+        oldsum=sum;
+    }
+    for (;j<=200;Sum+=oldsum/j++) oldsum*=ratio;
+    for (i=low;!p[i-low];++i);
+    for (j= -i;i<high && j>1;) if (p[++i-low]) j=karlin_gcd(j,i);
+    *K = (j*exp(-2*Sum))/(av*(1.0-exp(- *lambda*j)));
+    free(p);
+    free(P);
+    return TRUE;        /* Parameters calculated successfully */
+}
+
+double ExpectedInformation(a_type A, double lambda, double *freq)
+{
+        int i,j;
+        double sum,tot,fij,eij,mij;
+
+        sum = tot = 0.0;
+
+        for (i=1; i<=20; i++){
+           for (j=1; j<=20; j++) {
+                mij = valAlphaR(i,j,A);
+                fij = freq[i]*freq[j];
+                tot += fij;
+                eij = mij*fij*exp(lambda*mij);
+                sum += eij;
+           }
+        }
+        return(lambda*sum/tot);
+}
+
+int karlin_gcd(int a,int b)
+{
+    int c;
+
+    if (b<0) b= -b;
+    if (b>a) { c=a; a=b; b=c; }
+    for (;b;b=c) { c=a%b; a=b; }
+    return a;
 }

@@ -14,6 +14,9 @@ typedef struct {
     int wSize;
     uint64_t *nFrags;
     uint64_t minSeqLen;
+    struct statsHSP * seqStatsX;
+    struct statsHSP * seqStatsY;
+    long double e_value;
 } ComparisonArgs;
 
 /**
@@ -55,6 +58,7 @@ long int sizeofFragment();
 struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
                               hashentryF *entriesX,
                               uint64_t nEntriesX, hashentryR *entriesY, uint64_t nEntriesY, int wSize, uint64_t Lmin,
-                              uint64_t SimTh, uint64_t *nFrags);
+                              uint64_t SimTh, uint64_t *nFrags, struct statsHSP * seqStatsX, struct statsHSP * seqStatsY,
+                              long double e_value);
 
 #endif /* COMPARISON_FUNCTIONS_H */

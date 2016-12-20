@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <math.h>
 #include "structs.h"
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
@@ -12,7 +13,6 @@
 
 #define MAXBUF 1000000
 #define MaxREP 100
-#define POINT 4
 
 int FragFromHit(long M[1000][100], struct FragFile *myF, hit *H, struct Sequence *sX,
                 uint64_t n0, struct Sequence *sY,
@@ -23,10 +23,12 @@ int FragFromHitReverse(long M[1000][100], struct FragFile *myF, hit *H, struct S
                        uint64_t n1, uint64_t nSeqs1, uint64_t Lm, uint64_t SimTh, int WL);
 
 struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64_t Lmin, uint64_t SimTh, int WL,
-                       uint64_t *nF, uint64_t *nHU);
+                       uint64_t *nF, uint64_t *nHU, struct statsHSP * seqStatsX, struct statsHSP * seqStatsY, long double e_value);
 
 struct FragFile *fragsReverse(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64_t Lmin, uint64_t SimTh, int WL,
-                              uint64_t *nF, uint64_t *nHU);
+                              uint64_t *nF, uint64_t *nHU, struct statsHSP * seqStatsX, struct statsHSP * seqStatsY, long double e_value);
+
+long double computeExpectedValueOfFrag(struct FragFile * frag, struct statsHSP * seqStatsX, struct statsHSP * seqStatsY);
 
 inline char complement(char c) {
     switch (c) {
@@ -187,6 +189,7 @@ void writeFragment(struct FragFile *frag, FILE *f) {
         fwrite(&frag->seqY, sizeof(uint64_t), 1, f);
         fwrite(&frag->block, sizeof(int64_t), 1, f);
         fputc(frag->strand, f);
+	fwrite(&frag->evalue, sizeof(long double), 1, f);
     } else {
         //Little endian
         endianessConversion((char *) (&frag->diag), tmpArray, sizeof(int64_t));
@@ -214,6 +217,8 @@ void writeFragment(struct FragFile *frag, FILE *f) {
         endianessConversion((char *) (&frag->block), tmpArray, sizeof(int64_t));
         fwrite(tmpArray, sizeof(int64_t), 1, f);
         fputc(frag->strand, f);
+	endianessConversion((char *) (&frag->evalue), tmpArray, sizeof(long double));
+	fwrite(tmpArray, sizeof(long double), 1, f);
     }
 }
 
@@ -264,14 +269,10 @@ int differentSequences(hit h1, hit h2) {
     return h1.seqX != h2.seqX || h1.seqY != h2.seqY;
 }
 
-uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize, hit **output) {
+uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
     if (hitsInBuf == 0 || hBuf == NULL) {
-        *output = NULL;
         return 0;
     }
-    hit *hBuf2 = (hit *) calloc(hitsInBuf, sizeof(hit));
-    if (hBuf2 == NULL)
-        perror("Not enough memory for filtered hits buffer");
 
     int64_t diagonal;
     uint64_t lastPosition;
@@ -281,34 +282,39 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize, hit **output) {
 
     originalNumberOfHits = hitsInBuf;
     uint64_t i = 0;
+    hit lastHitNotFiltered;
 
-    diagonal = hBuf[i].posX - hBuf[i].posY;
-
-    while (i < (hitsInBuf - 1)) {
-        if (differentSequences(hBuf[i], hBuf[i + 1])) {
-            lastPosition = 0;
-            diagonal = hBuf[i].posX - hBuf[i].posY;
+    memcpy(&lastHitNotFiltered, &hBuf[0], sizeof(hit));
+    finalNumberOfHits++;
+    diagonal = lastHitNotFiltered.posX - lastHitNotFiltered.posY; 
+    while (i < hitsInBuf) {
+        if (differentSequences(lastHitNotFiltered, hBuf[i + 1])) {
+            lastPosition = hBuf[i+1].posX + (2*wSize-1);
+            diagonal = hBuf[i+1].posX - hBuf[i+1].posY;
+	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+	    memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
             i++;
             continue;
         }
 
         if (diagonal != (hBuf[i + 1].posX - hBuf[i + 1].posY) || hBuf[i + 1].posX > lastPosition) {
-            memcpy(&hBuf2[finalNumberOfHits++], &hBuf[i], sizeof(hit));
-            lastPosition = hBuf[i].posX + (2 * wSize - 1);
-            diagonal = hBuf[i].posX - hBuf[i].posY;
+            lastPosition = hBuf[i+1].posX + (2 * wSize - 1);
+            diagonal = hBuf[i+1].posX - hBuf[i+1].posY;
+	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
         }
         i++;
     }
 
-    if (diagonal != (hBuf[i].posX - hBuf[i].posY) || hBuf[i].posX > (lastPosition - wSize)) {
-        memcpy(&hBuf2[finalNumberOfHits++], &hBuf[i], sizeof(hit));
+    if (diagonal != (hBuf[i].posX - hBuf[i].posY) || hBuf[i].posX > (lastPosition)) {
+        memcpy(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
     }
 
     if (finalNumberOfHits == 0) {
         perror("0 Hits. At least one hit should be kept in the filtering");
     }
-    *output = hBuf2 = realloc(hBuf2, finalNumberOfHits * sizeof(hit));
-    if (hBuf2 == NULL)
+    hBuf = realloc(hBuf, finalNumberOfHits * sizeof(hit));
+    if (hBuf == NULL)
         perror("Error reallocating filtered hits array");
 
     fprintf(stdout,
@@ -323,51 +329,52 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize, hit **output) {
     //End of filterhits
 }
 
-uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t minSeqXLenSeqYLen, hit **output) {
+uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t minSeqXLenSeqYLen) {
     if (hitsInBuf == 0 || hBuf == NULL) {
-        *output = NULL;
         return 0;
     }
-    hit *hBuf2 = (hit *) calloc(hitsInBuf, sizeof(hit));
-    if (hBuf2 == NULL)
-        perror("Not enough memory for filtered hits buffer");
 
     int64_t diagonal;
     uint64_t lastPosition;
     uint64_t originalNumberOfHits = 0, finalNumberOfHits = 0;
 
     lastPosition = 0;
-
     originalNumberOfHits = hitsInBuf;
     uint64_t i = 0;
 
-    diagonal = hBuf[i].posX + hBuf[i].posY - minSeqXLenSeqYLen;
+    hit lastHitNotFiltered;
 
-    while (i < (hitsInBuf - 1)) {
-        if (differentSequences(hBuf[i], hBuf[i + 1])) {
-            lastPosition = 0;
-            diagonal = hBuf[i].posX + hBuf[i].posY - minSeqXLenSeqYLen;
+    memcpy(&lastHitNotFiltered, &hBuf[0], sizeof(hit));
+    finalNumberOfHits++;
+    diagonal = lastHitNotFiltered.posX - lastHitNotFiltered.posY; 
+    while (i < hitsInBuf) {
+        if (differentSequences(lastHitNotFiltered, hBuf[i + 1])) {
+            lastPosition = hBuf[i+1].posX + (2*wSize-1);
+            diagonal = hBuf[i+1].posX + hBuf[i+1].posY - minSeqXLenSeqYLen;
+	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
             i++;
             continue;
         }
 
         if (diagonal != (hBuf[i + 1].posX + hBuf[i + 1].posY - minSeqXLenSeqYLen) || hBuf[i + 1].posX > lastPosition) {
-            memcpy(&hBuf2[finalNumberOfHits++], &hBuf[i], sizeof(hit));
-            lastPosition = hBuf[i].posX + (2 * wSize - 1);
-            diagonal = hBuf[i].posX + hBuf[i].posY - minSeqXLenSeqYLen;
+            lastPosition = hBuf[i+1].posX + (2 * wSize - 1);
+            diagonal = hBuf[i+1].posX + hBuf[i+1].posY - minSeqXLenSeqYLen;
+	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
         }
         i++;
     }
 
-    if (diagonal != (hBuf[i].posX + hBuf[i].posY - minSeqXLenSeqYLen) || hBuf[i].posX > (lastPosition - wSize)) {
-        memcpy(&hBuf2[finalNumberOfHits++], &hBuf[i], sizeof(hit));
+    if (diagonal != (hBuf[i].posX + hBuf[i].posY - minSeqXLenSeqYLen) || hBuf[i].posX > (lastPosition)) {
+        memcpy(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
     }
 
     if (finalNumberOfHits == 0) {
         perror("0 Hits. At least one hit should be kept in the filtering");
     }
-    *output = hBuf2 = realloc(hBuf2, finalNumberOfHits * sizeof(hit));
-    if (hBuf2 == NULL)
+    hBuf = realloc(hBuf, finalNumberOfHits * sizeof(hit));
+    if (hBuf == NULL)
         perror("Error reallocating filtered hits array");
 
     fprintf(stdout,
@@ -385,7 +392,6 @@ uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t mi
 void *sortHitsFilterHitsFragHitsTh(void *a) {
     ComparisonArgs *args = (ComparisonArgs *) a;
     uint64_t HIB;
-    hit *hBuf2;
 
     if (args->nHits > 0) {
 #ifdef VERBOSE
@@ -403,14 +409,15 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
         fflush(stdout);
 #endif
 
-        HIB = filterHits(args->hits, args->nHits, args->wSize, &hBuf2);
+        HIB = filterHits(args->hits, args->nHits, args->wSize);
+
+	
 
 #ifdef VERBOSE
         fprintf(stdout, "End of filtering Hits 1\n");
         fflush(stdout);
 #endif
 
-        free(args->hits);
 
 #ifdef VERBOSE
         fprintf(stdout, "Frag Hits 1\n");
@@ -419,8 +426,8 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
 
         struct FragFile *fragsBuf = NULL;
         if (HIB > 0) {
-            fragsBuf = frags(args->seqX, args->seqY, hBuf2, HIB, args->Lmin, args->SimTh,
-                             args->wSize, args->nFrags, args->nHitsUsed);
+            fragsBuf = frags(args->seqX, args->seqY, args->hits, HIB, args->Lmin, args->SimTh,
+                             args->wSize, args->nFrags, args->nHitsUsed, args->seqStatsX, args->seqStatsY, args->e_value);
         }
 
 #ifdef VERBOSE
@@ -428,8 +435,8 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
         fflush(stdout);
 #endif
 
-        if (hBuf2 != NULL)
-            free(hBuf2);
+        if (args->hits != NULL)
+            free(args->hits);
         return fragsBuf;
     }
 
@@ -439,35 +446,44 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
 void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
     ComparisonArgs *args = (ComparisonArgs *) a;
     uint64_t HIB;
-    hit *hBuf2;
 
     if (args->nHits > 0) {
         psortHR(32, args->hits, args->nHits, args->minSeqLen);
 
-        HIB = filterHitsReverse(args->hits, args->nHits, args->wSize, args->minSeqLen, &hBuf2);
-        free(args->hits);
+        HIB = filterHitsReverse(args->hits, args->nHits, args->wSize, args->minSeqLen);
+
+#ifdef VERBOSE
+        fprintf(stdout, "Frag Hits 2\n");
+        fflush(stdout);
+#endif
+
 
         struct FragFile *fragsBuf = NULL;
         if (HIB > 0) {
-            fragsBuf = fragsReverse(args->seqX, args->seqY, hBuf2, HIB, args->Lmin, args->SimTh,
-                                    args->wSize, args->nFrags, args->nHitsUsed);
+            fragsBuf = fragsReverse(args->seqX, args->seqY, args->hits, HIB, args->Lmin, args->SimTh,
+                                    args->wSize, args->nFrags, args->nHitsUsed, args->seqStatsX, args->seqStatsY, args->e_value);
         }
+#ifdef VERBOSE
+        fprintf(stdout, "End of Frag Hits 2\n");
+        fflush(stdout);
+#endif
 
-        if (hBuf2 != NULL)
-            free(hBuf2);
+
+        if (args->hits != NULL)
+            free(args->hits);
 
         return fragsBuf;
     }
-
     return NULL;
 }
 
 struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
                               hashentryF *entriesX, uint64_t nEntriesX, hashentryR *entriesY, uint64_t nEntriesY,
-                              int wSize, uint64_t Lmin, uint64_t SimTh, uint64_t *nFrags) {
+                              int wSize, uint64_t Lmin, uint64_t SimTh, uint64_t *nFrags, struct statsHSP * seqStatsX,
+                              struct statsHSP * seqStatsY, long double e_value) {
     int bufSizeForward = MAXBUF, bufSizeReverse = MAXBUF;
     uint64_t hitsInBufForward = 0, hitsInBufReverse = 0, hitsInBufForwardUsed = 0, hitsInBufReverseUsed = 0,
-            nFragsForward, nFragsReverse;
+            nFragsForward = 0, nFragsReverse = 0;
     uint64_t i, j, k = 0, l = 0;
     int comp;
     int firstMatch = 0, endMatch = 0;
@@ -608,6 +624,9 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     argsForward.SimTh = SimTh;
     argsForward.wSize = wSize;
     argsForward.minSeqLen = minSeqXLenSeqYLen;
+    argsForward.seqStatsX = seqStatsX;
+    argsForward.seqStatsY = seqStatsY;
+    argsForward.e_value = e_value;
 
     argsReverse.seqX = seqX;
     argsReverse.seqY = seqY;
@@ -619,6 +638,18 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     argsReverse.SimTh = SimTh;
     argsReverse.wSize = wSize;
     argsReverse.minSeqLen = minSeqXLenSeqYLen;
+    argsReverse.seqStatsX = seqStatsX;
+    argsReverse.seqStatsY = seqStatsY;
+    argsReverse.e_value = e_value;
+
+    /*
+    FILE * fileout = fopen("db_nosort_f.hits", "wb");
+    fwrite(hBufForward, sizeof(hit), hitsInBufForward, fileout);
+    fclose(fileout);
+    fileout = fopen("db_nosort_r.hits", "wb");
+    fwrite(hBufReverse, sizeof(hit), hitsInBufReverse, fileout);
+    fclose(fileout);
+    */
 
     pthread_create(&thF, NULL, sortHitsFilterHitsFragHitsTh, (void *) (&argsForward));
     pthread_create(&thR, NULL, sortHitsFilterHitsFragHitsReverseTh, (void *) (&argsReverse));
@@ -676,10 +707,11 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
 
     if (fragsBufReverse != NULL) {
         for (i = 0; i < nFragsReverse; i++) {
-            uint64_t tmp;
-            tmp = seqYLen - fragsBufReverse[i].yEnd;
-            fragsBufReverse[i].yStart = seqYLen - fragsBufReverse[i].yStart;
-            fragsBufReverse[i].yEnd = tmp;
+            //this was causing errors
+            //uint64_t tmp;
+            //tmp = seqYLen - fragsBufReverse[i].yEnd;
+            //fragsBufReverse[i].yStart = seqYLen - fragsBufReverse[i].yStart;
+            //fragsBufReverse[i].yEnd = tmp;
             writeFragment(&fragsBufReverse[i], fOut);
         }
         free(fragsBufReverse);
@@ -737,11 +769,12 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
 }
 
 struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64_t Lmin, uint64_t SimTh, int WL,
-                       uint64_t *nF, uint64_t *nHU) {
+                       uint64_t *nF, uint64_t *nHU, struct statsHSP * seqStatsX, struct statsHSP * seqStatsY, long double e_value) {
     struct Sequence *sX, *sY;
-    uint64_t n0, n1, nSeqs0, nSeqs1;
+    uint64_t n0, n1, nSeqs0 = 0, nSeqs1 = 0;
     uint64_t i, j;
     int newFrag;
+    uint64_t e_val_filtered = 0;
     uint64_t nFrags = 0, nHitsUsed = 0;
     int64_t lastOffset, lastDiagonal;
     struct FragFile myF;
@@ -768,23 +801,23 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
         terror("Not enough memory for frags array");
 
     //Open files
-    if ((f = fopen(seqX, "rt")) == NULL)
-        terror("opening seqX file");
-    sX = LeeSeqDB(f, &n0, &nSeqs0, 0);
-    fclose(f);
 
     if ((f = fopen(seqY, "rt")) == NULL)
         terror("opening seqY file");
     sY = LeeSeqDB(f, &n1, &nSeqs1, 0);
     fclose(f);
 
-    n0 += nSeqs0 - 1;
-    n1 += nSeqs1 - 1;
+   
 
-    // read Hits
-    if (nHits == 0) {
-        terror("Empty hits file");
-    }
+    if ((f = fopen(seqX, "rt")) == NULL)
+        terror("opening seqX file");
+    sX = LeeSeqDB(f, &n0, &nSeqs0, 0);
+    fclose(f);
+    
+
+    n0 += min(nSeqs0 - 1, 0);
+    n1 += min(nSeqs1 - 1, 0);
+
     lastDiagonal = hits[0].posX - hits[0].posY;
     lastOffset = hits[0].posX - 1;
 
@@ -806,6 +839,18 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
         nHitsUsed++;
         newFrag = FragFromHit(coverage, &myF, &hits[i], sX, n0, sY, n1, nSeqs1, Lmin, SimTh,
                               WL);
+
+        if(newFrag){
+            if(computeExpectedValueOfFrag(&myF, seqStatsX, seqStatsY) <= e_value){
+                newFrag = 1;
+            }else{
+                newFrag = 0;
+                e_val_filtered++;
+            }
+        }
+	
+	fprintf(stdout, "%"PRIu64"\t%Le\n", myF.seqX, myF.evalue);
+
         if (newFrag) {
             memcpy(&fragsBuf[nFrags], &myF, sizeof(struct FragFile));
             lastOffset = hits[i].posX + myF.length;
@@ -819,6 +864,7 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
 
 #ifdef VERBOSE
     fprintf(stdout, "Forward strand frags calculated\n");
+    fprintf(stdout, "%"PRIu64" out of %"PRIu64" frags filtered due to e-value\n", e_val_filtered, nFrags);
     fflush(stdout);
 #endif
 
@@ -841,11 +887,12 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
 }
 
 struct FragFile *fragsReverse(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64_t Lmin, uint64_t SimTh, int WL,
-                              uint64_t *nF, uint64_t *nHU) {
+                              uint64_t *nF, uint64_t *nHU, struct statsHSP * seqStatsX, struct statsHSP * seqStatsY, long double e_value) {
     struct Sequence *sX, *sY;
-    uint64_t n0, n1, nSeqs0, nSeqs1;
+    uint64_t n0, n1, nSeqs0 = 0, nSeqs1 = 0;
     uint64_t i, j;
     int newFrag;
+    uint64_t e_val_filtered = 0;
     uint64_t nFrags = 0, nHitsUsed = 0;
     int64_t lastOffset, lastDiagonal;
     struct FragFile myF;
@@ -882,8 +929,8 @@ struct FragFile *fragsReverse(char *seqX, char *seqY, hit *hits, uint64_t nHits,
     sY = LeeSeqDB(f, &n1, &nSeqs1, 0);
     fclose(f);
 
-    n0 += nSeqs0 - 1;
-    n1 += nSeqs1 - 1;
+    n0 += min(nSeqs0 - 1, 0);
+    n1 += min(nSeqs1 - 1, 0);
 
     // read Hits
     if (nHits == 0) {
@@ -910,6 +957,16 @@ struct FragFile *fragsReverse(char *seqX, char *seqY, hit *hits, uint64_t nHits,
         nHitsUsed++;
         newFrag = FragFromHitReverse(coverage, &myF, &hits[i], sX, n0, sY, n1, nSeqs1, Lmin, SimTh,
                                      WL);
+
+        if(newFrag){
+            if(computeExpectedValueOfFrag(&myF, seqStatsX, seqStatsY) <= e_value){
+                newFrag = 1;
+            }else{
+                newFrag = 0;
+                e_val_filtered++;
+            }
+        }
+
         if (newFrag) {
             memcpy(&fragsBuf[nFrags], &myF, sizeof(struct FragFile));
             lastOffset = hits[i].posX + myF.length;
@@ -923,6 +980,7 @@ struct FragFile *fragsReverse(char *seqX, char *seqY, hit *hits, uint64_t nHits,
 
 #ifdef VERBOSE
     fprintf(stdout, "Reverse strand frags calculated\n");
+    fprintf(stdout, "%"PRIu64" out of %"PRIu64" frags filtered due to e-value\n", e_val_filtered, nFrags);
     fflush(stdout);
 #endif
 
@@ -1258,5 +1316,35 @@ int64_t GTHR(hit a1, hit a2, uint64_t minSeqXLenSeqYLen) {
 
     return 0;
 }
+
+long double computeExpectedValueOfFrag(struct FragFile * frag, struct statsHSP * seqStatsX, struct statsHSP * seqStatsY){
+    
+    long double lambda = 0.275;
+    long double karlin = 0.333;
+
+    long double rawscore = (frag->ident*POINT) - (frag->length - frag->ident)*(POINT);
+    
+
+    //printf("Seqx: %"PRIu64", Seqy: %"PRIu64"\n", frag->seqX, frag->seqY);
+
+
+    long double t_len_x = seqStatsX[frag->seqX].tf.total;
+    long double t_len_y = seqStatsY[frag->seqY].tf.total;
+
+    //printf("Real length seqX: %Le, Real length seqY: %Le\n", t_len_x, t_len_y);
+
+    //I verified that it is correct.
+    long double expected = karlin*t_len_y*t_len_x*expl(-lambda * rawscore);
+
+
+    //printf("Len: %"PRIu64" Ident: %"PRIu64"\n Raw: %Le Expected: %Le\n", frag->length, frag->ident, rawscore, expected);
+    //getchar();
+    frag->evalue = expected;
+    return expected;
+}
+
+
+
+
 /************************/
 

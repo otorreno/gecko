@@ -72,7 +72,7 @@ void endianessConversion(char *source, char *target, int numberOfBytes) {
  * Function to read a fragment from the specified file
  */
 void readFragment(struct FragFile *frag, FILE *f) {
-    char tmpArray[8];
+    char tmpArray[sizeof(long double)];
 
     if (htons(1) == 1) {
         //big endian
@@ -114,6 +114,10 @@ void readFragment(struct FragFile *frag, FILE *f) {
             terror("Error reading the HSP block");
         }
         frag->strand = fgetc(f);
+        if (fread(&frag->evalue, sizeof(long double), 1, f) != 1) {
+            terror("Error reading the HSP evalue");
+        }
+
     } else {
         //little endian
         if (fread(tmpArray, sizeof(int64_t), 1, f) != 1) {
@@ -166,6 +170,10 @@ void readFragment(struct FragFile *frag, FILE *f) {
         }
         endianessConversion(tmpArray, (char *) (&frag->block), sizeof(int64_t));
         frag->strand = fgetc(f);
+        if (fread(tmpArray, sizeof(long double), 1, f) != 1) {
+            terror("Error reading the HSP evalue");
+        }
+        endianessConversion(tmpArray, (char *) (&frag->evalue), sizeof(long double));
     }
 }
 
@@ -173,7 +181,7 @@ void readFragment(struct FragFile *frag, FILE *f) {
  * Function to write a fragment to the specified file
  */
 void writeFragment(struct FragFile *frag, FILE *f) {
-    char tmpArray[8];
+    char tmpArray[sizeof(long double)];
     if (htons(1) == 1) {
         //Big endian
         fwrite(&frag->diag, sizeof(int64_t), 1, f);
@@ -217,8 +225,8 @@ void writeFragment(struct FragFile *frag, FILE *f) {
         endianessConversion((char *) (&frag->block), tmpArray, sizeof(int64_t));
         fwrite(tmpArray, sizeof(int64_t), 1, f);
         fputc(frag->strand, f);
-	endianessConversion((char *) (&frag->evalue), tmpArray, sizeof(long double));
-	fwrite(tmpArray, sizeof(long double), 1, f);
+	    endianessConversion((char *) (&frag->evalue), tmpArray, sizeof(long double));
+	    fwrite(tmpArray, sizeof(long double), 1, f);
     }
 }
 

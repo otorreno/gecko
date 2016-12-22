@@ -12,6 +12,9 @@ coordinates: ramgecko2gecko indexmaker
 gecko: gecko.c
 	$(CC) $(CFLAGS) dictionaryFunctions.c -lm commonFunctions.c -lm comparisonFunctions.c quicksortWordForward.c quicksortWordReverse.c quicksortHit.c gecko.c -lpthread -o $(BIN)/gecko
 
+gecko_all_vs_all: gecko_all_vs_all.c
+	$(CC) $(CFLAGS) dictionaryFunctions.c -lm commonFunctions.c -lm comparisonFunctions.c quicksortWordForward.c quicksortWordReverse.c quicksortHit.c gecko_all_vs_all.c -lpthread -o $(BIN)/gecko_all_vs_all
+
 wordsStat: wordsStat.c
 	$(CC) $(CFLAGS) dictionaryFunctions.c -lm commonFunctions.c comparisonFunctions.c -lm quicksortWordForward.c quicksortWordReverse.c quicksortHit.c wordsStat.c -lpthread -o $(BIN)/wordsStat
 
@@ -27,4 +30,4 @@ indexmaker: indexmaker.c
 
 
 clean:
-	rm -rf $(BIN)/gecko $(BIN)/wordsStat $(BIN)/hitsStat $(BIN)/ramgecko2gecko $(BIN)/indexmaker
+	rm -rf $(BIN)/gecko $(BIN)/gecko_all_vs_all $(BIN)/wordsStat $(BIN)/hitsStat $(BIN)/ramgecko2gecko $(BIN)/indexmaker

@@ -9,10 +9,14 @@
 #include "dictionaryFunctions.h"
 #include "comparisonFunctions.h"
 
+
+
 int main(int ac, char **av) {
     if (ac < 7) {
         terror("USE: gecko seqFileX.IN seqFileX.IN fragsFile.OUT Lmin SimTh WL *min_e_value");
     }
+
+
 
     char *seqX = av[1];
     char *seqY = av[2];

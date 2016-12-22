@@ -72,7 +72,7 @@ void endianessConversion(char *source, char *target, int numberOfBytes) {
  * Function to read a fragment from the specified file
  */
 void readFragment(struct FragFile *frag, FILE *f) {
-    char tmpArray[8];
+    char tmpArray[sizeof(long double)];
 
     if (htons(1) == 1) {
         //big endian
@@ -114,6 +114,9 @@ void readFragment(struct FragFile *frag, FILE *f) {
             terror("Error reading the HSP block");
         }
         frag->strand = fgetc(f);
+        if (fread(&frag->evalue, sizeof(long double), 1, f) != 1) {
+            terror("Error reading the HSP evalue");
+        }
     } else {
         //little endian
         if (fread(tmpArray, sizeof(int64_t), 1, f) != 1) {
@@ -166,6 +169,10 @@ void readFragment(struct FragFile *frag, FILE *f) {
         }
         endianessConversion(tmpArray, (char *) (&frag->block), sizeof(int64_t));
         frag->strand = fgetc(f);
+        if (fread(tmpArray, sizeof(long double), 1, f) != 1) {
+            terror("Error reading the HSP evalue");
+        }
+        endianessConversion(tmpArray, (char *) (&frag->evalue), sizeof(long double));
     }
 }
 
@@ -173,7 +180,7 @@ void readFragment(struct FragFile *frag, FILE *f) {
  * Function to write a fragment to the specified file
  */
 void writeFragment(struct FragFile *frag, FILE *f) {
-    char tmpArray[8];
+    char tmpArray[sizeof(long double)];
     if (htons(1) == 1) {
         //Big endian
         fwrite(&frag->diag, sizeof(int64_t), 1, f);
@@ -189,7 +196,7 @@ void writeFragment(struct FragFile *frag, FILE *f) {
         fwrite(&frag->seqY, sizeof(uint64_t), 1, f);
         fwrite(&frag->block, sizeof(int64_t), 1, f);
         fputc(frag->strand, f);
-	fwrite(&frag->evalue, sizeof(long double), 1, f);
+	    fwrite(&frag->evalue, sizeof(long double), 1, f);
     } else {
         //Little endian
         endianessConversion((char *) (&frag->diag), tmpArray, sizeof(int64_t));
@@ -217,8 +224,8 @@ void writeFragment(struct FragFile *frag, FILE *f) {
         endianessConversion((char *) (&frag->block), tmpArray, sizeof(int64_t));
         fwrite(tmpArray, sizeof(int64_t), 1, f);
         fputc(frag->strand, f);
-	endianessConversion((char *) (&frag->evalue), tmpArray, sizeof(long double));
-	fwrite(tmpArray, sizeof(long double), 1, f);
+	    endianessConversion((char *) (&frag->evalue), tmpArray, sizeof(long double));
+	    fwrite(tmpArray, sizeof(long double), 1, f);
     }
 }
 
@@ -435,7 +442,8 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
         fflush(stdout);
 #endif
 
-        if (args->hits != NULL)
+
+        if (args != NULL && args->hits != NULL)
             free(args->hits);
         return fragsBuf;
     }
@@ -469,7 +477,7 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
 #endif
 
 
-        if (args->hits != NULL)
+        if (args != NULL && args->hits != NULL)
             free(args->hits);
 
         return fragsBuf;
@@ -477,7 +485,7 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
     return NULL;
 }
 
-struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
+FragsFandR hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
                               hashentryF *entriesX, uint64_t nEntriesX, hashentryR *entriesY, uint64_t nEntriesY,
                               int wSize, uint64_t Lmin, uint64_t SimTh, uint64_t *nFrags, struct statsHSP * seqStatsX,
                               struct statsHSP * seqStatsY, long double e_value) {
@@ -666,7 +674,16 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     "\n", nFragsForward, nFragsReverse);
     fflush(stdout);
 
+    FragsFandR fAndR;
+    fAndR.t_forward_fragments = nFragsForward;
+    fAndR.t_reverse_fragments = nFragsReverse;
+
+    fAndR.fforward = fragsBufForward;
+    fAndR.freverse = fragsBufReverse;
+
     *nFrags = nFragsForward + nFragsReverse;
+
+    /*
 
 #ifdef VERBOSE
     fprintf(stdout, "Writing fragments to disk\n");
@@ -684,6 +701,8 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     "\n", seqXLen, seqYLen);
     fflush(stdout);
 #endif
+
+    
 
     writeSequenceLength(&seqXLen, fOut);
     writeSequenceLength(&seqYLen, fOut);
@@ -723,6 +742,8 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
 #endif
 
     fclose(fOut);
+
+    */
 
     // metadata info
     sprintf(infoFileName, "%s.INF", out);
@@ -764,8 +785,8 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     fflush(stdout);
 #endif
 
-    //TODO change if we want to have the fragments outside this function
-    return NULL;
+    
+    return fAndR;
 }
 
 struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64_t Lmin, uint64_t SimTh, int WL,
@@ -849,7 +870,6 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
             }
         }
 	
-	fprintf(stdout, "%"PRIu64"\t%Le\n", myF.seqX, myF.evalue);
 
         if (newFrag) {
             memcpy(&fragsBuf[nFrags], &myF, sizeof(struct FragFile));

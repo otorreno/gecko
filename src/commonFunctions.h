@@ -84,6 +84,9 @@ long double pdf(long double x, long double mu, long double sigma);
 */
 long double cdf(long double x, long double mu, long double sigma);
 
-
+/*
+	Loads a path file (1 file per line in raw text) and stores it in a char **
+*/
+char ** read_all_vs_all_files(char * list_of_files, uint64_t * n_files, uint64_t * t_alloc);
 
 #endif /* COMMON_FUNCTIONS_H */

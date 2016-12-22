@@ -9,10 +9,11 @@
 #define MAXLID 200
 //#define READBUF 2000000000 //2 GB
 #define READBUF 50000000 //50MB
-#define INITSEQS 300000 //Number of starting sequences (in database)
+#define INIT_SEQS 30 //Number of starting sequences
 #define REALLOC_FREQ 40000
 #define POINT 4
 
+#define READLINE 2000
 #define MAXLID 200
 
 //Struct for words program
@@ -192,4 +193,12 @@ struct rIndex2 {
     uint64_t  pos;      //Start position of sequence
     uint64_t  Lac;      //Accumulated length
 };
+
+//Struct to hold fragments for reverse and forward
+typedef struct fragsFandR{
+    struct FragFile * fforward;
+    uint64_t t_forward_fragments;
+    struct FragFile * freverse;
+    uint64_t t_reverse_fragments;
+} FragsFandR;
 #endif

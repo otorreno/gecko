@@ -1,6 +1,7 @@
 #ifndef COMPARISON_FUNCTIONS_H
 #define COMPARISON_FUNCTIONS_H
 
+
 #define min(x, y)    (((x) < (y)) ? (x) : (y))
 
 typedef struct {
@@ -55,7 +56,7 @@ long int sizeofFragment();
  * Function to calculate the hits between two dictionaries
  * in memory
  */
-struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
+FragsFandR hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
                               hashentryF *entriesX,
                               uint64_t nEntriesX, hashentryR *entriesY, uint64_t nEntriesY, int wSize, uint64_t Lmin,
                               uint64_t SimTh, uint64_t *nFrags, struct statsHSP * seqStatsX, struct statsHSP * seqStatsY,

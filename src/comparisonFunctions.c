@@ -270,7 +270,7 @@ void writeSequenceLength(uint64_t *length, FILE *f) {
  * function could be different
  */
 long int sizeofFragment() {
-    return 9 * sizeof(uint64_t) + 2 * sizeof(int64_t) + 1 * sizeof(float) + 1 * sizeof(char);
+    return 9 * sizeof(uint64_t) + 2 * sizeof(int64_t) + 1 * sizeof(float) + 1 * sizeof(char) + 1*sizeof(long double);
 }
 
 int differentSequences(hit h1, hit h2) {

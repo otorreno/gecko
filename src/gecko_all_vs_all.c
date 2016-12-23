@@ -21,6 +21,8 @@ int main(int ac, char **av) {
 
     char ** paths_to_files = read_all_vs_all_files(av[1], &n_files, &t_alloc);
     if(n_files < 2) terror("At least two files need to be compared");
+    unsigned char wrote_lengths[n_files]; //To keep track of which lengths were written or not
+    for(i=0;i<n_files;i++) { wrote_lengths[i] = 0; }
 
 
 
@@ -49,6 +51,10 @@ int main(int ac, char **av) {
     FragsFandR frags_list[n_comps];
 
     FILE * fOut = fopen64(out, "wb");
+    char path_for_lengths[READLINE];
+    strcpy(path_for_lengths, out);
+    strcat(path_for_lengths, ".lengths");
+    FILE * fOutLengths = fopen64(path_for_lengths, "wb");
     if(fOut == NULL) terror("Could not open output frags file");
     
     uint64_t unused_len = 0;
@@ -125,6 +131,18 @@ int main(int ac, char **av) {
             }
             free(entriesY);
 
+
+            //This will write the first sequence's length
+            if(wrote_lengths[i] == 0){
+                fwrite(&argsX.seqStats->tf.total, sizeof(uint64_t), 1, fOutLengths);
+                wrote_lengths[i] = 1;
+            }
+            //This will write the rest throughout the second loop
+            if(wrote_lengths[j] == 0){
+                fwrite(&argsY.seqStats->tf.total, sizeof(uint64_t), 1, fOutLengths);
+                wrote_lengths[j] = 1;
+            }
+
             free(argsX.seqStats);
             free(argsY.seqStats);
 
@@ -141,5 +159,6 @@ int main(int ac, char **av) {
     free(paths_to_files);
 
     fclose(fOut);
+    fclose(fOutLengths);
     return 0;
 }

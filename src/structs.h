@@ -5,6 +5,7 @@
 //Structs required for the dotplot workflow
 #define MAXLID 200
 #define MAXLS 1000000000
+#define READBUF 50000000 //50MB
 
 //Struct for words program
 typedef struct {
@@ -42,7 +43,7 @@ typedef struct {
 //Struct for w2hd program
 typedef struct {
     //Ocurrence position in the sequence
-	uint64_t pos;
+    uint64_t pos;
     //For multiple sequence files this var
     //reflects in what sequence occurs the
     //word
@@ -112,7 +113,7 @@ struct FragFile {
 //Struct for leeSeqDB function
 struct Sequence{
     char ident[MAXLID+1];
-    char datos[MAXLS];
+    char *datos;
 };
 
 #endif

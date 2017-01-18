@@ -48,48 +48,6 @@ int letterToIndex(char c) {
 	}
 }
 
-int loadSequence(char *fileName, char *seq, uint64_t *Tot) {
-	FILE *fIn;
-	char c;
-
-	//Opening input and output files
-	if ((fIn = fopen(fileName, "rt")) == NULL)
-		terror("opening sequence file");
-
-	//Skip the identification of the sequence
-	skipIDLine(fIn);
-
-	// Load Sequence into memory
-	c = fgetc(fIn);
-	while (!feof(fIn)) {
-		//Check if is a letter
-		if (!isupper(c)) {
-			/*
-			 * If not is a start of a sequence,
-			 * then read a new char and continue
-			 */
-			if (c != '>') {
-				c = fgetc(fIn);
-				continue;
-			}
-		}
-
-		//Get the index of the letter
-		seq[*Tot] = letterToIndex(c);
-
-		//Check if is a multi-sequence file
-		if (c == '>') {
-			skipIDLine(fIn);
-		}
-
-		(*Tot)++;
-		c = fgetc(fIn);
-	}
-
-	fclose(fIn);
-	return 0;
-}
-
 int wordcmp(unsigned char *w1, unsigned char *w2, int n) {
 
 	int i = 0, limit;

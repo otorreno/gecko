@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <string.h>
 #include <ctype.h>
+#include <inttypes.h>
 #include "structs.h"
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
@@ -44,6 +45,8 @@ void main_FILE(char * inFile, char * outFile){
 	FILE *f;
 	FILE *f2;
 	char c;
+	char *seq = NULL;
+	uint64_t i = 0, r = 0;
 
 	if ((f=fopen(inFile,"rt"))==NULL){
 	perror("opening sequence file");
@@ -51,10 +54,16 @@ void main_FILE(char * inFile, char * outFile){
 	if ((f2=fopen(outFile,"wb"))==NULL) {
 		terror("opening OUT sequence Words file");
 	}
-	
-	c=fgetc(f);
-	while(c!='\n'){
-		c=fgetc(f);
+	if ((seq = calloc(READBUF, sizeof(char))) == NULL) {
+		terror("not enough memory for read buffer");
+	}
+
+	//To force the read
+	i = READBUF + 1;
+
+	c = buffered_fgetc(seq, &i, &r, f);
+	while (c != '\n') {
+		c = buffered_fgetc(seq, &i, &r, f);
 	}
 
 	wentry WE;
@@ -65,8 +74,9 @@ void main_FILE(char * inFile, char * outFile){
 	unsigned long Tot=0;
 	unsigned long NoACGT=0;
 	unsigned long NoC=0;
-	c=fgetc(f);
-	while(!feof(f)){
+
+	c = buffered_fgetc(seq, &i, &r, f);
+	while (!feof(f) || (feof(f) && i < r)){
 		if (!isupper(toupper(c))){
 			if(c=='>'){
 				c = fgetc(f);
@@ -105,7 +115,7 @@ void main_FILE(char * inFile, char * outFile){
 			NW++;
 			fwrite(&WE,sizeof(wentry),1,f2);
 		}
-		c=fgetc(f);
+		c = buffered_fgetc(seq, &i, &r, f);
 	}
 	//printf("FILE: Create %d Words --(seqLen=%d NoACGT=%d noChar=%d\n",NW,Tot,NoACGT, NoC);
 	fclose(f);

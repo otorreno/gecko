@@ -20,12 +20,6 @@ void skipIDLine(FILE *fIn);
 int letterToIndex(char c);
 
 /**
- * Function to load the sequence.
- * The code was present inside words.c program
- */
-int loadSequence(char *fileName, char *seq, uint64_t *Tot);
-
-/**
  * Function to print in stdout the given compressed word
  */
 void showWord(word* w, char *ws);

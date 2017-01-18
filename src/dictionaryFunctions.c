@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <math.h>
+#include <time.h>
 #include "structs.h"
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
@@ -139,6 +140,14 @@ void *dictionary(void *a) {
     uint64_t i = 0, r = 0;
     uint64_t Tot = 0;
 
+#ifdef ELAPSEDTIME
+    //time variables
+    clock_t begin, end;
+    double elapsed_secs;
+
+    begin = clock();
+#endif
+    
     if ((f = fopen(args->seqFile, "rt")) == NULL) {
         fprintf(stdout, "opening sequence file: %s\n", args->seqFile);
         terror("opening sequence file");
@@ -293,16 +302,36 @@ void *dictionary(void *a) {
     if (words == NULL)
         terror("Error reallocating words of seqX array");
 
+#ifdef ELAPSEDTIME
+    end = clock();
+    elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+    fprintf(stdout, "[WORDS] Elapsed time: %lf\n", elapsed_secs);
+#endif
+
 #ifdef VERBOSE
     fprintf(stdout, "Before sorting words of seqX\n");
     fflush(stdout);
 #endif
 
+#ifdef ELAPSEDTIME
+    begin = clock();
+#endif
+
     psortWF(32, words, NW);
+
+#ifdef ELAPSEDTIME
+    end = clock();
+    elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+    fprintf(stdout, "[SORTWORDS] Elapsed time: %lf\n", elapsed_secs);
+#endif
 
 #ifdef VERBOSE
     fprintf(stdout, "After sorting words of seqX\n");
     fflush(stdout);
+#endif
+
+#ifdef ELAPSEDTIME
+    begin = clock();
 #endif
 
 #ifdef VERBOSE
@@ -390,6 +419,12 @@ void *dictionary(void *a) {
     fprintf(stdout, "After w2hd of seqX\n");
 #endif
 
+#ifdef ELAPSEDTIME
+    end = clock();
+    elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+    fprintf(stdout, "[W2HD] Elapsed time: %lf\n", elapsed_secs);
+#endif
+
     if (j == 0)
         terror("Number of entries in the hash table is 0");
     free(entries[j].locs);
@@ -423,6 +458,14 @@ void *dictionaryWithReverse(void *a) {
     uint64_t j = 0;
     uint64_t k = 0;
     uint64_t l = REALLOC_FREQ;
+
+#ifdef ELAPSEDTIME
+    //time variables
+    clock_t begin, end;
+    double elapsed_secs;
+
+    begin = clock();
+#endif
 
     if ((f = fopen(args->seqFile, "rt")) == NULL) {
         fprintf(stdout, "opening sequence file: %s\n", args->seqFile);
@@ -590,16 +633,36 @@ void *dictionaryWithReverse(void *a) {
     if (words == NULL)
         terror("Error reallocating words of seqY array");
 
+#ifdef ELAPSEDTIME
+    end = clock();
+    elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+    fprintf(stdout, "[WORDS] Elapsed time: %lf\n", elapsed_secs);
+#endif
+
 #ifdef VERBOSE
     fprintf(stdout, "Before sorting seqY\n");
     fflush(stdout);
 #endif
 
+#ifdef ELAPSEDTIME
+    begin = clock();
+#endif
+
     psortWR(32, words, NW);
+
+#ifdef ELAPSEDTIME
+    end = clock();
+    elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+    fprintf(stdout, "[SORTWORDS] Elapsed time: %lf\n", elapsed_secs);
+#endif
 
 #ifdef VERBOSE
     fprintf(stdout, "After sorting seqY\n");
     fflush(stdout);
+#endif
+
+#ifdef ELAPSEDTIME
+    begin = clock();
 #endif
 
 #ifdef VERBOSE
@@ -694,6 +757,12 @@ void *dictionaryWithReverse(void *a) {
     }
 #ifdef VERBOSE
     fprintf(stdout, "After w2hd seqY\n");
+#endif
+
+#ifdef ELAPSEDTIME
+    end = clock();
+    elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+    fprintf(stdout, "[W2HD] Elapsed time: %lf\n", elapsed_secs);
 #endif
 
     if (j == 0)

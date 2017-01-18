@@ -117,7 +117,6 @@ void readFragment(struct FragFile *frag, FILE *f) {
         if (fread(&frag->evalue, sizeof(long double), 1, f) != 1) {
             terror("Error reading the HSP evalue");
         }
-
     } else {
         //little endian
         if (fread(tmpArray, sizeof(int64_t), 1, f) != 1) {
@@ -197,7 +196,7 @@ void writeFragment(struct FragFile *frag, FILE *f) {
         fwrite(&frag->seqY, sizeof(uint64_t), 1, f);
         fwrite(&frag->block, sizeof(int64_t), 1, f);
         fputc(frag->strand, f);
-	fwrite(&frag->evalue, sizeof(long double), 1, f);
+        fwrite(&frag->evalue, sizeof(long double), 1, f);
     } else {
         //Little endian
         endianessConversion((char *) (&frag->diag), tmpArray, sizeof(int64_t));
@@ -225,8 +224,8 @@ void writeFragment(struct FragFile *frag, FILE *f) {
         endianessConversion((char *) (&frag->block), tmpArray, sizeof(int64_t));
         fwrite(tmpArray, sizeof(int64_t), 1, f);
         fputc(frag->strand, f);
-	    endianessConversion((char *) (&frag->evalue), tmpArray, sizeof(long double));
-	    fwrite(tmpArray, sizeof(long double), 1, f);
+        endianessConversion((char *) (&frag->evalue), tmpArray, sizeof(long double));
+        fwrite(tmpArray, sizeof(long double), 1, f);
     }
 }
 
@@ -401,12 +400,28 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
     ComparisonArgs *args = (ComparisonArgs *) a;
     uint64_t HIB;
 
+#ifdef ELAPSEDTIME
+    //time variables
+    clock_t begin, end;
+    double elapsed_secs;
+
+    begin = clock();
+#endif
+
     if (args->nHits > 0) {
 #ifdef VERBOSE
         fprintf(stdout, "Sorting Hits 1\n");
         fflush(stdout);
 #endif
         psortHF(32, args->hits, args->nHits);
+
+#ifdef ELAPSEDTIME
+        end = clock();
+        elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+        fprintf(stdout, "[SORTHITS] Elapsed time: %lf\n", elapsed_secs);
+        begin = clock();
+#endif
+
 #ifdef VERBOSE
         fprintf(stdout, "End of Sorting Hits 1\n");
         fflush(stdout);
@@ -419,7 +434,12 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
 
         HIB = filterHits(args->hits, args->nHits, args->wSize);
 
-	
+#ifdef ELAPSEDTIME
+        end = clock();
+        elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+        fprintf(stdout, "[FILTERHITS] Elapsed time: %lf\n", elapsed_secs);
+        begin = clock();
+#endif
 
 #ifdef VERBOSE
         fprintf(stdout, "End of filtering Hits 1\n");
@@ -436,6 +456,11 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
         if (HIB > 0) {
             fragsBuf = frags(args->seqX, args->seqY, args->hits, HIB, args->Lmin, args->SimTh,
                              args->wSize, args->nFrags, args->nHitsUsed, args->seqStatsX, args->seqStatsY, args->e_value);
+#ifdef ELAPSEDTIME
+            end = clock();
+            elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+            fprintf(stdout, "[FRAGHITSREV] Elapsed time: %lf\n", elapsed_secs);
+#endif
         }
 
 #ifdef VERBOSE
@@ -455,10 +480,31 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
     ComparisonArgs *args = (ComparisonArgs *) a;
     uint64_t HIB;
 
+#ifdef ELAPSEDTIME
+    //time variables
+    clock_t begin, end;
+    double elapsed_secs;
+
+    begin = clock();
+#endif
+
     if (args->nHits > 0) {
         psortHR(32, args->hits, args->nHits, args->minSeqLen);
+#ifdef ELAPSEDTIME
+        end = clock();
+        elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+        fprintf(stdout, "[SORTHITSREV] Elapsed time: %lf\n", elapsed_secs);
+        begin = clock();
+#endif
 
         HIB = filterHitsReverse(args->hits, args->nHits, args->wSize, args->minSeqLen);
+
+#ifdef ELAPSEDTIME
+        end = clock();
+        elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+        fprintf(stdout, "[FILTERHITSREV] Elapsed time: %lf\n", elapsed_secs);
+        begin = clock();
+#endif
 
 #ifdef VERBOSE
         fprintf(stdout, "Frag Hits 2\n");
@@ -470,6 +516,11 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
         if (HIB > 0) {
             fragsBuf = fragsReverse(args->seqX, args->seqY, args->hits, HIB, args->Lmin, args->SimTh,
                                     args->wSize, args->nFrags, args->nHitsUsed, args->seqStatsX, args->seqStatsY, args->e_value);
+#ifdef ELAPSEDTIME
+            end = clock();
+            elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+            fprintf(stdout, "[FRAGHITSREV] Elapsed time: %lf\n", elapsed_secs);
+#endif
         }
 #ifdef VERBOSE
         fprintf(stdout, "End of Frag Hits 2\n");
@@ -502,6 +553,14 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     uint64_t minSeqXLenSeqYLen = min(seqXLen, seqYLen);
     FILE *fOut, *fInf;
     char infoFileName[1024];
+
+#ifdef ELAPSEDTIME
+    //time variables
+    clock_t begin, end;
+    double elapsed_secs;
+
+    begin = clock();
+#endif
 
     if ((hBufForward = (hit *) calloc(MAXBUF, sizeof(hit))) == NULL)
         terror("HITS: memory for I-O buffer");
@@ -618,6 +677,14 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     "\n", hitsInBufReverse);
     fflush(stdout);
 #endif
+
+#ifdef ELAPSEDTIME
+    end = clock();
+    elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
+    fprintf(stdout, "[HITS] Elapsed time: %lf\n", elapsed_secs);
+#endif
+
+
 
     ComparisonArgs argsForward, argsReverse;
     pthread_t thF, thR;
@@ -857,8 +924,6 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
             }
         }
 	
-	fprintf(stdout, "%"PRIu64"\t%Le\n", myF.seqX, myF.evalue);
-
         if (newFrag) {
             memcpy(&fragsBuf[nFrags], &myF, sizeof(struct FragFile));
             lastOffset = hits[i].posX + myF.length;

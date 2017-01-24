@@ -30,6 +30,11 @@ struct FragFile *fragsReverse(char *seqX, char *seqY, hit *hits, uint64_t nHits,
 
 long double computeExpectedValueOfFrag(struct FragFile * frag, struct statsHSP * seqStatsX, struct statsHSP * seqStatsY);
 
+void printFragment(struct FragFile * f){
+    
+    fprintf(stdout, "FRAG::(%"PRIu64", %"PRIu64") to (%"PRIu64", %"PRIu64"): [%"PRIu64"]-[%e] %c LEN[%"PRIu64"]\n", f->xStart, f->yStart, f->xEnd, f->yEnd, f->ident, f->similarity, f->strand, f->length);
+}
+
 inline char complement(char c) {
     switch (c) {
         case 'A':
@@ -196,7 +201,7 @@ void writeFragment(struct FragFile *frag, FILE *f) {
         fwrite(&frag->seqY, sizeof(uint64_t), 1, f);
         fwrite(&frag->block, sizeof(int64_t), 1, f);
         fputc(frag->strand, f);
-        fwrite(&frag->evalue, sizeof(long double), 1, f);
+	    fwrite(&frag->evalue, sizeof(long double), 1, f);
     } else {
         //Little endian
         endianessConversion((char *) (&frag->diag), tmpArray, sizeof(int64_t));
@@ -224,8 +229,8 @@ void writeFragment(struct FragFile *frag, FILE *f) {
         endianessConversion((char *) (&frag->block), tmpArray, sizeof(int64_t));
         fwrite(tmpArray, sizeof(int64_t), 1, f);
         fputc(frag->strand, f);
-        endianessConversion((char *) (&frag->evalue), tmpArray, sizeof(long double));
-        fwrite(tmpArray, sizeof(long double), 1, f);
+	    endianessConversion((char *) (&frag->evalue), tmpArray, sizeof(long double));
+	    fwrite(tmpArray, sizeof(long double), 1, f);
     }
 }
 
@@ -298,8 +303,8 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
         if (differentSequences(lastHitNotFiltered, hBuf[i + 1])) {
             lastPosition = hBuf[i+1].posX + (2*wSize-1);
             diagonal = hBuf[i+1].posX - hBuf[i+1].posY;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-	    memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+	        memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
             i++;
             continue;
         }
@@ -307,14 +312,14 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
         if (diagonal != (hBuf[i + 1].posX - hBuf[i + 1].posY) || hBuf[i + 1].posX > lastPosition) {
             lastPosition = hBuf[i+1].posX + (2 * wSize - 1);
             diagonal = hBuf[i+1].posX - hBuf[i+1].posY;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
         }
         i++;
     }
 
     if (diagonal != (hBuf[i].posX - hBuf[i].posY) || hBuf[i].posX > (lastPosition)) {
-        memcpy(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
+        memmove(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
     }
 
     if (finalNumberOfHits == 0) {
@@ -354,12 +359,12 @@ uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t mi
     memcpy(&lastHitNotFiltered, &hBuf[0], sizeof(hit));
     finalNumberOfHits++;
     diagonal = lastHitNotFiltered.posX - lastHitNotFiltered.posY; 
-    while (i < hitsInBuf) {
+    while (i < hitsInBuf - 1) {
         if (differentSequences(lastHitNotFiltered, hBuf[i + 1])) {
             lastPosition = hBuf[i+1].posX + (2*wSize-1);
             diagonal = hBuf[i+1].posX + hBuf[i+1].posY - minSeqXLenSeqYLen;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
             i++;
             continue;
         }
@@ -367,14 +372,14 @@ uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t mi
         if (diagonal != (hBuf[i + 1].posX + hBuf[i + 1].posY - minSeqXLenSeqYLen) || hBuf[i + 1].posX > lastPosition) {
             lastPosition = hBuf[i+1].posX + (2 * wSize - 1);
             diagonal = hBuf[i+1].posX + hBuf[i+1].posY - minSeqXLenSeqYLen;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
         }
         i++;
     }
 
     if (diagonal != (hBuf[i].posX + hBuf[i].posY - minSeqXLenSeqYLen) || hBuf[i].posX > (lastPosition)) {
-        memcpy(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
+        memmove(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
     }
 
     if (finalNumberOfHits == 0) {
@@ -400,28 +405,12 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
     ComparisonArgs *args = (ComparisonArgs *) a;
     uint64_t HIB;
 
-#ifdef ELAPSEDTIME
-    //time variables
-    clock_t begin, end;
-    double elapsed_secs;
-
-    begin = clock();
-#endif
-
     if (args->nHits > 0) {
 #ifdef VERBOSE
         fprintf(stdout, "Sorting Hits 1\n");
         fflush(stdout);
 #endif
         psortHF(32, args->hits, args->nHits);
-
-#ifdef ELAPSEDTIME
-        end = clock();
-        elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
-        fprintf(stdout, "[SORTHITS] Elapsed time: %lf\n", elapsed_secs);
-        begin = clock();
-#endif
-
 #ifdef VERBOSE
         fprintf(stdout, "End of Sorting Hits 1\n");
         fflush(stdout);
@@ -434,12 +423,6 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
 
         HIB = filterHits(args->hits, args->nHits, args->wSize);
 
-#ifdef ELAPSEDTIME
-        end = clock();
-        elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
-        fprintf(stdout, "[FILTERHITS] Elapsed time: %lf\n", elapsed_secs);
-        begin = clock();
-#endif
 
 #ifdef VERBOSE
         fprintf(stdout, "End of filtering Hits 1\n");
@@ -456,11 +439,6 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
         if (HIB > 0) {
             fragsBuf = frags(args->seqX, args->seqY, args->hits, HIB, args->Lmin, args->SimTh,
                              args->wSize, args->nFrags, args->nHitsUsed, args->seqStatsX, args->seqStatsY, args->e_value);
-#ifdef ELAPSEDTIME
-            end = clock();
-            elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
-            fprintf(stdout, "[FRAGHITSREV] Elapsed time: %lf\n", elapsed_secs);
-#endif
         }
 
 #ifdef VERBOSE
@@ -468,7 +446,8 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
         fflush(stdout);
 #endif
 
-        if (args->hits != NULL)
+
+        if (args != NULL && args->hits != NULL)
             free(args->hits);
         return fragsBuf;
     }
@@ -480,31 +459,10 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
     ComparisonArgs *args = (ComparisonArgs *) a;
     uint64_t HIB;
 
-#ifdef ELAPSEDTIME
-    //time variables
-    clock_t begin, end;
-    double elapsed_secs;
-
-    begin = clock();
-#endif
-
     if (args->nHits > 0) {
         psortHR(32, args->hits, args->nHits, args->minSeqLen);
-#ifdef ELAPSEDTIME
-        end = clock();
-        elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
-        fprintf(stdout, "[SORTHITSREV] Elapsed time: %lf\n", elapsed_secs);
-        begin = clock();
-#endif
 
         HIB = filterHitsReverse(args->hits, args->nHits, args->wSize, args->minSeqLen);
-
-#ifdef ELAPSEDTIME
-        end = clock();
-        elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
-        fprintf(stdout, "[FILTERHITSREV] Elapsed time: %lf\n", elapsed_secs);
-        begin = clock();
-#endif
 
 #ifdef VERBOSE
         fprintf(stdout, "Frag Hits 2\n");
@@ -516,11 +474,6 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
         if (HIB > 0) {
             fragsBuf = fragsReverse(args->seqX, args->seqY, args->hits, HIB, args->Lmin, args->SimTh,
                                     args->wSize, args->nFrags, args->nHitsUsed, args->seqStatsX, args->seqStatsY, args->e_value);
-#ifdef ELAPSEDTIME
-            end = clock();
-            elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
-            fprintf(stdout, "[FRAGHITSREV] Elapsed time: %lf\n", elapsed_secs);
-#endif
         }
 #ifdef VERBOSE
         fprintf(stdout, "End of Frag Hits 2\n");
@@ -528,7 +481,7 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
 #endif
 
 
-        if (args->hits != NULL)
+        if (args != NULL && args->hits != NULL)
             free(args->hits);
 
         return fragsBuf;
@@ -536,7 +489,7 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
     return NULL;
 }
 
-struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
+FragsFandR hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uint64_t seqYLen,
                               hashentryF *entriesX, uint64_t nEntriesX, hashentryR *entriesY, uint64_t nEntriesY,
                               int wSize, uint64_t Lmin, uint64_t SimTh, uint64_t *nFrags, struct statsHSP * seqStatsX,
                               struct statsHSP * seqStatsY, long double e_value) {
@@ -553,14 +506,6 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     uint64_t minSeqXLenSeqYLen = min(seqXLen, seqYLen);
     FILE *fOut, *fInf;
     char infoFileName[1024];
-
-#ifdef ELAPSEDTIME
-    //time variables
-    clock_t begin, end;
-    double elapsed_secs;
-
-    begin = clock();
-#endif
 
     if ((hBufForward = (hit *) calloc(MAXBUF, sizeof(hit))) == NULL)
         terror("HITS: memory for I-O buffer");
@@ -678,14 +623,6 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     fflush(stdout);
 #endif
 
-#ifdef ELAPSEDTIME
-    end = clock();
-    elapsed_secs = (double)(end-begin)/CLOCKS_PER_SEC;
-    fprintf(stdout, "[HITS] Elapsed time: %lf\n", elapsed_secs);
-#endif
-
-
-
     ComparisonArgs argsForward, argsReverse;
     pthread_t thF, thR;
 
@@ -717,6 +654,11 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     argsReverse.seqStatsY = seqStatsY;
     argsReverse.e_value = e_value;
 
+
+
+    pthread_create(&thF, NULL, sortHitsFilterHitsFragHitsTh, (void *) (&argsForward));
+    pthread_create(&thR, NULL, sortHitsFilterHitsFragHitsReverseTh, (void *) (&argsReverse));
+    
     /*
     FILE * fileout = fopen("db_nosort_f.hits", "wb");
     fwrite(hBufForward, sizeof(hit), hitsInBufForward, fileout);
@@ -725,9 +667,6 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     fwrite(hBufReverse, sizeof(hit), hitsInBufReverse, fileout);
     fclose(fileout);
     */
-
-    pthread_create(&thF, NULL, sortHitsFilterHitsFragHitsTh, (void *) (&argsForward));
-    pthread_create(&thR, NULL, sortHitsFilterHitsFragHitsReverseTh, (void *) (&argsReverse));
 
     struct FragFile *fragsBufForward;
     struct FragFile *fragsBufReverse;
@@ -741,7 +680,16 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     "\n", nFragsForward, nFragsReverse);
     fflush(stdout);
 
+    FragsFandR fAndR;
+    fAndR.t_forward_fragments = nFragsForward;
+    fAndR.t_reverse_fragments = nFragsReverse;
+
+    fAndR.fforward = fragsBufForward;
+    fAndR.freverse = fragsBufReverse;
+
     *nFrags = nFragsForward + nFragsReverse;
+
+    /*
 
 #ifdef VERBOSE
     fprintf(stdout, "Writing fragments to disk\n");
@@ -759,6 +707,8 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     "\n", seqXLen, seqYLen);
     fflush(stdout);
 #endif
+
+    
 
     writeSequenceLength(&seqXLen, fOut);
     writeSequenceLength(&seqYLen, fOut);
@@ -798,6 +748,8 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
 #endif
 
     fclose(fOut);
+
+    */
 
     // metadata info
     sprintf(infoFileName, "%s.INF", out);
@@ -839,8 +791,8 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     fflush(stdout);
 #endif
 
-    //TODO change if we want to have the fragments outside this function
-    return NULL;
+    
+    return fAndR;
 }
 
 struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64_t Lmin, uint64_t SimTh, int WL,
@@ -912,8 +864,12 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
         }
 
         nHitsUsed++;
+        //printf("Calling with hit: %"PRIu64" - %"PRIu64"\n", hits[i].posX, hits[i].posY);
         newFrag = FragFromHit(coverage, &myF, &hits[i], sX, n0, sY, n1, nSeqs1, Lmin, SimTh,
                               WL);
+
+	//printf("results in %d\n", newFrag);
+	//printFragment(&myF);
 
         if(newFrag){
             if(computeExpectedValueOfFrag(&myF, seqStatsX, seqStatsY) <= e_value){
@@ -924,6 +880,7 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
             }
         }
 	
+
         if (newFrag) {
             memcpy(&fragsBuf[nFrags], &myF, sizeof(struct FragFile));
             lastOffset = hits[i].posX + myF.length;

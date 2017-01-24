@@ -7,7 +7,7 @@
 #include "structs.h"
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
-#include "comparisonFunctions.h"
+#include "comparisonFunctionsAll.h"
 
 
 

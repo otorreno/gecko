@@ -324,33 +324,34 @@ long double cdf(long double x, long double mu, long double sigma){
         return 0.5 * (1 + erfl((x - mu) / (sigma * sqrtl(2.))));
 }
 
-char ** read_all_vs_all_files(char * list_of_files, uint64_t * n_files, uint64_t * t_alloc){
+char ** read_all_vs_all_files(char * list_of_files, uint64_t * n_files){
 
     FILE * lf = fopen64(list_of_files, "rt");
     if(lf == NULL) terror("Could not open list of genomic files");
 
-    *t_alloc = 1;
+
+    uint64_t t_seqs = 0;
+    char c = 'Z';
+    while(!feof(lf)){
+        if(c=='\n') t_seqs++;
+        c=fgetc(lf);
+    }
+    //Rewind
+    fseeko64(lf, 0L, SEEK_SET);
+
+
     *n_files = 0;
     uint64_t i;
 
-    char ** all_sequences = (char **) malloc (INIT_SEQS*sizeof(char *));
-    for(i=0;i<INIT_SEQS;i++){
+    char ** all_sequences = (char **) malloc (t_seqs*sizeof(char *));
+    for(i=0;i<t_seqs;i++){
         all_sequences[i] = (char *) malloc(READLINE*sizeof(char));
         if(all_sequences[i] == NULL) terror("Could not allocate paths to files");
     }
 
+    
 
-
-    while(!feof(lf)){
-        if(*n_files == (INIT_SEQS*(*t_alloc))){
-            (*t_alloc)++;
-            all_sequences = (char **) realloc(all_sequences, (*t_alloc)*INIT_SEQS);
-            if(all_sequences == NULL) terror("Could not re-allocate paths to files");
-            for(i=INIT_SEQS*((*t_alloc)-1);i<INIT_SEQS*(*t_alloc);i++){
-        all_sequences[i] = (char *) malloc(READLINE*sizeof(char));
-        if(all_sequences[i] == NULL) terror("Could not allocate paths to files");
-            }
-        }
+    while(*n_files < t_seqs && !feof(lf)){
         if(fgets(all_sequences[*n_files], READLINE, lf) > 0){
             if(all_sequences[*n_files][0] != '\0' && all_sequences[*n_files][0] != '\n'){
                

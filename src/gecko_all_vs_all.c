@@ -17,9 +17,9 @@ int main(int ac, char **av) {
     }
 
     //Load files to compare
-    uint64_t i, n_files, t_alloc, j, curr_comp = 0, k;
+    uint64_t i, n_files, j, curr_comp = 0, k;
 
-    char ** paths_to_files = read_all_vs_all_files(av[1], &n_files, &t_alloc);
+    char ** paths_to_files = read_all_vs_all_files(av[1], &n_files);
     if(n_files < 2) terror("At least two files need to be compared");
     unsigned char wrote_lengths[n_files]; //To keep track of which lengths were written or not
     for(i=0;i<n_files;i++) { wrote_lengths[i] = 0; }
@@ -152,7 +152,7 @@ int main(int ac, char **av) {
         fprintf(stdout, "[INFO] Fragments in comparison %"PRIu64": %"PRIu64"\n", i, nFrags[i]);
     }
 
-    for(i=0;i<t_alloc;i++){
+    for(i=0;i<n_files;i++){
         free(paths_to_files[i]);
     }
     free(paths_to_files);

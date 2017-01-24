@@ -308,13 +308,13 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
             lastPosition = hBuf[i+1].posX + (2 * wSize - 1);
             diagonal = hBuf[i+1].posX - hBuf[i+1].posY;
 	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-            memove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+            memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
         }
         i++;
     }
 
     if (diagonal != (hBuf[i].posX - hBuf[i].posY) || hBuf[i].posX > (lastPosition)) {
-        memove(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
+        memmove(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
     }
 
     if (finalNumberOfHits == 0) {

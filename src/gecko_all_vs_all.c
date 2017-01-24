@@ -143,7 +143,6 @@ int main(int ac, char **av) {
                 wrote_lengths[j] = 1;
             }
 
-            free(argsX.seqStats);
             free(argsY.seqStats);
 
         }

@@ -9,7 +9,7 @@
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
 #include "quicksortHit.h"
-#include "comparisonFunctions.h"
+#include "comparisonFunctionsAll.h"
 
 #define MAXBUF 1000000
 #define MaxREP 100
@@ -299,7 +299,7 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
     memcpy(&lastHitNotFiltered, &hBuf[0], sizeof(hit));
     finalNumberOfHits++;
     diagonal = lastHitNotFiltered.posX - lastHitNotFiltered.posY; 
-    while (i < hitsInBuf) {
+    while (i < hitsInBuf-1) {
         if (differentSequences(lastHitNotFiltered, hBuf[i + 1])) {
             lastPosition = hBuf[i+1].posX + (2*wSize-1);
             diagonal = hBuf[i+1].posX - hBuf[i+1].posY;
@@ -421,6 +421,7 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
         fflush(stdout);
 #endif
 
+
         HIB = filterHits(args->hits, args->nHits, args->wSize);
 
 
@@ -461,6 +462,7 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
 
     if (args->nHits > 0) {
         psortHR(32, args->hits, args->nHits, args->minSeqLen);
+
 
         HIB = filterHitsReverse(args->hits, args->nHits, args->wSize, args->minSeqLen);
 
@@ -659,6 +661,8 @@ FragsFandR hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLen, uin
     pthread_create(&thF, NULL, sortHitsFilterHitsFragHitsTh, (void *) (&argsForward));
     pthread_create(&thR, NULL, sortHitsFilterHitsFragHitsReverseTh, (void *) (&argsReverse));
     
+    
+
     /*
     FILE * fileout = fopen("db_nosort_f.hits", "wb");
     fwrite(hBufForward, sizeof(hit), hitsInBufForward, fileout);

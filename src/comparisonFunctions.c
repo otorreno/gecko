@@ -294,12 +294,12 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
     memcpy(&lastHitNotFiltered, &hBuf[0], sizeof(hit));
     finalNumberOfHits++;
     diagonal = lastHitNotFiltered.posX - lastHitNotFiltered.posY; 
-    while (i < hitsInBuf) {
+    while (i < hitsInBuf-1) {
         if (differentSequences(lastHitNotFiltered, hBuf[i + 1])) {
             lastPosition = hBuf[i+1].posX + (2*wSize-1);
             diagonal = hBuf[i+1].posX - hBuf[i+1].posY;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-	    memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+	        memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
             i++;
             continue;
         }
@@ -307,14 +307,14 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
         if (diagonal != (hBuf[i + 1].posX - hBuf[i + 1].posY) || hBuf[i + 1].posX > lastPosition) {
             lastPosition = hBuf[i+1].posX + (2 * wSize - 1);
             diagonal = hBuf[i+1].posX - hBuf[i+1].posY;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
         }
         i++;
     }
 
     if (diagonal != (hBuf[i].posX - hBuf[i].posY) || hBuf[i].posX > (lastPosition)) {
-        memcpy(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
+        memove(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
     }
 
     if (finalNumberOfHits == 0) {
@@ -354,12 +354,12 @@ uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t mi
     memcpy(&lastHitNotFiltered, &hBuf[0], sizeof(hit));
     finalNumberOfHits++;
     diagonal = lastHitNotFiltered.posX - lastHitNotFiltered.posY; 
-    while (i < hitsInBuf) {
+    while (i < hitsInBuf-1) {
         if (differentSequences(lastHitNotFiltered, hBuf[i + 1])) {
             lastPosition = hBuf[i+1].posX + (2*wSize-1);
             diagonal = hBuf[i+1].posX + hBuf[i+1].posY - minSeqXLenSeqYLen;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
             i++;
             continue;
         }
@@ -367,14 +367,14 @@ uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t mi
         if (diagonal != (hBuf[i + 1].posX + hBuf[i + 1].posY - minSeqXLenSeqYLen) || hBuf[i + 1].posX > lastPosition) {
             lastPosition = hBuf[i+1].posX + (2 * wSize - 1);
             diagonal = hBuf[i+1].posX + hBuf[i+1].posY - minSeqXLenSeqYLen;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
         }
         i++;
     }
 
     if (diagonal != (hBuf[i].posX + hBuf[i].posY - minSeqXLenSeqYLen) || hBuf[i].posX > (lastPosition)) {
-        memcpy(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
+        memmove(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
     }
 
     if (finalNumberOfHits == 0) {

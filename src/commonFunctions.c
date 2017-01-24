@@ -342,18 +342,25 @@ char ** read_all_vs_all_files(char * list_of_files, uint64_t * n_files, uint64_t
 
 
     while(!feof(lf)){
+        if(*n_files == (INIT_SEQS*(*t_alloc))){
+            (*t_alloc)++;
+            all_sequences = (char **) realloc(all_sequences, (*t_alloc)*INIT_SEQS);
+            if(all_sequences == NULL) terror("Could not re-allocate paths to files");
+            for(i=INIT_SEQS*((*t_alloc)-1);i<INIT_SEQS*(*t_alloc);i++){
+        all_sequences[i] = (char *) malloc(READLINE*sizeof(char));
+        if(all_sequences[i] == NULL) terror("Could not allocate paths to files");
+            }
+        }
         if(fgets(all_sequences[*n_files], READLINE, lf) > 0){
             if(all_sequences[*n_files][0] != '\0' && all_sequences[*n_files][0] != '\n'){
+               
                 all_sequences[*n_files][strlen(all_sequences[*n_files])-1] = '\0';
                 (*n_files)++;
             }
         }
-        if(*n_files == INIT_SEQS*(*t_alloc)){
-            (*t_alloc)++;
-            all_sequences = (char **) realloc(all_sequences, (*t_alloc)*INIT_SEQS);
-            if(all_sequences == NULL) terror("Could not re-allocate paths to files");
-        }
+
     }
+
 
     fclose(lf);
     return all_sequences;

@@ -1,21 +1,13 @@
 /* words.c
- new version of "words" program. Instead of working with the bin file
- this version works over the plain-text sequence (and do not uses the
- seqio library -for managing big data sets-)
- Problems have been detected in the previous version.
+ It is recommended to mask the Low-Complexity regions before using this program
 
- Using this option makes unnecesary to "format" the sequence (moving
- to binary code). Thus, after masking the Low-Complex regions this
- program can be used as next step
+ This program generates a set of 32-mers for the given input sequence.
 
- This new uses "./words seq.IN words.OUT
+ Usage: "./words seq.IN words.OUT
  where seq.IN is a plain-text sequence
- words.OUT is a binary file of "wentry" structures
-
- NEXT: this program load the full seq into memory. Need to be modified
- to load partial chunks of sequence (not difficult)
- -----------------------------------------------------4.Feb.2012
- ortrelles @ uma.es
+ words.OUT is a binary file of "wentry" structures with the 32-mers
+ -----------------------------------------------------
+ oscart@uma.es
  */
 
 #include <stdio.h>
@@ -28,9 +20,8 @@
 #include "commonFunctions.h"
 #include "dictionaryFunctions.h"
 
-static int WORD_SIZE=32;
-//static int BITS_PER_BASE=2;
-static int BYTES_IN_WORD=8;//(int)ceil(WORD_SIZE/8.*BITS_PER_BASE);
+#define WORD_SIZE 32
+#define BYTES_IN_WORD 8
 
 void shift_word(word * w){
 	int i;
@@ -79,15 +70,15 @@ void main_FILE(char * inFile, char * outFile){
 	while (!feof(f) || (feof(f) && i < r)){
 		if (!isupper(toupper(c))){
 			if(c=='>'){
-				c = fgetc(f);
+				c = buffered_fgetc(seq, &i, &r, f);
 				while (c != '\n')
-					c = fgetc(f);
+					c = buffered_fgetc(seq, &i, &r, f);
 				WE.seq++;
 				inEntry=0;
 				index++;
 			}
 			NoC++;
-			c=fgetc(f);
+			c = buffered_fgetc(seq, &i, &r, f);
 			continue;
 		}
 		shift_word(&WE.w);
@@ -117,7 +108,7 @@ void main_FILE(char * inFile, char * outFile){
 		}
 		c = buffered_fgetc(seq, &i, &r, f);
 	}
-	//printf("FILE: Create %d Words --(seqLen=%d NoACGT=%d noChar=%d\n",NW,Tot,NoACGT, NoC);
+
 	fclose(f);
 
 }

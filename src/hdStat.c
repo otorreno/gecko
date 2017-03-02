@@ -54,7 +54,7 @@ int main(int ac, char** av){
         while(!feof(f1)){
 
              if (flagV) {showWord(&he.w, W);fprintf(stdout, "%.32s", W);}
-             if (flagV) fprintf(stdout,"  : pos=%-7" PRIu64 " num=%-7" PRIu64 ":",he.pos,he.num);
+             if (flagV) fprintf(stdout,"  : num=%-7" PRIu64 ":",he.num);
 		if (he.num>=PEQ) {
 			fprintf(f3, "%" PRIu64 "\t", he.num);
 			showWord(&he.w, W);
@@ -73,7 +73,6 @@ int main(int ac, char** av){
 	       if(fread(&spos,sizeof(location),1,f2)!=1)
 			terror("Error reading the word occurrences");
                fprintf(stdout,"(%" PRIu64 ",%" PRIu64 ") ",spos.pos,spos.seq);
-		if (i>10) {fprintf(stdout,"...cont"); break;} 
              }
              fprintf(stdout,"\n");
 	    }

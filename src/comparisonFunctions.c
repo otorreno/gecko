@@ -134,7 +134,7 @@ char getValue(struct Sequence *s, uint64_t pos) {
     return s->datos[pos];
 }
 
-long getSeqLength(struct Sequence *s, uint64_t start, int ns) {
+long getSeqLength(struct Sequence *s) {
     uint64_t s1 = 0;
     while (s1 > 0 && s->datos[s1] != '*') {
         s1--;

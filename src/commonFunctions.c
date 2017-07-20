@@ -362,7 +362,6 @@ char ** read_all_vs_all_files(char * list_of_files, uint64_t * n_files){
 
     }
 
-
     fclose(lf);
     return all_sequences;
 }

@@ -9,7 +9,8 @@
 #include "dictionaryFunctions.h"
 #include "comparisonFunctionsAll.h"
 
-
+void write_header(FILE * f, uint64_t sx_len, uint64_t sy_len);
+void write_csvs(char * generic_path, uint64_t n_comparison, struct FragFile * f, uint64_t n_frags_f, struct FragFile * r, uint64_t n_frags_r, uint64_t xlen, uint64_t ylen, uint64_t lmin, uint64_t simmin, int kmer);
 
 int main(int ac, char **av) {
     if (ac < 6) {
@@ -17,7 +18,7 @@ int main(int ac, char **av) {
     }
 
     //Load files to compare
-    uint64_t i, n_files, j, curr_comp = 0, k;
+    uint64_t i, n_files, j, curr_comp = 0, k, bijectve_i_j = 0;
 
     char ** paths_to_files = read_all_vs_all_files(av[1], &n_files);
     if(n_files < 2) terror("At least two files need to be compared");
@@ -95,6 +96,9 @@ int main(int ac, char **av) {
 
             frags_list[curr_comp] = hitsAndFrags(paths_to_files[i], paths_to_files[j], out, seqXLen, seqYLen, entriesX, nEntriesX, entriesY, nEntriesY, wSize, Lmin, SimTh,
                  &nFrags[curr_comp], argsX.seqStats, argsY.seqStats, e_value);
+                 
+            write_csvs("multicomp", bijectve_i_j, frags_list[curr_comp].fforward, frags_list[curr_comp].t_forward_fragments, frags_list[curr_comp].freverse, frags_list[curr_comp].t_reverse_fragments, *argsX.seqLen, *argsY.seqLen, Lmin, SimTh, wSize);
+            bijectve_i_j++;
             
             for(k=0;k<frags_list[curr_comp].t_forward_fragments;k++){
                 
@@ -160,4 +164,57 @@ int main(int ac, char **av) {
     fclose(fOut);
     fclose(fOutLengths);
     return 0;
+}
+
+void write_header(FILE * f, uint64_t sx_len, uint64_t sy_len){
+    fprintf(f, "CSV file\n");
+    fprintf(f, "[Jul.17 -- < estebanpw@uma.es >\n");
+    fprintf(f, "SeqX filename	: DATA1.dat\n");
+    fprintf(f, "SeqY filename	: DATA2.dat\n");
+    fprintf(f, "SeqX name	: S1\n");
+    fprintf(f, "SeqY name	: S2\n");
+    fprintf(f, "SeqX length	: %"PRIu64"\n", sx_len);
+    fprintf(f, "SeqY length	: %"PRIu64"\n", sy_len);
+    fprintf(f, "Min.fragment.length	: 0\n");
+    fprintf(f, "Min.Identity	: 0.0\n");
+    fprintf(f, "Total hits	: 0\n");
+    fprintf(f, "Total hits (used)	: 0\n");
+    fprintf(f, "Total fragments	: 0\n");
+    fprintf(f, "Total CSBs:	: 0\n");
+    fprintf(f, "frag/CSB,xStart,yStart,xEnd,YEnd,strand,block,length,score,ident,similarity,identity,geneX,geneY\n");
+    fprintf(f, "========================================================\n");
+}
+
+void write_csvs(char * generic_path, uint64_t n_comparison, struct FragFile * f, uint64_t n_frags_f, struct FragFile * r, uint64_t n_frags_r, uint64_t xlen, uint64_t ylen, uint64_t lmin, uint64_t simmin, int kmer){
+
+    FILE * out;
+    char buffer[2048]; buffer[0]='\0';
+    sprintf(buffer, "%s_%"PRIu64"_%"PRIu64"_%"PRIu64"_%d", generic_path, n_comparison, lmin, simmin, kmer);
+    sprintf(buffer, "%s.csv", buffer);
+    out = fopen64(buffer, "wt");
+    if(out == NULL) terror("Could not open output csv file");
+
+
+    write_header(out, xlen, ylen);
+
+
+	double similarity, likeness;
+	uint64_t i;
+	for(i=0;i<n_frags_f;i++){
+		similarity=(((double)f[i].score)/((double)f[i].length*4.0));
+		likeness=(((double)f[i].ident)/((double)f[i].length));
+		
+
+		fprintf(out, "Frag,%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%c,%"PRId64",%"PRIu64",%"PRId64",%"PRIu64",%.2f,%.2f,0,0,%"PRIu64",%"PRIu64"\n", f[i].xStart, f[i].yStart, f[i].xEnd, f[i].yEnd,f[i].strand, f[i].block, f[i].length, f[i].score, f[i].ident, similarity, likeness, (uint64_t)0, (uint64_t)1);
+	}
+	
+	for(i=0;i<n_frags_r;i++){
+		similarity=(((double)r[i].score)/((double)r[i].length*4.0));
+		likeness=(((double)r[i].ident)/((double)r[i].length));
+		
+
+
+		fprintf(out, "Frag,%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%c,%"PRId64",%"PRIu64",%"PRId64",%"PRIu64",%.2f,%.2f,0,0,%"PRIu64",%"PRIu64"\n", r[i].xStart, r[i].yStart, r[i].xEnd, r[i].yEnd,r[i].strand, r[i].block, r[i].length, r[i].score, r[i].ident, similarity, likeness, (uint64_t)0, (uint64_t)1);
+	}
+	fclose(out);
 }

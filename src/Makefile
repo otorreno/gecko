@@ -1,9 +1,9 @@
 CC=gcc
 CXX=g++
-CFLAGS=-O3 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -Wall
+CFLAGS=-O3 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -Wall -DVERBOSE
 BIN=../bin
 
-all: gecko wordsStat hitsStat ramgecko2gecko indexmaker
+all: gecko wordsStat hitsStat ramgecko2gecko indexmaker gecko_all_vs_all
 
 stats: wordsStat hitsStat
 

@@ -854,6 +854,8 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
 
     i = 0;
     while (i < nHits) {
+    	
+    	
         if (lastDiagonal != (hits[i].posX - hits[i].posY)) {
             //Different diagonal update the variables
             lastDiagonal = hits[i].posX - hits[i].posY;
@@ -871,6 +873,8 @@ struct FragFile *frags(char *seqX, char *seqY, hit *hits, uint64_t nHits, uint64
         //printf("Calling with hit: %"PRIu64" - %"PRIu64"\n", hits[i].posX, hits[i].posY);
         newFrag = FragFromHit(coverage, &myF, &hits[i], sX, n0, sY, n1, nSeqs1, Lmin, SimTh,
                               WL);
+                              
+        
 
 	//printf("results in %d\n", newFrag);
 	//printFragment(&myF);
@@ -1109,6 +1113,7 @@ int FragFromHit(long M[1000][100], struct FragFile *myF, hit *H, struct Sequence
         if (fscore < 0)
             break;
     }
+    
 
     /**
      * Backward search --- Oscar (Sept.2013)
@@ -1151,6 +1156,7 @@ int FragFromHit(long M[1000][100], struct FragFile *myF, hit *H, struct Sequence
             if (fscore < 0)
                 break;
         }
+        
 
     // Set the values of the FragFile
     myF->diag = H->posX - H->posY;

@@ -116,4 +116,15 @@ struct Sequence{
     char *datos;
 };
 
+//Struct for reads index tuple
+struct rIndex2 {
+    char id[MAXLID];
+    uint64_t  rNumber;
+    uint64_t  rLen;
+    uint64_t  rLmasked; //Masked positions
+    uint64_t  nonACGT;  //N's
+    uint64_t  pos;      //Start position of sequence
+    uint64_t  Lac;      //Accumulated length
+};
+
 #endif

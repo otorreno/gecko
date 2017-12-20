@@ -48,32 +48,38 @@ void write_headers(FILE * f1, FILE * f2, FILE * fO, uint64_t pos1, uint64_t pos2
 	fprintf(fO, " LENGTH: %"PRIu64" IDENT: %"PRIu64" STRAND: %c @(%"PRIu64", %"PRIu64")\n", f->length, f->ident, f->strand, f->xStart, f->yStart);
 }
 
-void get_both_seqs(FILE * fastaX, FILE * fastaY, uint64_t iniX, uint64_t finX, uint64_t iniY, uint64_t finY, uint64_t posX, uint64_t posY, uint64_t LacX, uint64_t LacY, uint64_t lX, uint64_t lY, FILE * fO){
-	char copyX[TAB_INSERT];
-	char copyY[TAB_INSERT];
+void get_both_seqs(char * fastaX, char * fastaY, uint64_t iniX, uint64_t finX, uint64_t iniY, uint64_t finY, uint64_t posX, uint64_t posY, uint64_t LacX, uint64_t LacY, uint64_t lX, uint64_t lY, FILE * fO){
+	char copyX[TAB_INSERT+1];
+	char copyY[TAB_INSERT+1];
+	memset(copyX, 0x0, TAB_INSERT+1);
+	memset(copyY, 0x0, TAB_INSERT+1);
 	uint64_t atcopyX = 0;
 	uint64_t atcopyY = 0;
 	uint64_t i;
+
+	uint64_t pos_used_x, pos_used_y;
 	
 	// The X one
-	fseek(fastaX, posX, SEEK_SET);
-	char cX = fgetc(fastaX);
-	while(cX != '\n'){ cX = fgetc(fastaX); }
+	//fseek(fastaX, posX, SEEK_SET);
+	pos_used_x = posX;
+	char cX = fastaX[pos_used_x++];
+	while(cX != '\n'){ cX = fastaX[pos_used_x++]; }
 	uint64_t gpX = iniX - LacX;
 	uint64_t currX = 0, tab_counter;
 	while(currX < gpX){
-		cX = fgetc(fastaX);
+		cX = fastaX[pos_used_x++];
 		if(cX != '\n') ++currX;
 	}
 
 	// the other Y
-	fseek(fastaY, posY, SEEK_SET);
-	char cY = fgetc(fastaY);
-	while(cY != '\n'){ cY = fgetc(fastaY); }
+	//fseek(fastaY, posY, SEEK_SET);
+	pos_used_y = posY;
+	char cY = fastaY[pos_used_y++];
+	while(cY != '\n'){ cY = fastaY[pos_used_y++]; }
 	uint64_t gpY = iniY - LacY;
 	uint64_t currY = 0;
 	while(currY < gpY){
-		cY = fgetc(fastaY);
+		cY = fastaY[pos_used_y++];
 		if(cY != '\n') ++currY;
 	}
 
@@ -83,25 +89,45 @@ void get_both_seqs(FILE * fastaX, FILE * fastaY, uint64_t iniX, uint64_t finX, u
 	// Reached the region to show
 	currX = 0;
 	currY = 0;
-	cX = fgetc(fastaX);
-	cY = fgetc(fastaY);
+	cX = fastaX[pos_used_x++];
+	cY = fastaY[pos_used_y++];
 	//fprintf(fO, "\t");
 	tab_counter = 0;
 	while(currX < lX && currY < lY){
-		if(cX != '\n') copyX[atcopyX++] = cX;
-		if(cY != '\n') copyY[atcopyY++] = cY;
-		cX = fgetc(fastaX);
-		cY = fgetc(fastaY);
-		if(cX != '\n' || feof(fastaX)){ ++currX; ++tab_counter; }
-		if(cY != '\n' || feof(fastaY)){ ++currY; }
+		
+		if(cX == 'A' || cX == 'C' || cX == 'G' || cX == 'T' || cX == 'N'){ copyX[atcopyX++] = cX; ++currX; }
+		cX = fastaX[pos_used_x++];
+		while(cX != 'A' && cX != 'C' && cX != 'G' && cX != 'T' && cX != 'N') cX = fastaX[pos_used_x++];
 
 
-		if(tab_counter == TAB_INSERT){ 
-			fprintf(fO, "X:\t%s\n\t", copyX);
+		if(cY == 'A' || cY == 'C' || cY == 'G' || cY == 'T' || cY == 'N'){ copyY[atcopyY++] = cY; ++currY; }
+		cY = fastaY[pos_used_y++];
+		while(cY != 'A' && cY != 'C' && cY != 'G' && cY != 'T' && cY != 'N') cY = fastaY[pos_used_y++];
+
+		while(currX > currY){
+			if(cY == 'A' || cY == 'C' || cY == 'G' || cY == 'T' || cY == 'N'){ copyY[atcopyY++] = cY; ++currY; }
+			cY = fastaY[pos_used_y++];
+			while(cY != 'A' && cY != 'C' && cY != 'G' && cY != 'T' && cY != 'N') cY = fastaY[pos_used_y++];
+		}
+		while(currX < currY){
+			if(cX == 'A' || cX == 'C' || cX == 'G' || cX == 'T' || cX == 'N'){ copyX[atcopyX++] = cX; ++currX; }
+			cX = fastaX[pos_used_x++];
+			while(cX != 'A' && cX != 'C' && cX != 'G' && cX != 'T' && cX != 'N') cX = fastaX[pos_used_x++];
+		}
+
+		++tab_counter;
+		
+
+
+		if(tab_counter >= TAB_INSERT && currX == currY){ 
+			
+			copyX[TAB_INSERT] = '\0';
+			copyY[TAB_INSERT] = '\0';
+			fprintf(fO, "X:\t%.*s\n\t", TAB_INSERT, copyX);
 			for(i=0; i<TAB_INSERT; i++){
-				(copyX[atcopyX] == copyY[atcopyY]) ? (fprintf(fO, "|")) : (fprintf(fO, " "));
+				if(copyX[i] == copyY[i]) fprintf(fO, "|"); else fprintf(fO, " ");
 			}
-			fprintf(fO, "\nY:\t%s\n", copyY);
+			fprintf(fO, "\nY:\t%.*s\n\n", TAB_INSERT, copyY);
 			tab_counter = 0;
 			atcopyX = 0; atcopyY = 0;
 		}
@@ -109,11 +135,11 @@ void get_both_seqs(FILE * fastaX, FILE * fastaY, uint64_t iniX, uint64_t finX, u
 	if(atcopyX > 0){
 		copyX[atcopyX] = '\0';
 		copyY[atcopyY] = '\0';
-		fprintf(fO, "X:\t%s\n\t", copyX);
+		fprintf(fO, "X:\t%.*s\n\t", (int)atcopyX, copyX);
 		for(i=0; i<atcopyX; i++){
-			(copyX[atcopyX] == copyY[atcopyY]) ? (fprintf(fO, "|")) : (fprintf(fO, " "));
+			if(copyX[i] == copyY[i]) fprintf(fO, "|"); else fprintf(fO, " ");
 		}
-		fprintf(fO, "\nY:\t%s\n", copyY);
+		fprintf(fO, "\nY:\t%.*s\n\n", (int)atcopyY, copyY);
 		atcopyX = 0; atcopyY = 0;
 	} 
 	fprintf(fO, "\n");
@@ -193,6 +219,28 @@ int main(int ac, char** av) {
 	fYrev = fopen(av[4], "rt");
 	if(fYrev == NULL) terror("Could not open fasta Y-rev file");
 
+
+	// Get file lengths
+    fseek(fX, 0, SEEK_END);
+    uint64_t aprox_lenX = ftell(fX);
+    rewind(fX);
+	char * strfastaX = (char *) malloc(aprox_lenX*sizeof(char));
+	fseek(fY, 0, SEEK_END);
+    uint64_t aprox_lenY = ftell(fY);
+    rewind(fY);
+	char * strfastaY = (char *) malloc(aprox_lenY*sizeof(char));
+	fseek(fYrev, 0, SEEK_END);
+    uint64_t aprox_lenYrev = ftell(fYrev);
+    rewind(fYrev);
+	char * strfastaYrev = (char *) malloc(aprox_lenYrev*sizeof(char));
+
+	if(strfastaX == NULL || strfastaY == NULL || strfastaYrev == NULL) terror("Could not allocate string sequences");
+
+	if(aprox_lenX != fread(strfastaX, sizeof(char), aprox_lenX, fX)) terror("Read wrong number of chars at X sequence");
+	if(aprox_lenY != fread(strfastaY, sizeof(char), aprox_lenY, fY)) terror("Read wrong number of chars at Y sequence");
+	if(aprox_lenYrev != fread(strfastaYrev, sizeof(char), aprox_lenYrev, fYrev)) terror("Read wrong number of chars at Y reversed sequence");
+	
+
 	struct rIndex2 * RI_X, * RI_Y, * RI_Yrev;
 
 	
@@ -234,12 +282,12 @@ int main(int ac, char** av) {
 
 
 		if(frag.strand == 'f'){
-			get_both_seqs(fX, fY, frag.xStart, frag.xEnd, frag.yStart, frag.yEnd, RI_X[frag.seqX].pos, RI_Y[frag.seqY].pos, RI_X[frag.seqX].Lac, RI_Y[frag.seqY].Lac, frag.length, frag.length, fO);
+			get_both_seqs(strfastaX, strfastaY, frag.xStart, frag.xEnd, frag.yStart, frag.yEnd, RI_X[frag.seqX].pos, RI_Y[frag.seqY].pos, RI_X[frag.seqX].Lac, RI_Y[frag.seqY].Lac, frag.length, frag.length, fO);
 			//get_seq_from_to(fY, fO, frag.yStart, frag.yEnd, RI_Y[frag.seqY].pos, RI_Y[frag.seqY].Lac, frag.seqY, frag.length, fO);
 		}else{
 			uint64_t seqYnew;
 			seqYnew = nReads_Y - frag.seqY - 1;
-			get_both_seqs(fX, fYrev, frag.xStart, frag.xEnd, frag.yStart, frag.yEnd, RI_X[frag.seqX].pos, RI_Yrev[seqYnew].pos, RI_X[frag.seqX].Lac, RI_Yrev[seqYnew].Lac, frag.length, frag.length, fO);
+			get_both_seqs(strfastaX, strfastaYrev, frag.xStart, frag.xEnd, frag.yStart, frag.yEnd, RI_X[frag.seqX].pos, RI_Yrev[seqYnew].pos, RI_X[frag.seqX].Lac, RI_Yrev[seqYnew].Lac, frag.length, frag.length, fO);
 			//get_seq_from_to_rev(fYrev, fO, frag.yStart, frag.yEnd, RI_Yrev[seqYnew].pos, RI_Yrev[seqYnew].Lac, seqYnew, frag.length, fO);
 		}
 
@@ -254,6 +302,10 @@ int main(int ac, char** av) {
 	free(RI_X);
 	free(RI_Y);
 	free(RI_Yrev);
+
+	free(strfastaX);
+	free(strfastaY);
+	free(strfastaYrev);
 
 	return 0;
 }

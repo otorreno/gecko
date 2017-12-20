@@ -48,6 +48,77 @@ void write_headers(FILE * f1, FILE * f2, FILE * fO, uint64_t pos1, uint64_t pos2
 	fprintf(fO, " LENGTH: %"PRIu64" IDENT: %"PRIu64" STRAND: %c @(%"PRIu64", %"PRIu64")\n", f->length, f->ident, f->strand, f->xStart, f->yStart);
 }
 
+void get_both_seqs(FILE * fastaX, FILE * fastaY, uint64_t iniX, uint64_t finX, uint64_t iniY, uint64_t finY, uint64_t posX, uint64_t posY, uint64_t LacX, uint64_t LacY, uint64_t lX, uint64_t lY, FILE * fO){
+	char copyX[TAB_INSERT];
+	char copyY[TAB_INSERT];
+	uint64_t atcopyX = 0;
+	uint64_t atcopyY = 0;
+	uint64_t i;
+	
+	// The X one
+	fseek(fastaX, posX, SEEK_SET);
+	char cX = fgetc(fastaX);
+	while(cX != '\n'){ cX = fgetc(fastaX); }
+	uint64_t gpX = iniX - LacX;
+	uint64_t currX = 0, tab_counter;
+	while(currX < gpX){
+		cX = fgetc(fastaX);
+		if(cX != '\n') ++currX;
+	}
+
+	// the other Y
+	fseek(fastaY, posY, SEEK_SET);
+	char cY = fgetc(fastaY);
+	while(cY != '\n'){ cY = fgetc(fastaY); }
+	uint64_t gpY = iniY - LacY;
+	uint64_t currY = 0;
+	while(currY < gpY){
+		cY = fgetc(fastaY);
+		if(cY != '\n') ++currY;
+	}
+
+
+	
+
+	// Reached the region to show
+	currX = 0;
+	currY = 0;
+	cX = fgetc(fastaX);
+	cY = fgetc(fastaY);
+	//fprintf(fO, "\t");
+	tab_counter = 0;
+	while(currX < lX && currY < lY){
+		if(cX != '\n') copyX[atcopyX++] = cX;
+		if(cY != '\n') copyY[atcopyY++] = cY;
+		cX = fgetc(fastaX);
+		cY = fgetc(fastaY);
+		if(cX != '\n' || feof(fastaX)){ ++currX; ++tab_counter; }
+		if(cY != '\n' || feof(fastaY)){ ++currY; }
+
+
+		if(tab_counter == TAB_INSERT){ 
+			fprintf(fO, "X:\t%s\n\t", copyX);
+			for(i=0; i<TAB_INSERT; i++){
+				(copyX[atcopyX] == copyY[atcopyY]) ? (fprintf(fO, "|")) : (fprintf(fO, " "));
+			}
+			fprintf(fO, "\nY:\t%s\n", copyY);
+			tab_counter = 0;
+			atcopyX = 0; atcopyY = 0;
+		}
+	}
+	if(atcopyX > 0){
+		copyX[atcopyX] = '\0';
+		copyY[atcopyY] = '\0';
+		fprintf(fO, "X:\t%s\n\t", copyX);
+		for(i=0; i<atcopyX; i++){
+			(copyX[atcopyX] == copyY[atcopyY]) ? (fprintf(fO, "|")) : (fprintf(fO, " "));
+		}
+		fprintf(fO, "\nY:\t%s\n", copyY);
+		atcopyX = 0; atcopyY = 0;
+	} 
+	fprintf(fO, "\n");
+}
+
 
 void get_seq_from_to(FILE * fasta, FILE * output, uint64_t ini, uint64_t fin, uint64_t pos, uint64_t Lac, uint64_t seqNum, uint64_t l, FILE * fO){
 	fseek(fasta, pos, SEEK_SET);
@@ -158,14 +229,18 @@ int main(int ac, char** av) {
 		}
 		
 
-		get_seq_from_to(fX, fO, frag.xStart, frag.xEnd, RI_X[frag.seqX].pos, RI_X[frag.seqX].Lac, frag.seqX, frag.length, fO);
+		//get_seq_from_to(fX, fO, frag.xStart, frag.xEnd, RI_X[frag.seqX].pos, RI_X[frag.seqX].Lac, frag.seqX, frag.length, fO);
+
+
 
 		if(frag.strand == 'f'){
-			get_seq_from_to(fY, fO, frag.yStart, frag.yEnd, RI_Y[frag.seqY].pos, RI_Y[frag.seqY].Lac, frag.seqY, frag.length, fO);
+			get_both_seqs(fX, fY, frag.xStart, frag.xEnd, frag.yStart, frag.yEnd, RI_X[frag.seqX].pos, RI_Y[frag.seqY].pos, RI_X[frag.seqX].Lac, RI_Y[frag.seqY].Lac, frag.length, frag.length, fO);
+			//get_seq_from_to(fY, fO, frag.yStart, frag.yEnd, RI_Y[frag.seqY].pos, RI_Y[frag.seqY].Lac, frag.seqY, frag.length, fO);
 		}else{
 			uint64_t seqYnew;
 			seqYnew = nReads_Y - frag.seqY - 1;
-			get_seq_from_to_rev(fYrev, fO, frag.yStart, frag.yEnd, RI_Yrev[seqYnew].pos, RI_Yrev[seqYnew].Lac, seqYnew, frag.length, fO);
+			get_both_seqs(fX, fYrev, frag.xStart, frag.xEnd, frag.yStart, frag.yEnd, RI_X[frag.seqX].pos, RI_Yrev[seqYnew].pos, RI_X[frag.seqX].Lac, RI_Yrev[seqYnew].Lac, frag.length, frag.length, fO);
+			//get_seq_from_to_rev(fYrev, fO, frag.yStart, frag.yEnd, RI_Yrev[seqYnew].pos, RI_Yrev[seqYnew].Lac, seqYnew, frag.length, fO);
 		}
 
 		readFragment(&frag, fFrags);

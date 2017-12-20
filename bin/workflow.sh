@@ -10,7 +10,7 @@ if [ $# != 6 ]; then
    exit -1
 fi
 
-#{
+{
 
 dirNameX=$(readlink -f $1 | xargs dirname)
 seqXName=$(basename "$1")
@@ -148,4 +148,4 @@ mv ${seqXName}-${seqYName}.csv ../../results
 cd ..
 #rm -rf ${seqXName}-${seqYName}
 
-#} &> /dev/null
+} &> /dev/null

@@ -14,11 +14,9 @@ Use: filterFrags file.frags length similarity
 #include <sys/types.h>
 #include <dirent.h>
 #include <math.h>
-
-#include "fragmentv3.h"
-#include "fragmentv2.h"
-
-#include "lista.h"
+#include "structs.h"
+#include "commonFunctions.h"
+#include "comparisonFunctions.h"
 #define  MAX_LEVELS  900000
 
 
@@ -31,16 +29,23 @@ int main(int ac,char** av){
 	}
 	
 	// Read fragments
-	struct FragFile* f;
-	int nf; // Number of fragments
+	struct FragFile frag;
 	uint64_t xtotal,ytotal;
-	nf=0;
-	f=readFragmentsv2(av[1],&nf,&xtotal,&ytotal);
+	//f=readFragmentsv2(av[1],&nf,&xtotal,&ytotal);
+
+	FILE * fFrags = fopen(av[1], "rb");
+	if(fFrags == NULL){ fprintf(stderr, "Could not open input file\n"); exit(-1); }
+
+	readSequenceLength(&xtotal, fFrags);
+	readSequenceLength(&ytotal, fFrags);
+	
+
+	
+
 	uint64_t min_l = (uint64_t) atoi(av[2]);
 	double min_sim = (double) atof(av[3])/100;
 	
 	/******************************************/
-	int i;
 	
 	// Print header. Frags file info
 	printf("Total CSB: 0\n");
@@ -50,21 +55,25 @@ int main(int ac,char** av){
 	
 	double similarity,likeness;
 				
-	for(i=0;i<nf;i++){
-		similarity=(((double)f[i].score)/((double)f[i].length*4.0));
-		likeness=(((double)f[i].ident)/((double)f[i].length));
+	while(!feof(fFrags)){
+		readFragment(&frag, fFrags);
+
+		similarity=(((double)frag.score)/((double)frag.length*4.0));
+		likeness=(((double)frag.ident)/((double)frag.length));
 		
-		if(f[i].strand=='r'){
-			f[i].yStart = ytotal - f[i].yStart - 1;
-			f[i].yEnd = ytotal - f[i].yEnd - 1;
+		if(frag.strand=='r'){
+			frag.yStart = ytotal - frag.yStart - 1;
+			frag.yEnd = ytotal - frag.yEnd - 1;
 		}
 		
 		
-		if(similarity >= min_sim && (uint64_t)f[i].length >= min_l){
-			printf("Frag,%d,%d,%d,%d,%c,%d,%d,%d,%d,%.2f,%.2f,%d,%d\n",(int)f[i].xStart,(int)f[i].yStart,(int)f[i].xEnd,(int)f[i].yEnd,f[i].strand,(int)f[i].block,(int)f[i].length,(int)f[i].score,(int)f[i].ident,similarity,likeness,(int)f[i].seqX,(int)f[i].seqY);
+		if(similarity >= min_sim && (uint64_t)frag.length >= min_l){
+			printf("Frag,%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%c,%"PRId64",%"PRIu64",%"PRIu64",%"PRIu64",%.2f,%.2f,%"PRIu64",%"PRIu64"\n",frag.xStart,frag.yStart,frag.xEnd,frag.yEnd,frag.strand,frag.block,frag.length,frag.score,frag.ident,similarity,likeness,frag.seqX,frag.seqY);
 		}
 				
 	}
+
+	fclose(fFrags);
 	
 	return 0;
 }

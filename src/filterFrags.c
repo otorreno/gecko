@@ -48,8 +48,23 @@ int main(int ac,char** av){
 	/******************************************/
 	
 	// Print header. Frags file info
-	printf("Total CSB: 0\n");
+	printf("All by-Identity Ungapped Fragments (Hits based approach)\n");
+	printf("[Abr.98/Apr.2010/Dec.2011 -- <ortrelles@uma.es>\n");
+	printf("SeqX filename        : Unknown\n");
+	printf("SeqY filename        : Unknown\n");
+	printf("SeqX name            : Unknown\n");
+	printf("SeqY name            : Unknown\n");
+	printf("SeqX length          : %"PRIu64"\n", xtotal);
+	printf("SeqY length          : %"PRIu64"\n", ytotal);
+	printf("Min.fragment.length  : 0\n");
+	printf("Min.Identity         : 0\n");
+	printf("Tot Hits (seeds)     : 0\n");
+	printf("Tot Hits (seeds) used: 0\n");
+	printf("Total fragments      : 0\n");
+
 	printf("========================================================\n");
+
+	
 	
 	printf("Type,xStart,yStart,xEnd,yEnd,strand(f/r),block,length,score,ident,similarity,%%ident,SeqX,SeqY\n");
 	
@@ -58,7 +73,7 @@ int main(int ac,char** av){
 	while(!feof(fFrags)){
 		readFragment(&frag, fFrags);
 
-		similarity=(((double)frag.score)/((double)frag.length*4.0));
+		similarity=100.0*(((double)frag.score)/((double)frag.length*4.0));
 		likeness=(((double)frag.ident)/((double)frag.length));
 		
 		if(frag.strand=='r'){

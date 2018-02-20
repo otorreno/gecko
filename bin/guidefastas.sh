@@ -5,7 +5,7 @@ BINDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 if [ $# -lt 7 ]; then
    echo " ==== ERROR ... you called this script inappropriately."
    echo ""
-   echo "   usage:  $0 seqXName.fasta seqYName.fasta guideFile ratio LEN SIM WL"
+   echo "   usage:  $0 seqXName.fasta seqYName.fasta guideFile dimension LEN SIM WL"
    echo ""
    exit -1
 fi
@@ -18,7 +18,7 @@ seqNameY=$(basename "$2")
 seqNameY="${seqNameY%.*}"
 
 guided=$3
-ratio=$4
+dimension=$4
 
 LEN=$5
 SIM=$6
@@ -53,7 +53,8 @@ Total CSB: 0
 ========================================================
 Type,xStart,yStart,xEnd,yEnd,strand(f/r),block,length,score,ident,similarity,%ident,SeqX,SeqY" > all-results/master.csv
 
-
+ratioX=$(($lenX / $dimension))
+ratioY=$(($lenY / $dimension))
 actualX=0
 actualY=0
 
@@ -63,10 +64,10 @@ for i in $( tail -n +2 $guided ); do
 	if [[ turn -eq 0 ]]; then
 	
 		actualX=`expr $i - 1`
-		actualX=$(($actualX * $ratio))
+		actualX=$(($actualX * $ratioX))
 	
 		echo ">nothing" > tempfastas/X_${counterX}.fasta
-		(tail -c +"$actualX" "$1" | head -c "$ratio") >> tempfastas/X_${counterX}.fasta
+		(tail -c +"$actualX" "$1" | head -c "$ratioX") >> tempfastas/X_${counterX}.fasta
 		
 	
 		counterX=`expr $counterX + 1`
@@ -75,10 +76,10 @@ for i in $( tail -n +2 $guided ); do
 	if [[ turn -eq 1 ]]; then
 		
 		actualY=`expr $i - 1`
-		actualY=$(($actualY * $ratio))
+		actualY=$(($actualY * $ratioY))
 		
 		echo ">nothing" > tempfastas/Y_${counterY}.fasta	
-		(tail -c +"$actualY" "$2" | head -c "$ratio") >> tempfastas/Y_${counterY}.fasta
+		(tail -c +"$actualY" "$2" | head -c "$ratioY") >> tempfastas/Y_${counterY}.fasta
 	
 		counterY=`expr $counterY + 1`
 	fi
@@ -101,11 +102,11 @@ for i in $( tail -n +2 $guided ); do
 
 
 		mv results/X_${counterXprev}-Y_${counterYprev}.csv all-results
-		rm -rf intermediateResults/ results/
+		rm -rf intermediateFiles results
 		
 	fi
 	
 done
-rm -rf intermediateResults results
+rm -rf intermediateFiles results
 
 

@@ -3,7 +3,7 @@ CXX=g++
 CFLAGS=-O3 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -Wall -DELAPSEDTIME
 BIN=../bin
 
-all: gecko wordsStat hitsStat ramgecko2gecko indexmaker
+all: gecko wordsStat hitsStat ramgecko2gecko indexmaker filterFrags
 
 stats: wordsStat hitsStat
 
@@ -24,7 +24,9 @@ ramgecko2gecko: ramgecko2gecko.c
 indexmaker: indexmaker.c
 	$(CC) $(CFLAGS) dictionaryFunctions.c -lm commonFunctions.c comparisonFunctions.c -lm quicksortWordForward.c quicksortWordReverse.c quicksortHit.c indexmaker.c -lpthread -o $(BIN)/indexmaker
 
+filterFrags: filterFrags.c
+	$(CC) $(CFLAGS) dictionaryFunctions.c -lm commonFunctions.c comparisonFunctions.c -lm quicksortWordForward.c quicksortWordReverse.c quicksortHit.c filterFrags.c -lpthread -o $(BIN)/filterFrags
 
 
 clean:
-	rm -rf $(BIN)/gecko $(BIN)/wordsStat $(BIN)/hitsStat $(BIN)/ramgecko2gecko $(BIN)/indexmaker
+	rm -rf $(BIN)/gecko $(BIN)/wordsStat $(BIN)/hitsStat $(BIN)/ramgecko2gecko $(BIN)/indexmaker $(BIN)/filterFrags

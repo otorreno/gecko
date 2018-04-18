@@ -52,15 +52,15 @@ int main(int ac,char** av){
 	double similarity,likeness;
 				
 	for(i=0;i<nf;i++){
-		similarity=(((double)f[i].score)/((double)f[i].length*4.0));
-		likeness=(((double)f[i].ident)/((double)f[i].length));
+		similarity=100.0 * (((double)f[i].score)/((double)f[i].length*4.0));
+		likeness=100.0 * (((double)f[i].ident)/((double)f[i].length));
 		
 		if(f[i].strand=='r'){
 			f[i].yStart = ytotal - f[i].yStart - 1;
 			f[i].yEnd = ytotal - f[i].yEnd - 1;
 		}
 
-		printf("Frag,%d,%d,%d,%d,%c,%d,%d,%d,%d,%.2f,%.2f,%d,%d\n",(int)f[i].xStart,(int)f[i].yStart,(int)f[i].xEnd,(int)f[i].yEnd,f[i].strand,(int)f[i].block,(int)f[i].length,(int)f[i].score,(int)f[i].ident,similarity,likeness,(int)f[i].seqX,(int)f[i].seqY);
+		printf("Frag,%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%c,%"PRIu64",%"PRIu64",%"PRIu64",%"PRIu64",%.2f,%.2f,%"PRIu64",%"PRIu64"\n",(uint64_t)f[i].xStart,(uint64_t)f[i].yStart,(uint64_t)f[i].xEnd,(uint64_t)f[i].yEnd,f[i].strand,(uint64_t)f[i].block,(uint64_t)f[i].length,(uint64_t)f[i].score,(uint64_t)f[i].ident,similarity,likeness,(uint64_t)f[i].seqX,(uint64_t)f[i].seqY);
 				
 	}
 	

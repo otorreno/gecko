@@ -659,7 +659,7 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     if (hitsInBufForward > 0)
         hBufForward = realloc(hBufForward, hitsInBufForward * sizeof(hit));
     if (hBufForward == NULL){
-	fprintf(stdout, "Attempted to allocate: %"PRIu64"\n", (bufSizeForward + MAXBUF) * sizeof(hit));
+	fprintf(stdout, "Attempted to allocate: %"PRIu64"\n", hitsInBufForward * sizeof(hit));
         perror("Error reallocating forward hits buffer");
 }
 

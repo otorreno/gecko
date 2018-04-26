@@ -629,6 +629,7 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
                         hBufForward = realloc(hBufForward, (bufSizeForward + MAXBUF) * sizeof(hit));
                         if (hBufForward == NULL){
 				fprintf(stdout, "Attempted to allocate: %"PRIu64"\n", (bufSizeForward + MAXBUF) * sizeof(hit));
+				fflush(stdout);
                             perror("Error reallocating forward hits buffer");
 			}
                         bufSizeForward += MAXBUF;
@@ -660,6 +661,7 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
         hBufForward = realloc(hBufForward, hitsInBufForward * sizeof(hit));
     if (hBufForward == NULL){
 	fprintf(stdout, "Attempted to allocate: %"PRIu64"\n", hitsInBufForward * sizeof(hit));
+	fflush(stdout);
         perror("Error reallocating forward hits buffer");
 }
 

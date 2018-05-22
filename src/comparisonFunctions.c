@@ -276,7 +276,7 @@ int differentSequences(hit h1, hit h2) {
     return h1.seqX != h2.seqX || h1.seqY != h2.seqY;
 }
 
-uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
+uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize, hit **hBufNew) {
     if (hitsInBuf == 0 || hBuf == NULL) {
         return 0;
     }
@@ -294,12 +294,12 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
     memcpy(&lastHitNotFiltered, &hBuf[0], sizeof(hit));
     finalNumberOfHits++;
     diagonal = lastHitNotFiltered.posX - lastHitNotFiltered.posY; 
-    while (i < hitsInBuf) {
+    while (i < hitsInBuf-1) {
         if (differentSequences(lastHitNotFiltered, hBuf[i + 1])) {
             lastPosition = hBuf[i+1].posX + (2*wSize-1);
             diagonal = hBuf[i+1].posX - hBuf[i+1].posY;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-	    memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+	        memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
             i++;
             continue;
         }
@@ -307,21 +307,23 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
         if (diagonal != (hBuf[i + 1].posX - hBuf[i + 1].posY) || hBuf[i + 1].posX > lastPosition) {
             lastPosition = hBuf[i+1].posX + (2 * wSize - 1);
             diagonal = hBuf[i+1].posX - hBuf[i+1].posY;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
         }
         i++;
     }
 
     if (diagonal != (hBuf[i].posX - hBuf[i].posY) || hBuf[i].posX > (lastPosition)) {
-        memcpy(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
+        memmove(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
     }
 
     if (finalNumberOfHits == 0) {
         perror("0 Hits. At least one hit should be kept in the filtering");
     }
-    hBuf = realloc(hBuf, finalNumberOfHits * sizeof(hit));
-    if (hBuf == NULL)
+    
+    //hBuf = realloc(hBuf, finalNumberOfHits * sizeof(hit));
+    *hBufNew = realloc(hBuf, finalNumberOfHits * sizeof(hit));
+    if (hBufNew == NULL)
         perror("Error reallocating filtered hits array");
 
     fprintf(stdout,
@@ -336,7 +338,7 @@ uint64_t filterHits(hit *hBuf, uint64_t hitsInBuf, int wSize) {
     //End of filterhits
 }
 
-uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t minSeqXLenSeqYLen) {
+uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t minSeqXLenSeqYLen, hit **hBufNew) {
     if (hitsInBuf == 0 || hBuf == NULL) {
         return 0;
     }
@@ -354,12 +356,12 @@ uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t mi
     memcpy(&lastHitNotFiltered, &hBuf[0], sizeof(hit));
     finalNumberOfHits++;
     diagonal = lastHitNotFiltered.posX - lastHitNotFiltered.posY; 
-    while (i < hitsInBuf) {
+    while (i < hitsInBuf-1) {
         if (differentSequences(lastHitNotFiltered, hBuf[i + 1])) {
             lastPosition = hBuf[i+1].posX + (2*wSize-1);
             diagonal = hBuf[i+1].posX + hBuf[i+1].posY - minSeqXLenSeqYLen;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
             i++;
             continue;
         }
@@ -367,21 +369,22 @@ uint64_t filterHitsReverse(hit *hBuf, uint64_t hitsInBuf, int wSize, uint64_t mi
         if (diagonal != (hBuf[i + 1].posX + hBuf[i + 1].posY - minSeqXLenSeqYLen) || hBuf[i + 1].posX > lastPosition) {
             lastPosition = hBuf[i+1].posX + (2 * wSize - 1);
             diagonal = hBuf[i+1].posX + hBuf[i+1].posY - minSeqXLenSeqYLen;
-	    memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
-            memcpy(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
+	        memcpy(&lastHitNotFiltered, &hBuf[i+1], sizeof(hit));
+            memmove(&hBuf[finalNumberOfHits++], &hBuf[i+1], sizeof(hit));
         }
         i++;
     }
 
     if (diagonal != (hBuf[i].posX + hBuf[i].posY - minSeqXLenSeqYLen) || hBuf[i].posX > (lastPosition)) {
-        memcpy(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
+        memmove(&hBuf[finalNumberOfHits++], &hBuf[i], sizeof(hit));
     }
 
     if (finalNumberOfHits == 0) {
         perror("0 Hits. At least one hit should be kept in the filtering");
     }
-    hBuf = realloc(hBuf, finalNumberOfHits * sizeof(hit));
-    if (hBuf == NULL)
+    //hBuf = realloc(hBuf, finalNumberOfHits * sizeof(hit));
+    *hBufNew = realloc(hBuf, finalNumberOfHits * sizeof(hit));
+    if (hBufNew == NULL)
         perror("Error reallocating filtered hits array");
 
     fprintf(stdout,
@@ -431,8 +434,8 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
         fprintf(stdout, "Filtering Hits 1\n");
         fflush(stdout);
 #endif
-
-        HIB = filterHits(args->hits, args->nHits, args->wSize);
+        args->hits_realloc = (hit **) malloc(sizeof(hit **));
+        HIB = filterHits(args->hits, args->nHits, args->wSize, args->hits_realloc);
 
 #ifdef ELAPSEDTIME
         end = clock();
@@ -454,7 +457,7 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
 
         struct FragFile *fragsBuf = NULL;
         if (HIB > 0) {
-            fragsBuf = frags(args->seqX, args->seqY, args->hits, HIB, args->Lmin, args->SimTh,
+            fragsBuf = frags(args->seqX, args->seqY, *(args->hits_realloc), HIB, args->Lmin, args->SimTh,
                              args->wSize, args->nFrags, args->nHitsUsed, args->seqStatsX, args->seqStatsY, args->e_value);
 #ifdef ELAPSEDTIME
             end = clock();
@@ -468,8 +471,8 @@ void *sortHitsFilterHitsFragHitsTh(void *a) {
         fflush(stdout);
 #endif
 
-        if (args->hits != NULL)
-            free(args->hits);
+        if (*(args->hits_realloc) != NULL)
+            free(*(args->hits_realloc));
         return fragsBuf;
     }
 
@@ -496,8 +499,8 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
         fprintf(stdout, "[SORTHITSREV] Elapsed time: %lf\n", elapsed_secs);
         begin = clock();
 #endif
-
-        HIB = filterHitsReverse(args->hits, args->nHits, args->wSize, args->minSeqLen);
+        args->hits_realloc = (hit **) malloc(sizeof(hit **));
+        HIB = filterHitsReverse(args->hits, args->nHits, args->wSize, args->minSeqLen, args->hits_realloc);
 
 #ifdef ELAPSEDTIME
         end = clock();
@@ -514,7 +517,7 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
 
         struct FragFile *fragsBuf = NULL;
         if (HIB > 0) {
-            fragsBuf = fragsReverse(args->seqX, args->seqY, args->hits, HIB, args->Lmin, args->SimTh,
+            fragsBuf = fragsReverse(args->seqX, args->seqY, *(args->hits_realloc), HIB, args->Lmin, args->SimTh,
                                     args->wSize, args->nFrags, args->nHitsUsed, args->seqStatsX, args->seqStatsY, args->e_value);
 #ifdef ELAPSEDTIME
             end = clock();
@@ -528,8 +531,8 @@ void *sortHitsFilterHitsFragHitsReverseTh(void *a) {
 #endif
 
 
-        if (args->hits != NULL)
-            free(args->hits);
+        if (*(args->hits_realloc) != NULL)
+            free(*(args->hits_realloc));
 
         return fragsBuf;
     }
@@ -551,7 +554,7 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     long offsetWordBefore = 0, offsetWordAfter = 0;
     hit *hBufForward, *hBufReverse;
     uint64_t minSeqXLenSeqYLen = min(seqXLen, seqYLen);
-    FILE *fOut, *fInf;
+    FILE *fOut = NULL, *fInf;
     char infoFileName[1024];
 
 #ifdef ELAPSEDTIME
@@ -803,7 +806,7 @@ struct FragFile *hitsAndFrags(char *seqX, char *seqY, char *out, uint64_t seqXLe
     fflush(stdout);
 #endif
 
-    fclose(fOut);
+    if(fOut != NULL) fclose(fOut);
 
     // metadata info
     sprintf(infoFileName, "%s.INF", out);

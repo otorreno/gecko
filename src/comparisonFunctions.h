@@ -7,6 +7,7 @@ typedef struct {
     char *seqX;
     char *seqY;
     hit *hits;
+    hit **hits_realloc;
     uint64_t nHits;
     uint64_t *nHitsUsed;
     uint64_t Lmin;

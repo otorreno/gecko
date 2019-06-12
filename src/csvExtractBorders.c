@@ -227,7 +227,7 @@ int main(int ac, char** av) {
 	FILE* fFrags;
 	struct FragFile frag;
 
-	fprintf(stdout, "[WARNING] - Remember that if using a CSV make sure that the reverse y coordinates are transformed\n");
+	//fprintf(stdout, "[WARNING] - Remember that if using a CSV make sure that the reverse y coordinates are transformed\n");
 
 	if (ac != 10)
 		terror("USE: ./frags2text fragsFILE.csv fastaX fastaY fastaYrev indexX indexY indexYrev fragsFILE.txt borderSize");
@@ -347,6 +347,9 @@ int main(int ac, char** av) {
 		}else{
 			uint64_t seqYnew;
 			seqYnew = (nReads_Y - frag.seqY) - 1;
+
+			frag.yStart = ylen - frag.yStart - 1;
+			frag.yEnd = ylen - frag.yEnd - 1;
 
 			int64_t leftx = MAX(0, (int64_t)frag.xStart - (int64_t)border_size);
             int64_t rightx = MIN(xlen, (int64_t)frag.xEnd + (int64_t)border_size);

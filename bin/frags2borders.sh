@@ -1,9 +1,9 @@
 #!/bin/bash
 
-if [ $# != 4 ]; then
+if [ $# != 5 ]; then
    echo " ==== ERROR ... you called this script inappropriately."
    echo ""
-   echo "   usage:  $0 fragsFILE.frags/.csv fastaX fastaY alignments.txt"
+   echo "   usage:  $0 fragsFILE.csv fastaX fastaY alignments.txt borderSize"
    echo ""
    exit -1
 fi
@@ -12,6 +12,7 @@ FRAGS=$1
 FASTAX=$2
 FASTAY=$3
 ALIGN=$4
+BORDER=$5
 
 
 
@@ -27,20 +28,11 @@ $BINDIR/indexmaker $FASTAY.rev $FASTAY.rev.idx
 
 # extract frags
 
-if [ ${FRAGS: -4} == ".csv" ]
-then
+sed 's/,/ /g' $FRAGS > $FRAGS.fix
 
-	echo "....using csv"
-	sed 's/,/ /g' $FRAGS > $FRAGS.fix
-	$BINDIR/csvFrags2text $FRAGS.fix $FASTAX $FASTAY $FASTAY.rev $FASTAX.idx $FASTAY.idx $FASTAY.rev.idx $ALIGN
-	rm $FRAGS.fix
+$BINDIR/csvExtractBorders $FRAGS.fix $FASTAX $FASTAY $FASTAY.rev $FASTAX.idx $FASTAY.idx $FASTAY.rev.idx $ALIGN $BORDER
 
-else
-	echo "....using frags"
-	$BINDIR/frags2text $FRAGS $FASTAX $FASTAY $FASTAY.rev $FASTAX.idx $FASTAY.idx $FASTAY.rev.idx $ALIGN
-fi
-
-
+rm $FRAGS.fix
 rm $FASTAX.idx
 rm $FASTAY.idx
 rm $FASTAY.rev

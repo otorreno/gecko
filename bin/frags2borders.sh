@@ -38,7 +38,9 @@ $BINDIR/csvExtractBorders $FRAGS.fix $FASTAX $FASTAY $FASTAY.rev $FASTAX.idx $FA
 if [[ $ONLYQUERYSEQ = "query" ]]
 then
 
-	grep '>\|X:' $ALIGN | awk '{ if (substr($0,1,2) ~ "X:" ) print substr($0,8); else print $0; }' > query.fasta
+	grep '>\|X:' $ALIGN | awk 'BEGIN{n=0;} {if (substr($0,1,2) ~ "X:" ) { print substr($0,8);} else { printf(">S%d-%s\n", n, $0); n = n + 1; }}' > query.fasta
+	sed 's/>/#/g' query.fasta | sed 's/^#/>/' > query-$BORDER.fasta
+	rm query.fasta
 
 fi
 

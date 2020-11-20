@@ -5,7 +5,7 @@ FL=1000   # frequency limit
 if [ $# != 6 ]; then
    echo " ==== ERROR ... you called this script inappropriately."
    echo ""
-   echo "   usage:  $0 seqXName seqYName lenght similarity WL fixedL"
+   echo "   usage:  $0 seqXName seqYName length similarity WL fixedL"
    echo ""
    exit -1
 fi

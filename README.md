@@ -83,5 +83,10 @@ Use `./gecko/bin/frags2align.sh fragsFILE.frags query reference output_alignment
 
 You can find a guided exercise [here](http://chirimoyo.ac.uma.es/gecko/documents/GuidedExercise-fromGENOMES2Visualization-reduced-v0.2.pdf) and the supplementary material [here](http://chirimoyo.ac.uma.es/gecko/documents/HSPWorkflow-SuppMat-submittedv2.pdf).
 
+## Cite
 
+If you use GECKO, please cite:
 
+Torreno, Oscar, and Oswaldo Trelles. "Breaking the computational barriers of pairwise genome comparison." BMC bioinformatics 16, no. 1 (2015): 250.
+
+[Link to manuscript] (https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-015-0679-9)

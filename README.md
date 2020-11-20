@@ -89,4 +89,4 @@ If you use GECKO, please cite:
 
 Torreno, Oscar, and Oswaldo Trelles. "Breaking the computational barriers of pairwise genome comparison." BMC bioinformatics 16, no. 1 (2015): 250.
 
-[Link to manuscript] (https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-015-0679-9)
+[Link to manuscript](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-015-0679-9)

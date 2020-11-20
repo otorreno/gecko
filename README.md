@@ -49,7 +49,7 @@ current_directory --|
 
 - The "dictionaries" folder contains files that are used in case GECKO is run again with the same sequences, either as query or reference. 
 - The "hits" folder contains the files regarding seed matches between query and reference. This folder can be heavyweight and the recommendation is to remove it after usage.- The "results" folder contains the files that represent the comparison output. In particular:
- - query-reference.csv: A CSV file that includes metadata about the sequence compared and each HSP detected. See section "Interpreting the CSV" below for more information. This file can be used to visualize the comparison in the interactive sequence visualizer GECKO-MGV (use online [here](pistacho.ac.uma.es) or download and install [here](https://github.com/estebanpw/docker-geckomgv)). 
+ - query-reference.csv: A CSV file that includes metadata about the sequence compared and each HSP detected. See section "Interpreting the CSV" below for more information. This file can be used to visualize the comparison in the interactive sequence visualizer GECKO-MGV (use online [here](https://pistacho.ac.uma.es/) or download and install [here](https://github.com/estebanpw/docker-geckomgv)). 
  - query-reference.frags: The same information contained in the CSV but without metadata and in binary format. This file is used for further processing (e.g. extracting the alignments). This file is made up from the `FragFile` structure found in the `structs.h` file in the `src` folder.
 
 ## Interpreting the CSV

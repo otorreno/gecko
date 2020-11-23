@@ -6,7 +6,7 @@ GECKO (GEnome Comparison with K-mers Out-of-core) is a fast, modular application
 
 ## Requirements
 
-GCC compiler. Please make sure that on your linux CC resolves to GCC, otherwise it might not work.
+GCC compiler. Please make sure that on your linux cc or gcc is available (try `which cc` or `which gcc`) otherwise it might not work.
 
 Simply download the .zip and unzip it, or clone the repository.
 Then issue the following command:

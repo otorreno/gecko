@@ -1,5 +1,6 @@
-CC=gcc
-CXX=g++
+#CC=gcc
+#CXX=g++
+CC?=gcc
 CFLAGS=-O3 -D_FILE_OFFSET_BITS=64 -Wall
 BIN=../bin
 

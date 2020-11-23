@@ -7,7 +7,7 @@ if [ $# != 6 ]; then
    echo ""
    echo "   usage:  $0 seqXName seqYName length similarity WL fixedL"
    echo ""
-   exit -1
+   exit 0
 fi
 
 {

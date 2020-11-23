@@ -2,12 +2,31 @@
 
 FL=1000   # frequency limit
 
+if [ $1 == "--help" ]; then
+   echo " ==== GECKO HELP ..."
+   echo ""
+   echo "   To run gecko, use:"
+   echo "   ./gecko/bin/workflow.sh query reference length similarity wordLength 1"
+   echo ""
+   echo "   Query sequence: The sequence that will be compared against the reference. Use only FASTA format.
+    Reference sequence: The reference sequence where to look for matches from the query. Note that the reverse strand is computed for the reference and also matched. Use only FASTA format."
+   echo "   Length: This parameter is the minimum length in nucleotides for an HSP (similarity fragment) to be conserved. Any HSP below this length will be filtered out of the comparison. It is recommended to use around 40 bp for small organisms (e.g. bacterial mycoplasma or E. Coli) and around 100 bp or more for larger organisms (e.g. human chromosomes)."
+   echo "   Similarity: This parameter is analogous to the minimum length, however, instead of length, the similarity is used as threshold. The similarity is calculated as the score attained by an HSP divided by the maximum possible score. Use values above 50-60 to filter noise."
+   echo "   Word length: This parameter is the seed size used to find HSPs. A smaller seed size will increase sensitivity and decrease performance, whereas a larger seed size will decrease sensitivity and increase performance. Recommended values are 12 or 16 for smaller organisms (bacteria) and 32 for larger organisms (chromosomes). These values must be multiples of 4."
+   echo ""
+   echo " ===="
+
+   exit 0
+
+fi
+
+
 if [ $# != 6 ]; then
    echo " ==== ERROR ... you called this script inappropriately."
    echo ""
    echo "   usage:  $0 seqXName seqYName length similarity WL fixedL"
    echo ""
-   exit 0
+   exit -1
 fi
 
 {

@@ -29,7 +29,7 @@ if [ $# != 6 ]; then
    exit -1
 fi
 
-{
+#{
 
 dirNameX=$(readlink -f $1 | xargs dirname)
 seqXName=$(basename "$1")
@@ -52,12 +52,12 @@ WL=${5} # wordSize
 fixedL=${6}
 strand=${7}
 
-mkdir intermediateFiles
+mkdir intermediateFiles 2> /dev/null
 
-mkdir intermediateFiles/${seqXName}-${seqYName}
-mkdir results
-mkdir intermediateFiles/dictionaries
-mkdir intermediateFiles/hits
+mkdir intermediateFiles/${seqXName}-${seqYName} 2> /dev/null
+mkdir results 2> /dev/null
+mkdir intermediateFiles/dictionaries 2> /dev/null
+mkdir intermediateFiles/hits 2> /dev/null
 
 # Copiamos los fastas
 ln -s ${dirNameX}/${seqXName}.${extensionX} intermediateFiles/${seqXName}-${seqYName}
@@ -103,14 +103,14 @@ mv ${seqYName}-revercomp.d2hP ../dictionaries/
 mv ${seqYName}-revercomp.d2hW ../dictionaries/
 		
 # Hacemos enlace simbolico
-ln -s ../dictionaries/${seqXName}.d2hP .
-ln -s ../dictionaries/${seqXName}.d2hW .
+ln -s ../dictionaries/${seqXName}.d2hP . 2> /dev/null
+ln -s ../dictionaries/${seqXName}.d2hW . 2> /dev/null
 
-ln -s ../dictionaries/${seqYName}.d2hP .
-ln -s ../dictionaries/${seqYName}.d2hW .
+ln -s ../dictionaries/${seqYName}.d2hP . 2> /dev/null
+ln -s ../dictionaries/${seqYName}.d2hW . 2> /dev/null
 
-ln -s ../dictionaries/${seqYName}-revercomp.d2hP .
-ln -s ../dictionaries/${seqYName}-revercomp.d2hW .
+ln -s ../dictionaries/${seqYName}-revercomp.d2hP . 2> /dev/null
+ln -s ../dictionaries/${seqYName}-revercomp.d2hW . 2> /dev/null
 
 echo "${BINDIR}/comparison.sh ${seqXName}.${extensionX} ${seqYName}.${extensionY} ${length} ${similarity} ${WL} ${fixedL} f &"
 ${BINDIR}/comparison.sh ${seqXName}.${extensionX} ${seqYName}.${extensionY} ${length} ${similarity} ${WL} ${fixedL} f &

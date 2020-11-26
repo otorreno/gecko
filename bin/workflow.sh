@@ -167,4 +167,4 @@ mv ${seqXName}-${seqYName}.csv ../../results
 cd ..
 #rm -rf ${seqXName}-${seqYName}
 
-} &> /dev/null
+#} &> /dev/null

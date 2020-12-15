@@ -48,7 +48,7 @@ void write_headers(FILE * f1, FILE * f2, FILE * fO, uint64_t pos1, uint64_t pos2
 	fprintf(fO, " LENGTH: %"PRIu64" IDENT: %"PRIu64" STRAND: %c @(%"PRIu64", %"PRIu64")\n", f->length, f->ident, f->strand, f->xStart, f->yStart);
 }
 
-void get_both_seqs(char * fastaX, char * fastaY, uint64_t iniX, uint64_t finX, uint64_t iniY, uint64_t finY, uint64_t posX, uint64_t posY, uint64_t LacX, uint64_t LacY, uint64_t lX, uint64_t lY, FILE * fO){
+void get_both_seqs(char * fastaX, char * fastaY, uint64_t iniX, uint64_t finX, uint64_t iniY, uint64_t finY, uint64_t posX, uint64_t posY, uint64_t LacX, uint64_t LacY, uint64_t lX, uint64_t lY, FILE * fO, uint64_t seq_x_len, uint64_t seq_y_len, uint64_t file_x_len, uint64_t file_y_len){
 	char copyX[TAB_INSERT+1];
 	char copyY[TAB_INSERT+1];
 	memset(copyX, 0x0, TAB_INSERT+1);
@@ -58,27 +58,37 @@ void get_both_seqs(char * fastaX, char * fastaY, uint64_t iniX, uint64_t finX, u
 	uint64_t i;
 
 	uint64_t pos_used_x, pos_used_y;
+
+	printf("%"PRIu64", %"PRIu64", %"PRIu64", %"PRIu64" max ostro: %"PRIu64", %"PRIu64"\n", iniX, finX, iniY, finY, lX, lY);
 	
 	// The X one
-	//fseek(fastaX, posX, SEEK_SET);
 	pos_used_x = posX;
 	char cX = fastaX[pos_used_x++];
-	while(cX != '\n'){ cX = fastaX[pos_used_x++]; }
+	while(cX != '\n'){ 
+		if(pos_used_x == file_x_len){ terror("Could not find DNA sequence (X)"); } 
+		cX = fastaX[pos_used_x++]; 
+	}
 	uint64_t gpX = iniX - LacX;
 	uint64_t currX = 0, tab_counter;
 	while(currX < gpX){
+		if(pos_used_x == file_x_len){ terror("Reached end of fasta (X)"); }
+		if(currX      == seq_x_len){ terror("Reached end of sequence (X)"); }
 		cX = fastaX[pos_used_x++];
 		if(cX != '\n') ++currX;
 	}
 
 	// the other Y
-	//fseek(fastaY, posY, SEEK_SET);
 	pos_used_y = posY;
 	char cY = fastaY[pos_used_y++];
-	while(cY != '\n'){ cY = fastaY[pos_used_y++]; }
+	while(cY != '\n'){ 
+		if(pos_used_y == file_y_len){ terror("Could not find DNA sequence (Y)"); }
+		cY = fastaY[pos_used_y++]; 
+	}
 	uint64_t gpY = iniY - LacY;
 	uint64_t currY = 0;
 	while(currY < gpY){
+		if(pos_used_y == file_y_len){ terror("Reached end of fasta (Y)"); }
+		if(currY      == seq_y_len){ terror("Reached end of sequence (Y)"); }
 		cY = fastaY[pos_used_y++];
 		if(cY != '\n') ++currY;
 	}
@@ -89,33 +99,34 @@ void get_both_seqs(char * fastaX, char * fastaY, uint64_t iniX, uint64_t finX, u
 	// Reached the region to show
 	currX = 0;
 	currY = 0;
+	uint64_t prev_currX = 0, prev_currY = 0;
 	cX = fastaX[pos_used_x++];
 	cY = fastaY[pos_used_y++];
-	//fprintf(fO, "\t");
 	tab_counter = 0;
-	while(currX < lX && currY < lY){
+	while(currX < lX && currY < lY && pos_used_x < file_x_len && pos_used_y < file_y_len){
 		
 		if(cX == 'A' || cX == 'C' || cX == 'G' || cX == 'T' || cX == 'N'){ copyX[atcopyX++] = cX; ++currX; }
-		cX = fastaX[pos_used_x++];
-		while(cX != 'A' && cX != 'C' && cX != 'G' && cX != 'T' && cX != 'N') cX = fastaX[pos_used_x++];
+		if(pos_used_x < file_x_len) cX = fastaX[pos_used_x++];
+		while(pos_used_x < file_x_len && cX != 'A' && cX != 'C' && cX != 'G' && cX != 'T' && cX != 'N') cX = fastaX[pos_used_x++];
 
 
 		if(cY == 'A' || cY == 'C' || cY == 'G' || cY == 'T' || cY == 'N'){ copyY[atcopyY++] = cY; ++currY; }
-		cY = fastaY[pos_used_y++];
-		while(cY != 'A' && cY != 'C' && cY != 'G' && cY != 'T' && cY != 'N') cY = fastaY[pos_used_y++];
+		if(pos_used_y < file_y_len) cY = fastaY[pos_used_y++];
+		while(pos_used_y < file_y_len && cY != 'A' && cY != 'C' && cY != 'G' && cY != 'T' && cY != 'N') cY = fastaY[pos_used_y++];
+
 
 		while(currX > currY){
 			if(cY == 'A' || cY == 'C' || cY == 'G' || cY == 'T' || cY == 'N'){ copyY[atcopyY++] = cY; ++currY; }
-			cY = fastaY[pos_used_y++];
-			while(cY != 'A' && cY != 'C' && cY != 'G' && cY != 'T' && cY != 'N') cY = fastaY[pos_used_y++];
+			if(pos_used_y < file_y_len) cY = fastaY[pos_used_y++];
+			while(pos_used_y < file_y_len && cY != 'A' && cY != 'C' && cY != 'G' && cY != 'T' && cY != 'N') cY = fastaY[pos_used_y++];
 		}
 		while(currX < currY){
 			if(cX == 'A' || cX == 'C' || cX == 'G' || cX == 'T' || cX == 'N'){ copyX[atcopyX++] = cX; ++currX; }
-			cX = fastaX[pos_used_x++];
-			while(cX != 'A' && cX != 'C' && cX != 'G' && cX != 'T' && cX != 'N') cX = fastaX[pos_used_x++];
+			if(pos_used_x < file_x_len) cX = fastaX[pos_used_x++];
+			while(pos_used_x < file_x_len && cX != 'A' && cX != 'C' && cX != 'G' && cX != 'T' && cX != 'N') cX = fastaX[pos_used_x++];
 		}
 
-		++tab_counter;
+		if(prev_currX < currX && prev_currY < currY) ++tab_counter;
 		
 
 
@@ -282,12 +293,12 @@ int main(int ac, char** av) {
 
 
 		if(frag.strand == 'f'){
-			get_both_seqs(strfastaX, strfastaY, frag.xStart, frag.xEnd, frag.yStart, frag.yEnd, RI_X[frag.seqX].pos, RI_Y[frag.seqY].pos, RI_X[frag.seqX].Lac, RI_Y[frag.seqY].Lac, frag.length, frag.length, fO);
+			get_both_seqs(strfastaX, strfastaY, frag.xStart, frag.xEnd, frag.yStart, frag.yEnd, RI_X[frag.seqX].pos, RI_Y[frag.seqY].pos, RI_X[frag.seqX].Lac, RI_Y[frag.seqY].Lac, frag.length, frag.length, fO, n1, n2, aprox_lenX, aprox_lenY);
 			//get_seq_from_to(fY, fO, frag.yStart, frag.yEnd, RI_Y[frag.seqY].pos, RI_Y[frag.seqY].Lac, frag.seqY, frag.length, fO);
 		}else{
 			uint64_t seqYnew;
 			seqYnew = nReads_Y - frag.seqY - 1;
-			get_both_seqs(strfastaX, strfastaYrev, frag.xStart, frag.xEnd, frag.yStart, frag.yEnd, RI_X[frag.seqX].pos, RI_Yrev[seqYnew].pos, RI_X[frag.seqX].Lac, RI_Yrev[seqYnew].Lac, frag.length, frag.length, fO);
+			get_both_seqs(strfastaX, strfastaYrev, frag.xStart, frag.xEnd, frag.yStart, frag.yEnd, RI_X[frag.seqX].pos, RI_Yrev[seqYnew].pos, RI_X[frag.seqX].Lac, RI_Yrev[seqYnew].Lac, frag.length, frag.length, fO, n1, n2, aprox_lenX, aprox_lenYrev);
 			//get_seq_from_to_rev(fYrev, fO, frag.yStart, frag.yEnd, RI_Yrev[seqYnew].pos, RI_Yrev[seqYnew].Lac, seqYnew, frag.length, fO);
 		}
 

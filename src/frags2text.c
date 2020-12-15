@@ -59,7 +59,6 @@ void get_both_seqs(char * fastaX, char * fastaY, uint64_t iniX, uint64_t finX, u
 
 	uint64_t pos_used_x, pos_used_y;
 
-	printf("%"PRIu64", %"PRIu64", %"PRIu64", %"PRIu64" max ostro: %"PRIu64", %"PRIu64"\n", iniX, finX, iniY, finY, lX, lY);
 	
 	// The X one
 	pos_used_x = posX;

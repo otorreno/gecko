@@ -64,4 +64,10 @@ void writeSequenceLength(uint64_t *length, FILE *f);
  */
 long int sizeofFragment();
 
+/************New functions: CHARO************/
+
+/*This function writes the HSP cointained in frag to the file without little/big endian conversion*/
+void writeFragmentRaw(struct FragFile* frag, FILE *f);
+
+/********************************************/
 #endif /* COMPARISON_FUNCTIONS_H */

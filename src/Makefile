@@ -63,6 +63,9 @@ csvFrags2text:
 csvExtractBorders:
 	$(CC) $(CFLAGS) csvExtractBorders.c fragmentv2.c commonFunctions.c comparisonFunctions.c -lm -o $(BIN)/csvExtractBorders
 
+testFunctionsCharo:
+	$(CC) $(CFLAGS) testFunctionsCharo.c fragmentv2.c commonFunctions.c comparisonFunctions.c -lm -o $(BIN)/testFunctionsCharo
+
 clean:
 	rm -rf $(BIN)/getInfo
 	rm -rf $(BIN)/filterFrags

@@ -428,3 +428,43 @@ struct FragFile* readFragments(char* s,int* nf,uint64_t *xtotal,uint64_t *ytotal
 }
 /************************/
 
+
+
+/************New functions: CHARO************/
+
+/*This function writes the HSP cointained in frag to the file without little/big endian conversion*/
+void writeFragmentRaw(struct FragFile* frag, FILE *f) {
+	fwrite(&frag->diag, sizeof(int64_t), 1, f);
+	fwrite(&frag->xStart, sizeof(uint64_t), 1, f);
+	fwrite(&frag->yStart, sizeof(uint64_t), 1, f);
+	fwrite(&frag->xEnd, sizeof(uint64_t), 1, f);
+	fwrite(&frag->yEnd, sizeof(uint64_t), 1, f);
+	fwrite(&frag->length, sizeof(uint64_t), 1, f);
+	fwrite(&frag->ident, sizeof(uint64_t), 1, f);
+	fwrite(&frag->score, sizeof(uint64_t), 1, f);
+	fwrite(&frag->similarity, sizeof(float), 1, f);
+	fwrite(&frag->seqX, sizeof(uint64_t), 1, f);
+	fwrite(&frag->seqY, sizeof(uint64_t), 1, f);
+	fwrite(&frag->block, sizeof(int64_t), 1, f);
+	fputc(frag->strand, f);
+
+	
+}
+
+/*This function reads an HSP from file and  stores it into frag without little/big endian conversion*/
+void readFragmentRaw(struct FragFile* frag, FILE *f){
+
+}
+
+/*This function reads 8 bytes from file and saves it to variable length*/
+void readSequenceLengthRaw (uint64_t* length, FILE* f){
+
+}
+
+/*This function writes the 8 bytes where the length variable points to, to file*/
+void writeSequenceLengthRaw(uint64_t* length, FILE* f){
+
+}
+
+/******************************************/
+

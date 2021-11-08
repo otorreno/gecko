@@ -13,13 +13,13 @@
 int main(int ac,char** av){
 	
 	// Read fragments
-	struct FragFile* f;
+	struct FragFile *f;
 	int nf; // Number of fragments
 	uint64_t xtotal,ytotal;
 	nf = 0;
     FILE *fichero;
 	f = readFragmentsv2(av[1],&nf,&xtotal,&ytotal);
     fichero = fopen("ficheroCharo.txt", "rb");
-    writeFragmentRaw(f, fichero);
+	writeFragmentRaw(&f[0], fichero);
 	return 0;
 }

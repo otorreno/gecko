@@ -74,8 +74,8 @@ struct FragFile* readFragmentsv2(char* s,int* nf,uint64_t *xtotal,uint64_t *ytot
 //	fread(xtotal,sizeof( uint64_t),1,fe);
 //	fread(ytotal,sizeof( uint64_t),1,fe);
 
-	readSequenceLength(xtotal, fe);
-	readSequenceLength(ytotal, fe);
+	readSequenceLengthRaw(xtotal, fe);
+	readSequenceLengthraw(ytotal, fe);
 
 	long int longFile;
 	fseek(fe,0,SEEK_END);
@@ -99,13 +99,13 @@ struct FragFile* readFragmentsv2(char* s,int* nf,uint64_t *xtotal,uint64_t *ytot
 //	fread(ytotal,sizeof( uint64_t),1,fe);
 
 
-	readSequenceLength(xtotal, fe);
-	readSequenceLength(ytotal, fe);
+	readSequenceLengthRaw(xtotal, fe);
+	readSequenceLengthRaw(ytotal, fe);
 	
 
 //	while(!feof(fe)){
 	for(n=0;n<*nf;n++){
-		readFragment(&fs[n], fe);
+		readFragmentRaw(&fs[n], fe);
 		//fprintf(stdout,"d=%" PRId64 "\tx=%" PRIu64 "\ty=%" PRIu64 "\tL=%" PRIu64 "\tsco=%" PRIu64 "\tseqX=%" PRIu64 "\tseqY=%" PRIu64 "\tSIM=%f" "\tstrand=%c\n",fs[n].diag, fs[n].xStart, fs[n].yStart, fs[n].length, fs[n].score, fs[n].seqX, fs[n].seqY,fs[n].similarity, fs[n].strand);
 //		fprintf(stdout,"%" PRId64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%c" "\t%" PRIu64 "\n",fs[n].xStart, fs[n].yStart, fs[n].xEnd, fs[n].yEnd, fs[n].length, fs[n].strand, fs[n].ident);
 		

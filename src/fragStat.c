@@ -69,12 +69,12 @@ int main(int ac, char** av) {
 	if ((fFrags = fopen(av[1], "rb")) == NULL)
 		terror("Opening Frags binary file");
 
-	readSequenceLength(&n1, fFrags);
-	readSequenceLength(&n2, fFrags);
+	readSequenceLengthRaw(&n1, fFrags);
+	readSequenceLengthRaw(&n2, fFrags);
 	fprintf(stderr, "working with fragsFile=%s SeqX=%" PRIu64 " seqY=%" PRIu64 "\n", av[1], n1,
 			n2);
 
-	readFragment(&frag, fFrags);
+	readFragmentRaw(&frag, fFrags);
 	while (!feof(fFrags)) {
 		length = frag.length;
 		if (length >= MAXLENGTH)
@@ -96,7 +96,7 @@ int main(int ac, char** av) {
 		}
 		fprintf(stdout, "\n");
 		nFrags++;
-		readFragment(&frag, fFrags);
+		readFragmentRaw(&frag, fFrags);
 	}
 	fprintf(stdout, "nFrags:%" PRIu64 "\n", nFrags);
 

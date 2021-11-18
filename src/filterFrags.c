@@ -36,8 +36,8 @@ int main(int ac,char** av){
 	FILE * fFrags = fopen(av[1], "rb");
 	if(fFrags == NULL){ fprintf(stderr, "Could not open input file\n"); exit(-1); }
 
-	readSequenceLength(&xtotal, fFrags);
-	readSequenceLength(&ytotal, fFrags);
+	readSequenceLengthRaw(&xtotal, fFrags);
+	readSequenceLengthRaw(&ytotal, fFrags);
 	
 
 	
@@ -71,7 +71,7 @@ int main(int ac,char** av){
 	double similarity,likeness;
 				
 	while(!feof(fFrags)){
-		readFragment(&frag, fFrags);
+		readFragmentRaw(&frag, fFrags);
 
 		similarity=100.0*(((double)frag.score)/((double)frag.length*4.0));
 		likeness=(((double)frag.ident)/((double)frag.length));

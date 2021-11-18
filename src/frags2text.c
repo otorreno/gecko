@@ -263,11 +263,11 @@ int main(int ac, char** av) {
 	if(fO == NULL) terror("Could not open output alignments file");
 
 
-	readSequenceLength(&n1, fFrags);
-	readSequenceLength(&n2, fFrags);
+	readSequenceLengthRaw(&n1, fFrags);
+	readSequenceLengthRaw(&n2, fFrags);
 	
 
-	readFragment(&frag, fFrags);
+	readFragmentRaw(&frag, fFrags);
 
 	// RI_X 	is the forward index for fasta file X
 	// RI_Y 	is the forward index for fasta file Y

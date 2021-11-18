@@ -100,8 +100,8 @@ int HitsControl(char **av) {
 		terror("opening output file");
 
 	//Write sequence lengths
-	writeSequenceLength(&n0, fOut);
-	writeSequenceLength(&n1, fOut);
+	writeSequenceLengthRaw(&n0, fOut);
+	writeSequenceLengthRaw(&n1, fOut);
 
 	// read Hits
 	if(fread(&h, sizeof(hit), 1, fH)!=1){
@@ -131,7 +131,7 @@ int HitsControl(char **av) {
 		newFrag = FragFromHit(coverage, &myF, &h, sX, n0, sY, n1, nSeqs1, Lmin, SimTh,
 				WL, fixedL, strand);
 		if (newFrag) {
-			writeFragment(&myF, fOut);
+			writeFragmentRaw(&myF, fOut);
 			lastOffset = h.posX + myF.length;
 			nFrags++;
 		}

@@ -57,18 +57,18 @@ int main(int ac, char** av) {
 		terror("OUTput file open error");
 
 	// sequences lengths
-	readSequenceLength(&n1, fIn);
-	readSequenceLength(&n2, fIn);
+	readSequenceLengthRaw(&n1, fIn);
+	readSequenceLengthRaw(&n2, fIn);
 
-	writeSequenceLength(&n1, fOut);
-	writeSequenceLength(&n2, fOut);
+	writeSequenceLengthRaw(&n1, fOut);
+	writeSequenceLengthRaw(&n2, fOut);
 
 	//First file...
-	readFragment(&frag, fIn);
+	readFragmentRaw(&frag, fIn);
 
 	while (!feof(fIn)) {
-		writeFragment(&frag, fOut);
-		readFragment(&frag, fIn);
+		writeFragmentRaw(&frag, fOut);
+		readFragmentRaw(&frag, fIn);
 	}
 
 	fclose(fIn);
@@ -94,15 +94,15 @@ int main(int ac, char** av) {
 
 	fclose(fMat);
 
-	readSequenceLength(&n1, fIn);
-	readSequenceLength(&n2, fIn);
+	readSequenceLengthRaw(&n1, fIn);
+	readSequenceLengthRaw(&n2, fIn);
 
 	//Second file...
-	readFragment(&frag, fIn);
+	readFragmentRaw(&frag, fIn);
 
 	while (!feof(fIn)) {
-		writeFragment(&frag, fOut);
-		readFragment(&frag, fIn);
+		writeFragmentRaw(&frag, fOut);
+		readFragmentRaw(&frag, fIn);
 	}
 
 	//MAT

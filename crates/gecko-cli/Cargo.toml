@@ -1,0 +1,23 @@
+[package]
+name = "gecko-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CLI for GECKO pairwise genome comparison"
+
+[[bin]]
+name = "gecko"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+gecko-core = { path = "../gecko-core" }
+rayon = "1"
+serde_json = "1"
+
+[dev-dependencies]
+flate2 = "1"
+tempfile = "3"

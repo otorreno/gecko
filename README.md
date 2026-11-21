@@ -1,104 +1,89 @@
-# GECKO
+# GECKO (v2 — Rust)
 
-A pairwise genome comparison software for the detection of High-scoring Segment Pairs.
+A fast, memory-safe pairwise genome comparison tool for the detection of ungapped High-scoring Segment Pairs (HSPs).
 
-GECKO (GEnome Comparison with K-mers Out-of-core) is a fast, modular application designed to identify collections of High-scoring Segment Pairs in a pairwise genome comparisons. By employing novel filtering and data storing strategies, it is able to compare chromosome-sized sequences in less time.
+GECKO (*GEnome Comparison with K-mers Out-of-core*) identifies collections of HSPs across single- and multi-FASTA genomes, from bacterial assemblies to chromosome-scale sequences. This v2 release modernizes GECKO into a single Rust binary while preserving full drop-in compatibility with GECKO-MGV (`.frags`, `.csv`, `.INF`, `.MAT`) and adding modern bioinformatics formats (**PAF**, **BLAST tabular**, **BEDPE**, **JSONL**) and transparent `.gz` FASTA support.
 
-## Requirements
+## Highlights vs. Legacy GECKO (v1)
 
-GCC compiler. Please make sure that on your linux cc or gcc is available (try `which cc` or `which gcc`) otherwise it might not work.
+- **Single unified binary (`gecko`)** replacing 19 separate C binaries and 6 Bash scripts.
+- **Orders-of-magnitude less disk I/O**: adaptive in-memory parallel radix sort + streaming out-of-core spill-on-demand (`--memory`) eliminates writing hundreds of gigabytes of uncompressed temporary hit files for typical comparisons.
+- **Any seed word length `4..=32`**: no longer restricted to multiples of 4.
+- **Compressed FASTA input**: reads `.fa`, `.fasta`, `.fna`, and `.gz` seamlessly.
+- **Drop-in + modern formats**: outputs GECKO-MGV `.frags` (exact 93-byte big-endian format), `.csv`, `.frags.INF`, `.frags.MAT`, plus **PAF**, **BLAST tabular (`outfmt 6`)**, **BEDPE**, and **JSONL**.
+- **Fixes legacy bugs**: resolves the `readFragmentsv2` 104B/93B truncation bug (~10.6% dropped CSV fragments), `coverage[..][100]` OOB write on 100%-identical HSPs, `loadWordOcurrences` `realloc` UB, `reverseComplement` 2 GB fixed allocation / 8 MB stack array, `filterFrags` 100× similarity scale bug, and `workflow.sh` extension mismatch.
 
-Simply download the .zip and unzip it, or clone the repository.
-Then issue the following command:
+## Installation
 
-```cd gecko/src && make all```
+### From Source (Rust 1.88+)
 
-If the installation finished without errors, you are ready to go!
-
-## Use
-
-You can run GECKO directly by issuing:
-
-```./gecko/bin/workflow.sh query reference length similarity wordLength 1```
-
-Please note the ending "1". This is used for internal developing. Do not change unless actively knowing why.
-
-## Parameters
-
-- Query sequence: The sequence that will be compared against the reference. Use only FASTA format.
-- Reference sequence: The reference sequence where to look for matches from the query. Note that the reverse strand is computed for the reference and also matched. Use only FASTA format.
-- Length: This parameter is the minimum length in nucleotides for an HSP (similarity fragment) to be conserved. Any HSP below this length will be filtered out of the comparison. It is recommended to use around 40 bp for small organisms (e.g. bacterial mycoplasma or E. Coli) and around 100 bp or more for larger organisms (e.g. human chromosomes).
-- Similarity: This parameter is analogous to the minimum length, however, instead of length, the similarity is used as threshold. The similarity is calculated as the score attained by an HSP divided by the maximum possible score. Use values above 50-60 to filter noise.
-- Word length: This parameter is the seed size used to find HSPs. A smaller seed size will increase sensitivity and decrease performance, whereas a larger seed size will decrease sensitivity and increase performance. Recommended values are 12 or 16 for smaller organisms (bacteria) and 32 for larger organisms (chromosomes). These values must be multiples of 4.
-
-## Output
-
-Each time GECKO is executed, a folder structure is created containing both intermediate files and results, see below:
-
-```
-current_directory --|
-                    + intermediateFiles --|
-                                          + dictionaries [...]
-                                          + hits         [...]
-
-                    + results ------------|
-                                          + query-reference.csv
-                                          + query-reference.frags
-
+```bash
+cargo build --release --bin gecko
+# Binary available at ./target/release/gecko
 ```
 
-- The "dictionaries" folder contains files that are used in case GECKO is run again with the same sequences, either as query or reference. 
-- The "hits" folder contains the files regarding seed matches between query and reference. This folder can be heavyweight and the recommendation is to remove it after usage.- The "results" folder contains the files that represent the comparison output. In particular:
- - query-reference.csv: A CSV file that includes metadata about the sequence compared and each HSP detected. See section "Interpreting the CSV" below for more information. This file can be used to visualize the comparison in the interactive sequence visualizer GECKO-MGV (use online [here](https://pistacho.ac.uma.es/) or download and install [here](https://github.com/estebanpw/docker-geckomgv)). 
- - query-reference.frags: The same information contained in the CSV but without metadata and in binary format. This file is used for further processing (e.g. extracting the alignments). This file is made up from the `FragFile` structure found in the `structs.h` file in the `src` folder.
+### Docker
 
-## Interpreting the CSV
+```bash
+docker build -t gecko .
+docker run --rm -v "$PWD:/data" gecko compare /data/query.fa.gz /data/ref.fa.gz -o /data/results
+```
 
-After the metadata header, each line in the CSV represents a detected HSP (alignment). Each column is:
+## Quick Start
 
-``` Type,xStart,yStart,xEnd,yEnd,strand(f/r),block,length,score,ident,similarity,%ident,SeqX,SeqY ```
+```bash
+# Standard comparison (outputs legacy GECKO-MGV files + PAF by default)
+gecko compare query.fasta reference.fasta -l 40 -s 60 -k 12 -o results/
 
-- Type:   currently, this field is reserved for `Frag`.
-- xStart: starting coordinates of the alignment in the query sequence.
-- yStart: starting coordinates of the alignment in the reference sequence.
-- xEnd:   ending coordinates of the alignment in the query sequence.
-- yEnd:   ending coordinates of the alignment in the reference sequence.
-- strand: a character `f` or `r` encoding whether the alignment is in the forward or reverse strand.
-- block:  currently reserved.
-- length: the length in nucleotides of the alignment.
-- score:  the raw score of the alignment calculated with +4 and -4 per match and mismatch.
-- ident:  the number of identities found in the alignment (i.e. matches).
-- similarity: the similarity percentage calculated as the achieved raw score divided by the maximum possible score.
-- %ident:     the number of identities divided by the length of the alignment.
-- SeqX:       the ID corresponding to the sequence in the query file to which the xStart and xEnd coordinates correspond (0=> first sequence, 1=> second sequence, etc).
-- SeqY:       same as above but for the reference file.
+# Output all supported formats (frags, csv, inf, mat, paf, blast, bedpe, jsonl)
+gecko compare query.fa.gz reference.fa.gz -l 100 -s 60 -k 16 --format all -o results/
 
-Note that fragments in the reverse strand (marked with the `r` field) have their `yStart` and `yEnd` coordinates switched, i.e. `yEnd` is smaller than `yStart`.
+# Bound RAM for chromosome-scale comparisons and reuse k-mer dictionaries
+gecko compare chr1_human.fa.gz chr1_gorilla.fa.gz -l 100 -s 60 -k 32 -m 4G -t 16 --cache-dir .gecko_cache -o results/
+```
 
-## Extracting the alignments
+### Migration from v1 (`workflow.sh`)
 
-Use `./gecko/bin/frags2align.sh fragsFILE.frags query reference output_alignments.txt` to extract the alignments from a comparison. The `query` and `reference` files must be the same FASTA input sequences as used to generate the `fragsFILE.frags` found in the results folder. This will create a text file `output_alignments.txt` containing the alignments.
+| Legacy v1 Command | GECKO v2 Equivalent |
+|---|---|
+| `./bin/workflow.sh q.fa r.fa 40 60 12 1` | `gecko compare q.fa r.fa -l 40 -s 60 -k 12 --format legacy -o results` |
+| `./bin/frags2align.sh q-r.frags q.fa r.fa align.txt` | `gecko align q-r.frags q.fa r.fa -o align.txt` |
+| `./bin/frags2borders.sh q-r.csv q.fa r.fa out.txt 50 query` | `gecko borders q-r.csv q.fa r.fa -b 50 -o out.txt --emit-query query-50.fasta` |
+| `./bin/filterFrags q-r.frags 100 70 > out.csv` | `gecko filter q-r.frags -l 100 -s 70 -o out.csv` |
+| `./bin/allVsAll.sh genomes/ 200 40 12 fa` | `gecko all-vs-all genomes/ -l 200 -s 40 -k 12 --ext fa -o results` |
+| `./bin/fragStat q-r.frags` | `gecko stats q-r.frags` |
 
-## Further documentation
+## Subcommands
 
-You can find a guided exercise [here](http://chirimoyo.ac.uma.es/gecko/documents/GuidedExercise-fromGENOMES2Visualization-reduced-v0.2.pdf) and the supplementary material [here](http://chirimoyo.ac.uma.es/gecko/documents/HSPWorkflow-SuppMat-submittedv2.pdf).
+- `gecko compare`: Pairwise genome comparison (`-l`, `-s`, `-k`, `--freq-limit`, `--max-rep`, `--percent-length`, `--no-soft-mask`, `--forward-only`, `--format`, `-m/--memory`, `-t/--threads`, `--cache-dir`, `--json-stats`).
+- `gecko index`: Precompute a compact binary `.gidx` k-mer dictionary.
+- `gecko align`: Extract wrapped text pairwise alignments from `.frags` or `.csv` + original FASTAs.
+- `gecko borders`: Extract flanking border alignments (`-b/--border`) and optionally emit query sequences as FASTA (`--emit-query`).
+- `gecko filter`: Re-filter `.frags` or `.csv` by minimum length and similarity into CSV, `.frags`, PAF, BLAST, BEDPE, or JSONL.
+- `gecko all-vs-all`: Compare every genome pair in a directory, indexing each genome only once.
+- `gecko stats`: Inspect `.frags`, `.csv`, or `.gidx` files (human-readable or `--json`).
 
-## Use of GECKO in concurrent systems (clusters, etc.)
+## Output Formats
 
-GECKO is disk-intensive. This means that the algorithm will write a lot to the hard disk drive, which, even though buffered, can affect the performance of other processes that are sharing the same filesystem by starving their access to the disk. 
+- **`frags`**: 93-byte big-endian binary format compatible with GECKO-MGV and legacy downstream tools.
+- **`csv`**: GECKO-MGV CSV with metadata header and columns `Type,xStart,yStart,xEnd,yEnd,strand(f/r),block,length,score,ident,similarity,%ident,SeqX,SeqY`.
+- **`inf` / `mat`**: Legacy `.frags.INF` summary metadata and `.frags.MAT` 1000×100 length-by-similarity histogram.
+- **`paf`**: Minimap2 Pairwise mApping Format with 0-based per-sequence local coordinates and `AS:i:`, `si:f:`, `cg:Z:` tags.
+- **`blast`**: BLAST tabular (`outfmt 6`) with 1-based inclusive coordinates, ungapped Karlin-Altschul E-value, and bitscore.
+- **`bedpe`**: Pairwise 0-based BEDPE synteny intervals.
+- **`jsonl`**: Structured newline-delimited JSON records.
 
-Therefore, if GECKO is being used concurrently, it is recommended that the input file size is limited in order to avoid overall deterioration of the performance of the system. See details below for an estimate.
+## Development & Testing
 
-The most disk-consuming step is the writing of "seeds" or "hits". These depend on the length and the similarity of the input sequences.
-
-- A regular bacterial comparison (1 to 10 MB input sequences) can write around 1 to 5 GB.
-- A medium-sized comparison (around 20 or 30 MB input sequences) can write around 10 GB.
-- A chromosome comparison (50 to 200 MB input sequences) between human and gorilla can write around 600 GB. Other "less" similar comparison can write around 100 GB or less.
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
 
 ## Cite
 
 If you use GECKO, please cite:
 
-Torreno, Oscar, and Oswaldo Trelles. "Breaking the computational barriers of pairwise genome comparison." BMC bioinformatics 16, no. 1 (2015): 250.
-
-[Link to manuscript](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-015-0679-9)
+> Torreno, Oscar, and Oswaldo Trelles. "Breaking the computational barriers of pairwise genome comparison." *BMC Bioinformatics* 16, no. 1 (2015): 250.
+> https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-015-0679-9

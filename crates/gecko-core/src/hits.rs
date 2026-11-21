@@ -194,25 +194,29 @@ where
     let mut cur_x = idx_x.cursor(wl, freq_limit)?;
     let mut cur_y = idx_y.cursor(wl, freq_limit)?;
 
-    let mut gx = cur_x.next_prefix_group()?;
-    let mut gy = cur_y.next_prefix_group()?;
+    let mut gx = crate::kmer::KmerPrefixGroup::default();
+    let mut gy = crate::kmer::KmerPrefixGroup::default();
+    let mut has_x = cur_x.fill_next_prefix_group(&mut gx)?;
+    let mut has_y = cur_y.fill_next_prefix_group(&mut gy)?;
 
     let mut buf: Vec<Hit> = Vec::with_capacity(max_hits_in_mem.min(1 << 20));
     let mut spill_files: Vec<File> = Vec::new();
     let mut stats = HitStats::default();
 
-    while let (Some(group_x), Some(group_y)) = (&gx, &gy) {
-        if group_x.prefix < group_y.prefix {
-            gx = cur_x.next_prefix_group()?;
+    while has_x && has_y {
+        if gx.prefix < gy.prefix {
+            has_x = cur_x.fill_next_prefix_group(&mut gx)?;
             continue;
         }
-        if group_x.prefix > group_y.prefix {
-            gy = cur_y.next_prefix_group()?;
+        if gx.prefix > gy.prefix {
+            has_y = cur_y.fill_next_prefix_group(&mut gy)?;
             continue;
         }
 
-        for pos_x_slice in &group_x.words {
-            for pos_y_slice in &group_y.words {
+        for ix in 0..gx.num_words() {
+            let pos_x_slice = gx.word_positions(ix);
+            for iy in 0..gy.num_words() {
+                let pos_y_slice = gy.word_positions(iy);
                 emit_cartesian_hits(
                     pos_x_slice,
                     pos_y_slice,
@@ -225,8 +229,8 @@ where
             }
         }
 
-        gx = cur_x.next_prefix_group()?;
-        gy = cur_y.next_prefix_group()?;
+        has_x = cur_x.fill_next_prefix_group(&mut gx)?;
+        has_y = cur_y.fill_next_prefix_group(&mut gy)?;
     }
 
     finalize_and_consume_hits(

@@ -545,11 +545,32 @@ impl KmerIndex {
     }
 }
 
-/// All distinct 32-mer occurrence lists (passing `freq_limit`) sharing a `word_length` prefix.
-#[derive(Debug)]
+/// Reusable flat buffer holding all distinct 32-mer occurrence lists (passing `freq_limit`)
+/// sharing a `word_length` prefix—eliminating per-k-mer heap allocations during streaming merge.
+#[derive(Debug, Default)]
 pub struct KmerPrefixGroup {
     pub prefix: u64,
-    pub words: Vec<Vec<u64>>,
+    positions: Vec<u64>,
+    offsets: Vec<usize>,
+}
+
+impl KmerPrefixGroup {
+    #[inline]
+    pub fn clear(&mut self) {
+        self.positions.clear();
+        self.offsets.clear();
+        self.offsets.push(0);
+    }
+
+    #[inline]
+    pub fn num_words(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    #[inline]
+    pub fn word_positions(&self, idx: usize) -> &[u64] {
+        &self.positions[self.offsets[idx]..self.offsets[idx + 1]]
+    }
 }
 
 /// Sequential prefix-group cursor over either an in-memory [`KmerDict`] or an on-disk
@@ -570,8 +591,9 @@ pub enum KmerCursor<'a> {
 }
 
 impl<'a> KmerCursor<'a> {
-    /// Advance to the next prefix group containing at least one word with `freq <= freq_limit`.
-    pub fn next_prefix_group(&mut self) -> Result<Option<KmerPrefixGroup>> {
+    /// Fill `out` with the next prefix group containing at least one word with `freq <= freq_limit`.
+    /// Returns `Ok(true)` if a group was produced, or `Ok(false)` at EOF.
+    pub fn fill_next_prefix_group(&mut self, out: &mut KmerPrefixGroup) -> Result<bool> {
         match self {
             KmerCursor::InMemory {
                 dict,
@@ -584,19 +606,21 @@ impl<'a> KmerCursor<'a> {
                 let fl = *freq_limit;
                 while *pos < n {
                     let prefix = kmer_prefix(dict.words[*pos], wl);
-                    let mut words = Vec::new();
+                    out.clear();
+                    out.prefix = prefix;
                     while *pos < n && kmer_prefix(dict.words[*pos], wl) == prefix {
                         let slice = dict.positions_for(*pos);
                         if slice.len() <= fl {
-                            words.push(slice.to_vec());
+                            out.positions.extend_from_slice(slice);
+                            out.offsets.push(out.positions.len());
                         }
                         *pos += 1;
                     }
-                    if !words.is_empty() {
-                        return Ok(Some(KmerPrefixGroup { prefix, words }));
+                    if out.num_words() > 0 {
+                        return Ok(true);
                     }
                 }
-                Ok(None)
+                Ok(false)
             }
             KmerCursor::OnDisk {
                 reader,
@@ -608,14 +632,15 @@ impl<'a> KmerCursor<'a> {
                 let fl = *freq_limit;
                 while let Some(first) = *peeked {
                     let prefix = kmer_prefix(first.kmer, wl);
-                    let mut words = Vec::new();
+                    out.clear();
+                    out.prefix = prefix;
 
                     while let Some(cur) = *peeked {
                         if kmer_prefix(cur.kmer, wl) != prefix {
                             break;
                         }
                         let cur_kmer = cur.kmer;
-                        let mut positions = Vec::new();
+                        let start_len = out.positions.len();
                         let mut count = 0usize;
                         while let Some(e) = *peeked {
                             if e.kmer != cur_kmer {
@@ -623,22 +648,22 @@ impl<'a> KmerCursor<'a> {
                             }
                             count += 1;
                             if count <= fl {
-                                positions.push(e.pos);
-                            } else if !positions.is_empty() {
-                                positions.clear();
+                                out.positions.push(e.pos);
+                            } else if out.positions.len() > start_len {
+                                out.positions.truncate(start_len);
                             }
                             *peeked = read_word_entry(reader)?;
                         }
                         if count <= fl {
-                            words.push(positions);
+                            out.offsets.push(out.positions.len());
                         }
                     }
 
-                    if !words.is_empty() {
-                        return Ok(Some(KmerPrefixGroup { prefix, words }));
+                    if out.num_words() > 0 {
+                        return Ok(true);
                     }
                 }
-                Ok(None)
+                Ok(false)
             }
         }
     }

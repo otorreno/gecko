@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
 
 use crate::error::{GeckoError, Result};
-use crate::kmer::{KmerDict, kmer_prefix};
+use crate::kmer::{KmerDict, KmerIndex, kmer_prefix};
 use crate::radix::{i64_to_sortable_u64, parallel_radix_sort_u128_key};
 use crate::seq::Genome;
 
@@ -60,13 +60,6 @@ pub struct HitStats {
 
 /// Find, sort, and deduplicate diagonal hits between `dict_x` and `dict_y`, delivering
 /// filtered hits sorted by `(diag, pos_x)`.
-///
-/// - Fast path: if all raw hits fit in `opts.memory_budget`, everything runs 100% in memory
-///   with zero hit disk I/O.
-/// - Out-of-core path: when raw hits exceed `opts.memory_budget`, chunks are sorted,
-///   pre-deduplicated per diagonal, spilled to temporary files, and k-way merged into a
-///   compact deduplicated hit vector (or streamed in diagonal batches via
-///   [`generate_and_consume_hits`]).
 pub fn generate_filtered_hits(
     dict_x: &KmerDict,
     dict_y: &KmerDict,
@@ -81,16 +74,14 @@ pub fn generate_filtered_hits(
     Ok((out, stats))
 }
 
-/// Memory-bounded streaming hit generator: emits sorted, deduplicated slices of [`Hit`]
-/// guaranteed to be split cleanly at diagonal boundaries so downstream HSP extension can
-/// process each batch independently in parallel.
+/// Memory-bounded streaming hit generator over two in-memory [`KmerDict`]s.
 pub fn generate_and_consume_hits<F>(
     dict_x: &KmerDict,
     dict_y: &KmerDict,
     genome_x: &Genome,
     genome_y: &Genome,
     opts: HitOptions,
-    mut on_diagonal_batch: F,
+    on_diagonal_batch: F,
 ) -> Result<HitStats>
 where
     F: FnMut(&[Hit]),
@@ -138,42 +129,20 @@ where
             if pos_x_slice.len() > freq_limit {
                 continue;
             }
-            let step_x = if pos_x_slice.len() > max_rep {
-                pos_x_slice.len() / max_rep
-            } else {
-                1
-            };
-
             for j in iy..iy_end {
                 let pos_y_slice = dict_y.positions_for(j);
                 if pos_y_slice.len() > freq_limit {
                     continue;
                 }
-                stats.word_matches += 1;
-                let step_y = if pos_y_slice.len() > max_rep {
-                    pos_y_slice.len() / max_rep
-                } else {
-                    1
-                };
-
-                let mut ax = 0;
-                while ax < pos_x_slice.len() {
-                    let px_val = pos_x_slice[ax];
-                    let mut ay = 0;
-                    while ay < pos_y_slice.len() {
-                        let py_val = pos_y_slice[ay];
-                        buf.push(Hit {
-                            diag: px_val as i64 - py_val as i64,
-                            pos_x: px_val,
-                        });
-                        stats.raw_hits += 1;
-                        if buf.len() >= max_hits_in_mem {
-                            spill_files.push(sort_and_spill_hits(&mut buf)?);
-                        }
-                        ay += step_y;
-                    }
-                    ax += step_x;
-                }
+                emit_cartesian_hits(
+                    pos_x_slice,
+                    pos_y_slice,
+                    max_rep,
+                    max_hits_in_mem,
+                    &mut buf,
+                    &mut spill_files,
+                    &mut stats,
+                )?;
             }
         }
 
@@ -181,6 +150,154 @@ where
         iy = iy_end;
     }
 
+    finalize_and_consume_hits(
+        buf,
+        spill_files,
+        stats,
+        max_hits_in_mem,
+        wl,
+        genome_x,
+        genome_y,
+        on_diagonal_batch,
+    )
+}
+
+/// Memory-bounded streaming hit generator supporting both in-memory and on-disk [`KmerIndex`]es.
+pub fn generate_and_consume_hits_from_index<F>(
+    idx_x: &KmerIndex,
+    idx_y: &KmerIndex,
+    genome_x: &Genome,
+    genome_y: &Genome,
+    opts: HitOptions,
+    on_diagonal_batch: F,
+) -> Result<HitStats>
+where
+    F: FnMut(&[Hit]),
+{
+    if let (KmerIndex::InMemory(dx), KmerIndex::InMemory(dy)) = (idx_x, idx_y) {
+        return generate_and_consume_hits(dx, dy, genome_x, genome_y, opts, on_diagonal_batch);
+    }
+
+    let max_k = idx_x.index_k().min(idx_y.index_k());
+    if opts.word_length < 4 || opts.word_length > max_k {
+        return Err(GeckoError::InvalidParameter(format!(
+            "word_length ({}) must be in 4..={max_k} for the given dictionaries",
+            opts.word_length
+        )));
+    }
+
+    let wl = opts.word_length;
+    let freq_limit = opts.freq_limit as usize;
+    let max_rep = opts.max_rep.max(1);
+    let max_hits_in_mem = (opts.memory_budget / (2 * std::mem::size_of::<Hit>())).max(4096);
+
+    let mut cur_x = idx_x.cursor(wl, freq_limit)?;
+    let mut cur_y = idx_y.cursor(wl, freq_limit)?;
+
+    let mut gx = cur_x.next_prefix_group()?;
+    let mut gy = cur_y.next_prefix_group()?;
+
+    let mut buf: Vec<Hit> = Vec::with_capacity(max_hits_in_mem.min(1 << 20));
+    let mut spill_files: Vec<File> = Vec::new();
+    let mut stats = HitStats::default();
+
+    while let (Some(group_x), Some(group_y)) = (&gx, &gy) {
+        if group_x.prefix < group_y.prefix {
+            gx = cur_x.next_prefix_group()?;
+            continue;
+        }
+        if group_x.prefix > group_y.prefix {
+            gy = cur_y.next_prefix_group()?;
+            continue;
+        }
+
+        for pos_x_slice in &group_x.words {
+            for pos_y_slice in &group_y.words {
+                emit_cartesian_hits(
+                    pos_x_slice,
+                    pos_y_slice,
+                    max_rep,
+                    max_hits_in_mem,
+                    &mut buf,
+                    &mut spill_files,
+                    &mut stats,
+                )?;
+            }
+        }
+
+        gx = cur_x.next_prefix_group()?;
+        gy = cur_y.next_prefix_group()?;
+    }
+
+    finalize_and_consume_hits(
+        buf,
+        spill_files,
+        stats,
+        max_hits_in_mem,
+        wl,
+        genome_x,
+        genome_y,
+        on_diagonal_batch,
+    )
+}
+
+#[inline]
+fn emit_cartesian_hits(
+    pos_x_slice: &[u64],
+    pos_y_slice: &[u64],
+    max_rep: usize,
+    max_hits_in_mem: usize,
+    buf: &mut Vec<Hit>,
+    spill_files: &mut Vec<File>,
+    stats: &mut HitStats,
+) -> Result<()> {
+    stats.word_matches += 1;
+    let step_x = if pos_x_slice.len() > max_rep {
+        pos_x_slice.len() / max_rep
+    } else {
+        1
+    };
+    let step_y = if pos_y_slice.len() > max_rep {
+        pos_y_slice.len() / max_rep
+    } else {
+        1
+    };
+
+    let mut ax = 0;
+    while ax < pos_x_slice.len() {
+        let px_val = pos_x_slice[ax];
+        let mut ay = 0;
+        while ay < pos_y_slice.len() {
+            let py_val = pos_y_slice[ay];
+            buf.push(Hit {
+                diag: px_val as i64 - py_val as i64,
+                pos_x: px_val,
+            });
+            stats.raw_hits += 1;
+            if buf.len() >= max_hits_in_mem {
+                spill_files.push(sort_and_spill_hits(buf)?);
+            }
+            ay += step_y;
+        }
+        ax += step_x;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_and_consume_hits<F>(
+    mut buf: Vec<Hit>,
+    mut spill_files: Vec<File>,
+    mut stats: HitStats,
+    max_hits_in_mem: usize,
+    wl: usize,
+    genome_x: &Genome,
+    genome_y: &Genome,
+    mut on_diagonal_batch: F,
+) -> Result<HitStats>
+where
+    F: FnMut(&[Hit]),
+{
     if spill_files.is_empty() {
         parallel_radix_sort_u128_key(&mut buf, |h| (i64_to_sortable_u64(h.diag), h.pos_x));
         dedup_hits_in_place(&mut buf, genome_x, genome_y, wl);

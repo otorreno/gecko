@@ -6,8 +6,8 @@ use crate::error::{GeckoError, Result};
 use crate::extend::{CoverageMatrix, ExtendOptions, Scoring, extend_hits_parallel};
 use crate::formats::csv::ComparisonMetadata;
 use crate::formats::frags::Fragment;
-use crate::hits::{HitOptions, generate_and_consume_hits};
-use crate::kmer::{DictOptions, INDEX_WORD_SIZE, KmerDict};
+use crate::hits::{HitOptions, generate_and_consume_hits, generate_and_consume_hits_from_index};
+use crate::kmer::{DictOptions, INDEX_WORD_SIZE, KmerDict, KmerIndex};
 use crate::seq::Genome;
 
 /// Full configuration for a pairwise GECKO comparison.
@@ -156,21 +156,21 @@ pub fn compare_genomes(
         stats: CompareStats::default(),
     };
 
-    let dict_x = load_or_build_dict(query, dict_opts, cache_dir)?;
+    let idx_x = load_or_build_index(query, dict_opts, cache_dir)?;
 
     {
-        let dict_y = load_or_build_dict(reference, dict_opts, cache_dir)?;
-        run_strand(query, &dict_x, reference, &dict_y, 'f', config, &mut result)?;
+        let idx_y = load_or_build_index(reference, dict_opts, cache_dir)?;
+        run_strand_index(query, &idx_x, reference, &idx_y, 'f', config, &mut result)?;
     }
 
     if config.compare_reverse {
         let rev_ref = reference.reverse_complement();
-        let dict_y_rev = load_or_build_dict(&rev_ref, dict_opts, cache_dir)?;
-        run_strand(
+        let idx_y_rev = load_or_build_index(&rev_ref, dict_opts, cache_dir)?;
+        run_strand_index(
             query,
-            &dict_x,
+            &idx_x,
             &rev_ref,
-            &dict_y_rev,
+            &idx_y_rev,
             'r',
             config,
             &mut result,
@@ -244,6 +244,57 @@ fn run_strand(
         acc.fragments.append(&mut ext.fragments);
     })?;
 
+    record_strand_stats(acc, hit_stats, hits_used, strand, strand_frags);
+    Ok(())
+}
+
+fn run_strand_index(
+    query: &Genome,
+    idx_x: &KmerIndex,
+    target: &Genome,
+    idx_y: &KmerIndex,
+    strand: char,
+    config: &CompareConfig,
+    acc: &mut CompareResult,
+) -> Result<()> {
+    let hit_opts = HitOptions {
+        word_length: config.word_length,
+        freq_limit: config.freq_limit,
+        max_rep: config.max_rep,
+        memory_budget: config.memory_budget,
+    };
+    let ext_opts = ExtendOptions {
+        min_length: config.min_length,
+        min_similarity: config.min_similarity,
+        word_length: config.word_length,
+        fixed_length: config.fixed_length,
+        strand,
+        scoring: config.scoring,
+    };
+
+    let mut strand_frags: u64 = 0;
+    let mut hits_used: u64 = 0;
+
+    let hit_stats =
+        generate_and_consume_hits_from_index(idx_x, idx_y, query, target, hit_opts, |batch| {
+            let mut ext = extend_hits_parallel(batch, query, target, ext_opts);
+            strand_frags += ext.fragments.len() as u64;
+            hits_used += ext.hits_used;
+            acc.coverage.merge_from(&ext.coverage);
+            acc.fragments.append(&mut ext.fragments);
+        })?;
+
+    record_strand_stats(acc, hit_stats, hits_used, strand, strand_frags);
+    Ok(())
+}
+
+fn record_strand_stats(
+    acc: &mut CompareResult,
+    hit_stats: crate::hits::HitStats,
+    hits_used: u64,
+    strand: char,
+    strand_frags: u64,
+) {
     acc.stats.word_matches += hit_stats.word_matches;
     acc.stats.raw_hits += hit_stats.raw_hits;
     acc.stats.filtered_hits += hit_stats.filtered_hits;
@@ -254,15 +305,13 @@ fn run_strand(
     } else {
         acc.stats.reverse_fragments += strand_frags;
     }
-
-    Ok(())
 }
 
-fn load_or_build_dict(
+fn load_or_build_index(
     genome: &Genome,
     opts: DictOptions,
     cache_dir: Option<&Path>,
-) -> Result<KmerDict> {
+) -> Result<KmerIndex> {
     if let Some(dir) = cache_dir {
         std::fs::create_dir_all(dir)?;
         let mask_tag = if opts.soft_mask { "sm" } else { "nm" };
@@ -271,13 +320,13 @@ fn load_or_build_dict(
             && let Ok(loaded) = KmerDict::load_from_path(&idx_path)
             && loaded.index_k == opts.index_k
         {
-            return Ok(loaded);
+            return Ok(KmerIndex::InMemory(loaded));
         }
         let dict = KmerDict::build(genome, opts)?;
         dict.save_to_path(&idx_path)?;
-        Ok(dict)
+        Ok(KmerIndex::InMemory(dict))
     } else {
-        KmerDict::build(genome, opts)
+        KmerIndex::build(genome, opts)
     }
 }
 
@@ -331,5 +380,67 @@ mod tests {
         let rev = res.fragments.iter().find(|f| f.strand == 'r').unwrap();
         assert_eq!(rev.length, block_b.len() as u64);
         assert_eq!(rev.x_start, (10 + block_a.len() + 10) as u64);
+    }
+
+    #[test]
+    fn on_disk_index_matches_in_memory_exactly() {
+        let mut s_x = String::new();
+        let mut s_y = String::new();
+        let mut seed = 12345u64;
+        let bases = *b"ACGT";
+        let mut next_dna = |n: usize| {
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                out.push(bases[((seed >> 32) & 3) as usize]);
+            }
+            String::from_utf8(out).unwrap()
+        };
+
+        let fwd_block = next_dna(180);
+        let rev_block = next_dna(160);
+        let rev_block_rc: String = rev_block
+            .bytes()
+            .rev()
+            .map(crate::seq::complement_base)
+            .map(|b| b as char)
+            .collect();
+
+        // Make sequences > 1500 bp so a 32 KiB budget forces KmerIndex::OnDisk spilling!
+        s_x.push_str(&next_dna(700));
+        s_x.push_str(&fwd_block);
+        s_x.push_str(&next_dna(700));
+        s_x.push_str(&rev_block);
+        s_x.push_str(&next_dna(700));
+
+        s_y.push_str(&next_dna(650));
+        s_y.push_str(&fwd_block);
+        s_y.push_str(&next_dna(650));
+        s_y.push_str(&rev_block_rc);
+        s_y.push_str(&next_dna(650));
+
+        let q = Genome::from_records("q", [("q0", s_x.as_bytes())]);
+        let r = Genome::from_records("r", [("r0", s_y.as_bytes())]);
+
+        let cfg_mem = CompareConfig {
+            min_length: 80,
+            min_similarity: 70.0,
+            word_length: 12,
+            memory_budget: 64 * 1024 * 1024,
+            ..Default::default()
+        };
+        let cfg_disk = CompareConfig {
+            memory_budget: 32 * 1024,
+            ..cfg_mem.clone()
+        };
+
+        let res_mem = compare_genomes(&q, &r, &cfg_mem, None).unwrap();
+        let res_disk = compare_genomes(&q, &r, &cfg_disk, None).unwrap();
+        assert_eq!(res_mem.fragments.len(), 2);
+        assert_eq!(res_mem.fragments, res_disk.fragments);
+        assert_eq!(res_mem.stats.raw_hits, res_disk.stats.raw_hits);
+        assert_eq!(res_mem.stats.filtered_hits, res_disk.stats.filtered_hits);
     }
 }

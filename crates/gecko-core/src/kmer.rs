@@ -421,6 +421,260 @@ fn read_u64_le<R: Read>(r: &mut R) -> Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
+/// On-disk sorted k-mer stream storing 16-byte `(kmer: u64, pos: u64)` entries in a
+/// temporary file (auto-removed when dropped) so 200+ Mb chromosomes compare in bounded RAM.
+#[derive(Debug)]
+pub struct DiskKmerIndex {
+    pub index_k: usize,
+    file: File,
+}
+
+/// A k-mer dictionary stored either fully in RAM (fast path) or streamed from a sorted
+/// temporary file on disk (out-of-core path for huge chromosomes).
+#[derive(Debug)]
+pub enum KmerIndex {
+    InMemory(KmerDict),
+    OnDisk(DiskKmerIndex),
+}
+
+impl KmerIndex {
+    /// Build a [`KmerIndex`] respecting `opts.memory_budget`: stays in memory if all k-mers
+    /// fit in RAM, or spills sorted chunks and k-way merges into a streaming temporary file.
+    pub fn build(genome: &Genome, opts: DictOptions) -> Result<Self> {
+        let index_k = opts.index_k;
+        if !(4..=32).contains(&index_k) {
+            return Err(GeckoError::InvalidParameter(format!(
+                "index word size must be in 4..=32, got {index_k}"
+            )));
+        }
+
+        let max_entries_in_mem =
+            (opts.memory_budget / (2 * std::mem::size_of::<WordEntry>())).max(1024);
+        let shift_to_msb = 64 - 2 * index_k;
+        let kmer_mask: u64 = if index_k == 32 {
+            u64::MAX
+        } else {
+            (1u64 << (2 * index_k)) - 1
+        };
+
+        let mut entries: Vec<WordEntry> =
+            Vec::with_capacity(genome.data.len().min(max_entries_in_mem));
+        let mut spill_files: Vec<File> = Vec::new();
+
+        let mut cur_word: u64 = 0;
+        let mut valid_run: usize = 0;
+
+        for (idx, &raw_byte) in genome.data.iter().enumerate() {
+            if raw_byte == SEQ_SEP {
+                valid_run = 0;
+                cur_word = 0;
+                continue;
+            }
+            match encode_base(raw_byte, opts.soft_mask) {
+                Some(bits) => {
+                    cur_word = ((cur_word << 2) | bits) & kmer_mask;
+                    valid_run += 1;
+                    if valid_run >= index_k {
+                        let start_pos = (idx + 1 - index_k) as u64;
+                        entries.push(WordEntry {
+                            kmer: cur_word << shift_to_msb,
+                            pos: start_pos,
+                        });
+                        if entries.len() >= max_entries_in_mem {
+                            spill_files.push(sort_and_spill_entries(&mut entries)?);
+                        }
+                    }
+                }
+                None => {
+                    valid_run = 0;
+                    cur_word = 0;
+                }
+            }
+        }
+
+        if spill_files.is_empty() {
+            parallel_radix_sort_u128_key(&mut entries, |e| (e.kmer, e.pos));
+            Ok(KmerIndex::InMemory(KmerDict::compact_sorted(
+                index_k, &entries,
+            )))
+        } else {
+            if !entries.is_empty() {
+                spill_files.push(sort_and_spill_entries(&mut entries)?);
+            }
+            drop(entries);
+            let merged = merge_spilled_to_disk(spill_files)?;
+            Ok(KmerIndex::OnDisk(DiskKmerIndex {
+                index_k,
+                file: merged,
+            }))
+        }
+    }
+
+    #[inline]
+    pub fn index_k(&self) -> usize {
+        match self {
+            KmerIndex::InMemory(d) => d.index_k,
+            KmerIndex::OnDisk(d) => d.index_k,
+        }
+    }
+
+    /// Create a sequential cursor yielding prefix-grouped occurrence lists (skipping words
+    /// whose frequency exceeds `freq_limit`).
+    pub fn cursor(&self, word_length: usize, freq_limit: usize) -> Result<KmerCursor<'_>> {
+        use std::io::Seek;
+        match self {
+            KmerIndex::InMemory(dict) => Ok(KmerCursor::InMemory {
+                dict,
+                pos: 0,
+                word_length,
+                freq_limit,
+            }),
+            KmerIndex::OnDisk(disk) => {
+                let mut cloned = disk.file.try_clone()?;
+                cloned.rewind()?;
+                let mut reader = BufReader::with_capacity(1 << 20, cloned);
+                let peeked = read_word_entry(&mut reader)?;
+                Ok(KmerCursor::OnDisk {
+                    reader,
+                    peeked,
+                    word_length,
+                    freq_limit,
+                })
+            }
+        }
+    }
+}
+
+/// All distinct 32-mer occurrence lists (passing `freq_limit`) sharing a `word_length` prefix.
+#[derive(Debug)]
+pub struct KmerPrefixGroup {
+    pub prefix: u64,
+    pub words: Vec<Vec<u64>>,
+}
+
+/// Sequential prefix-group cursor over either an in-memory [`KmerDict`] or an on-disk
+/// [`DiskKmerIndex`].
+pub enum KmerCursor<'a> {
+    InMemory {
+        dict: &'a KmerDict,
+        pos: usize,
+        word_length: usize,
+        freq_limit: usize,
+    },
+    OnDisk {
+        reader: BufReader<File>,
+        peeked: Option<WordEntry>,
+        word_length: usize,
+        freq_limit: usize,
+    },
+}
+
+impl<'a> KmerCursor<'a> {
+    /// Advance to the next prefix group containing at least one word with `freq <= freq_limit`.
+    pub fn next_prefix_group(&mut self) -> Result<Option<KmerPrefixGroup>> {
+        match self {
+            KmerCursor::InMemory {
+                dict,
+                pos,
+                word_length,
+                freq_limit,
+            } => {
+                let n = dict.words.len();
+                let wl = *word_length;
+                let fl = *freq_limit;
+                while *pos < n {
+                    let prefix = kmer_prefix(dict.words[*pos], wl);
+                    let mut words = Vec::new();
+                    while *pos < n && kmer_prefix(dict.words[*pos], wl) == prefix {
+                        let slice = dict.positions_for(*pos);
+                        if slice.len() <= fl {
+                            words.push(slice.to_vec());
+                        }
+                        *pos += 1;
+                    }
+                    if !words.is_empty() {
+                        return Ok(Some(KmerPrefixGroup { prefix, words }));
+                    }
+                }
+                Ok(None)
+            }
+            KmerCursor::OnDisk {
+                reader,
+                peeked,
+                word_length,
+                freq_limit,
+            } => {
+                let wl = *word_length;
+                let fl = *freq_limit;
+                while let Some(first) = *peeked {
+                    let prefix = kmer_prefix(first.kmer, wl);
+                    let mut words = Vec::new();
+
+                    while let Some(cur) = *peeked {
+                        if kmer_prefix(cur.kmer, wl) != prefix {
+                            break;
+                        }
+                        let cur_kmer = cur.kmer;
+                        let mut positions = Vec::new();
+                        let mut count = 0usize;
+                        while let Some(e) = *peeked {
+                            if e.kmer != cur_kmer {
+                                break;
+                            }
+                            count += 1;
+                            if count <= fl {
+                                positions.push(e.pos);
+                            } else if !positions.is_empty() {
+                                positions.clear();
+                            }
+                            *peeked = read_word_entry(reader)?;
+                        }
+                        if count <= fl {
+                            words.push(positions);
+                        }
+                    }
+
+                    if !words.is_empty() {
+                        return Ok(Some(KmerPrefixGroup { prefix, words }));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn merge_spilled_to_disk(mut files: Vec<File>) -> Result<File> {
+    use std::io::Seek;
+
+    let mut readers: Vec<BufReader<File>> = Vec::with_capacity(files.len());
+    for mut f in files.drain(..) {
+        f.rewind()?;
+        readers.push(BufReader::with_capacity(256 * 1024, f));
+    }
+
+    let mut heap: BinaryHeap<Reverse<(u64, u64, usize)>> = BinaryHeap::new();
+    for (i, r) in readers.iter_mut().enumerate() {
+        if let Some(entry) = read_word_entry(r)? {
+            heap.push(Reverse((entry.kmer, entry.pos, i)));
+        }
+    }
+
+    let mut out = tempfile::tempfile()?;
+    {
+        let mut w = BufWriter::with_capacity(1 << 20, &mut out);
+        while let Some(Reverse((kmer, pos, run_idx))) = heap.pop() {
+            w.write_all(&kmer.to_le_bytes())?;
+            w.write_all(&pos.to_le_bytes())?;
+            if let Some(next) = read_word_entry(&mut readers[run_idx])? {
+                heap.push(Reverse((next.kmer, next.pos, run_idx)));
+            }
+        }
+        w.flush()?;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

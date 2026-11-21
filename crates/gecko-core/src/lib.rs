@@ -11,7 +11,7 @@ pub use error::{GeckoError, Result};
 pub use extend::{CoverageMatrix, ExtendOptions, Scoring};
 pub use formats::Fragment;
 pub use hits::{Hit, HitOptions, HitStats};
-pub use kmer::{DictOptions, DictStats, INDEX_WORD_SIZE, KmerDict};
+pub use kmer::{DictOptions, DictStats, DiskKmerIndex, INDEX_WORD_SIZE, KmerDict, KmerIndex};
 pub use pipeline::{
     CompareConfig, CompareResult, CompareStats, compare_genomes, compare_with_dicts,
 };

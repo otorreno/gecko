@@ -84,8 +84,9 @@ where
         }
     }
 
-    // Copy partitioned buckets back into `data` and sort each bucket in parallel.
+    // Copy partitioned buckets back into `data`, free `aux` immediately, and sort buckets in parallel.
     data.copy_from_slice(&aux);
+    drop(aux);
 
     // Build non-empty bucket slices and sort each bucket in parallel via LSD radix sort.
     let mut slices: Vec<&mut [T]> = Vec::with_capacity(256);

@@ -146,8 +146,15 @@ impl KmerDict {
             };
         }
 
-        let mut words = Vec::with_capacity(sorted.len() / 2 + 1);
-        let mut offsets = Vec::with_capacity(sorted.len() / 2 + 2);
+        let mut unique_count = 1usize;
+        for pair in sorted.windows(2) {
+            if pair[0].kmer != pair[1].kmer {
+                unique_count += 1;
+            }
+        }
+
+        let mut words = Vec::with_capacity(unique_count);
+        let mut offsets = Vec::with_capacity(unique_count + 1);
         let mut positions = Vec::with_capacity(sorted.len());
 
         let mut prev_kmer = sorted[0].kmer;

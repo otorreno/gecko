@@ -12,6 +12,7 @@ use gecko_core::formats::frags::{FragsFile, read_frags_path, write_frags_path};
 use gecko_core::formats::modern::{
     write_bedpe_path, write_blast_tabular_path, write_jsonl_path, write_paf_path,
 };
+use gecko_core::formats::plot::{ColorMode, PlotOptions, PlotOrigin, write_dotplot_png_path};
 use gecko_core::kmer::{DictOptions, INDEX_WORD_SIZE, KmerDict};
 use gecko_core::pipeline::{CompareConfig, compare_genomes, compare_with_dicts};
 use gecko_core::seq::Genome;
@@ -50,6 +51,9 @@ enum Commands {
     /// Filter a .frags or .csv file by minimum length and similarity thresholds.
     Filter(FilterArgs),
 
+    /// Render a 2D synteny matrix dotplot PNG from a .frags or .csv file.
+    Plot(PlotArgs),
+
     /// Compare all genome pairs in a directory (reusing dictionaries across pairs).
     AllVsAll(AllVsAllArgs),
 
@@ -75,6 +79,8 @@ enum OutputFormat {
     Bedpe,
     /// Newline-delimited JSON (.jsonl)
     Jsonl,
+    /// 2D synteny matrix dotplot image (.png)
+    Png,
     /// Preset: frags + csv + inf + mat (exact drop-in GECKO-MGV output set)
     Legacy,
     /// Preset: all legacy and modern output formats
@@ -92,6 +98,7 @@ impl std::fmt::Display for OutputFormat {
             OutputFormat::Blast => "blast",
             OutputFormat::Bedpe => "bedpe",
             OutputFormat::Jsonl => "jsonl",
+            OutputFormat::Png => "png",
             OutputFormat::Legacy => "legacy",
             OutputFormat::All => "all",
         };
@@ -119,6 +126,7 @@ impl OutputFormat {
                     set.insert(OutputFormat::Blast);
                     set.insert(OutputFormat::Bedpe);
                     set.insert(OutputFormat::Jsonl);
+                    set.insert(OutputFormat::Png);
                 }
                 other => {
                     set.insert(other);
@@ -350,6 +358,72 @@ struct AllVsAllArgs {
     skip_existing: bool,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PlotColorArg {
+    Strand,
+    Similarity,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PlotOriginArg {
+    TopLeft,
+    BottomLeft,
+}
+
+#[derive(Parser)]
+struct PlotArgs {
+    /// Input .frags or .csv fragment file.
+    input: PathBuf,
+
+    /// Output PNG image path.
+    #[arg(short = 'o', long)]
+    output: PathBuf,
+
+    /// Image width in pixels.
+    #[arg(long, default_value_t = 1200)]
+    width: u32,
+
+    /// Image height in pixels.
+    #[arg(long, default_value_t = 1200)]
+    height: u32,
+
+    /// Stroke thickness in pixels for each HSP segment.
+    #[arg(long, default_value_t = 2)]
+    line_width: u32,
+
+    /// Color encoding (strand: blue fwd / red rev, or similarity heatmap).
+    #[arg(long, default_value = "strand")]
+    color: PlotColorArg,
+
+    /// Matrix origin (top-left = matrix/GECKO-MGV style, bottom-left = Cartesian dotplot).
+    #[arg(long, default_value = "top-left")]
+    origin: PlotOriginArg,
+
+    /// Render with a dark background theme.
+    #[arg(long)]
+    dark: bool,
+
+    /// Optional minimum HSP length filter before plotting.
+    #[arg(short = 'l', long)]
+    min_length: Option<u64>,
+
+    /// Optional minimum similarity filter (0..=100) before plotting.
+    #[arg(short = 's', long)]
+    min_similarity: Option<f32>,
+
+    /// Optional custom plot title.
+    #[arg(long)]
+    title: Option<String>,
+
+    /// Optional query FASTA (adds axis name and multi-FASTA contig boundary guides).
+    #[arg(long)]
+    query: Option<PathBuf>,
+
+    /// Optional reference FASTA (adds axis name and multi-FASTA contig boundary guides).
+    #[arg(long)]
+    reference: Option<PathBuf>,
+}
+
 #[derive(Parser)]
 struct StatsArgs {
     /// Path to a .frags, .csv, or .gidx file.
@@ -376,6 +450,7 @@ fn main() -> Result<()> {
         Commands::Align(args) => cmd_align(args),
         Commands::Borders(args) => cmd_borders(args),
         Commands::Filter(args) => cmd_filter(args),
+        Commands::Plot(args) => cmd_plot(args),
         Commands::AllVsAll(args) => cmd_all_vs_all(args),
         Commands::Stats(args) => cmd_stats(args),
     }
@@ -842,6 +917,77 @@ fn write_outputs(
             fragments,
         )?;
     }
+    if formats.contains(&OutputFormat::Png) {
+        let plot_opts = PlotOptions::default().with_genomes(query, reference);
+        write_dotplot_png_path(
+            outdir.join(format!("{prefix}.png")),
+            query.total_bases,
+            reference.total_bases,
+            fragments,
+            &plot_opts,
+        )?;
+    }
+    Ok(())
+}
+
+fn cmd_plot(args: PlotArgs) -> Result<()> {
+    let t0 = Instant::now();
+    let ff = load_frags_or_csv(&args.input)?;
+
+    let fragments: Vec<Fragment> = ff
+        .fragments
+        .into_iter()
+        .filter(|f| {
+            args.min_length.is_none_or(|ml| f.length >= ml)
+                && args.min_similarity.is_none_or(|ms| f.similarity >= ms)
+        })
+        .collect();
+
+    let mut opts = PlotOptions {
+        width: args.width,
+        height: args.height,
+        line_width: args.line_width,
+        color_mode: match args.color {
+            PlotColorArg::Strand => ColorMode::Strand,
+            PlotColorArg::Similarity => ColorMode::Similarity,
+        },
+        origin: match args.origin {
+            PlotOriginArg::TopLeft => PlotOrigin::TopLeft,
+            PlotOriginArg::BottomLeft => PlotOrigin::BottomLeft,
+        },
+        dark: args.dark,
+        title: args.title,
+        ..Default::default()
+    };
+
+    if let (Some(qp), Some(rp)) = (args.query.as_ref(), args.reference.as_ref()) {
+        let q = Genome::from_fasta_path(qp)?;
+        let r = Genome::from_fasta_path(rp)?;
+        opts = opts.with_genomes(&q, &r);
+    } else if opts.title.is_none() {
+        let stem = args
+            .input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("GECKO Dotplot");
+        opts.title = Some(stem.to_string());
+    }
+
+    if let Some(parent) = args.output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    write_dotplot_png_path(&args.output, ff.x_total, ff.y_total, &fragments, &opts)?;
+    eprintln!(
+        "Rendered {} fragments ({}x{}) in {:.3}s -> {}",
+        fragments.len(),
+        opts.width,
+        opts.height,
+        t0.elapsed().as_secs_f64(),
+        args.output.display()
+    );
     Ok(())
 }
 

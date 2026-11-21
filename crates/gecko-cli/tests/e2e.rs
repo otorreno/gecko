@@ -290,6 +290,41 @@ fn e2e_compare_all_formats_gzip_align_borders_filter_stats() {
     assert_eq!(filtered_ff.fragments.len(), 1);
     assert_eq!(filtered_ff.fragments[0].strand, 'r');
 
+    // Verify --format all also emitted a valid PNG dotplot
+    let png_path = outdir.join("query-ref.png");
+    let png_bytes = fs::read(&png_path).unwrap();
+    assert_eq!(&png_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
+    // Test standalone `gecko plot` (dark mode + similarity heatmap + FASTA contig guides)
+    let custom_png = dir.join("custom_plot.png");
+    assert!(
+        Command::new(gecko_bin())
+            .args([
+                "plot",
+                csv_path.to_str().unwrap(),
+                "-o",
+                custom_png.to_str().unwrap(),
+                "--width",
+                "600",
+                "--height",
+                "600",
+                "--color",
+                "similarity",
+                "--origin",
+                "bottom-left",
+                "--dark",
+                "--query",
+                q_path.to_str().unwrap(),
+                "--reference",
+                r_path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let custom_bytes = fs::read(&custom_png).unwrap();
+    assert_eq!(&custom_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+
     // Test `gecko stats` on .frags and .gidx
     let stats_out = Command::new(gecko_bin())
         .args(["stats", frags_path.to_str().unwrap(), "--json"])

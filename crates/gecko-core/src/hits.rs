@@ -168,8 +168,7 @@ where
                         });
                         stats.raw_hits += 1;
                         if buf.len() >= max_hits_in_mem {
-                            spill_files
-                                .push(sort_dedup_and_spill(&mut buf, genome_x, genome_y, wl)?);
+                            spill_files.push(sort_and_spill_hits(&mut buf)?);
                         }
                         ay += step_y;
                     }
@@ -193,7 +192,7 @@ where
     }
 
     if !buf.is_empty() {
-        spill_files.push(sort_dedup_and_spill(&mut buf, genome_x, genome_y, wl)?);
+        spill_files.push(sort_and_spill_hits(&mut buf)?);
     }
     drop(buf);
     stats.spilled_runs = spill_files.len();
@@ -318,14 +317,8 @@ fn dedup_hits_in_place(hits: &mut Vec<Hit>, genome_x: &Genome, genome_y: &Genome
     hits.retain(|&h| state.accept(h));
 }
 
-fn sort_dedup_and_spill(
-    buf: &mut Vec<Hit>,
-    genome_x: &Genome,
-    genome_y: &Genome,
-    wl: usize,
-) -> Result<File> {
+fn sort_and_spill_hits(buf: &mut Vec<Hit>) -> Result<File> {
     parallel_radix_sort_u128_key(buf, |h| (i64_to_sortable_u64(h.diag), h.pos_x));
-    dedup_hits_in_place(buf, genome_x, genome_y, wl);
 
     let mut tmp = tempfile::tempfile()?;
     {

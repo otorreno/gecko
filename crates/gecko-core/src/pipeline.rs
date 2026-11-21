@@ -150,26 +150,34 @@ pub fn compare_genomes(
         index_k,
     };
 
-    let dict_x = load_or_build_dict(query, dict_opts, cache_dir)?;
-    let dict_y = load_or_build_dict(reference, dict_opts, cache_dir)?;
-
-    let (rev_ref, dict_y_rev) = if config.compare_reverse {
-        let rev = reference.reverse_complement();
-        let d_rev = load_or_build_dict(&rev, dict_opts, cache_dir)?;
-        (Some(rev), Some(d_rev))
-    } else {
-        (None, None)
+    let mut result = CompareResult {
+        fragments: Vec::new(),
+        coverage: CoverageMatrix::new(),
+        stats: CompareStats::default(),
     };
 
-    compare_with_dicts(
-        query,
-        &dict_x,
-        reference,
-        &dict_y,
-        rev_ref.as_ref(),
-        dict_y_rev.as_ref(),
-        config,
-    )
+    let dict_x = load_or_build_dict(query, dict_opts, cache_dir)?;
+
+    {
+        let dict_y = load_or_build_dict(reference, dict_opts, cache_dir)?;
+        run_strand(query, &dict_x, reference, &dict_y, 'f', config, &mut result)?;
+    }
+
+    if config.compare_reverse {
+        let rev_ref = reference.reverse_complement();
+        let dict_y_rev = load_or_build_dict(&rev_ref, dict_opts, cache_dir)?;
+        run_strand(
+            query,
+            &dict_x,
+            &rev_ref,
+            &dict_y_rev,
+            'r',
+            config,
+            &mut result,
+        )?;
+    }
+
+    Ok(result)
 }
 
 /// Compare two genomes using pre-built [`KmerDict`]s (ideal for all-vs-all workflows).

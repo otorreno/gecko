@@ -60,6 +60,7 @@ gecko compare chr1_human.fa.gz chr1_gorilla.fa.gz -l 100 -s 60 -k 32 -m 4G -t 16
 - `gecko align`: Extract wrapped text pairwise alignments from `.frags` or `.csv` + original FASTAs.
 - `gecko borders`: Extract flanking border alignments (`-b/--border`) and optionally emit query sequences as FASTA (`--emit-query`).
 - `gecko filter`: Re-filter `.frags` or `.csv` by minimum length and similarity into CSV, `.frags`, PAF, BLAST, BEDPE, or JSONL.
+- `gecko plot`: Render a 2D synteny matrix dotplot PNG directly from `.frags` or `.csv` (`--width`, `--height`, `--line-width`, `--color strand|similarity`, `--origin top-left|bottom-left`, `--dark`, `--query`/`--reference` for contig boundary dividers).
 - `gecko all-vs-all`: Compare every genome pair in a directory, indexing each genome only once.
 - `gecko stats`: Inspect `.frags`, `.csv`, or `.gidx` files (human-readable or `--json`).
 
@@ -72,6 +73,7 @@ gecko compare chr1_human.fa.gz chr1_gorilla.fa.gz -l 100 -s 60 -k 32 -m 4G -t 16
 - **`blast`**: BLAST tabular (`outfmt 6`) with 1-based inclusive coordinates, ungapped Karlin-Altschul E-value, and bitscore.
 - **`bedpe`**: Pairwise 0-based BEDPE synteny intervals.
 - **`jsonl`**: Structured newline-delimited JSON records.
+- **`png`**: 2D synteny matrix dotplot image with axes, gridlines, legend, and optional contig boundary dividers.
 
 ## Development & Testing
 

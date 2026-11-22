@@ -220,6 +220,95 @@ def main():
     plt.savefig(FIG_DIR / "gecko2_allvsall_resources.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
+    # =========================================================================
+    # FIGURE 4: 2-Panel Experiment 4 Ablations (4A Slab Memory + 4B WL x FL)
+    # =========================================================================
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.2, 4.7), gridspec_kw={"width_ratios": [1.0, 1.15]})
+
+    # --- Panel A: Ablation 4A (Zero-Spill Slab Memory Scaling on HS x PT chr1) ---
+    budgets = ["512M", "1G", "2G", "4G"]
+    cpu_rss = [702.7, 1019.1, 1625.8, 3111.4]
+    cu_rss  = [652.1,  652.1,  652.1,  652.1]
+    cpu_wt  = [301.53, 185.92, 121.55, 61.67]
+    cu_wt   = [5.02,     4.81,   5.08,  4.78]
+
+    xa = np.arange(len(budgets))
+    w = 0.34
+    ax1.bar(xa - w/2, cpu_rss, width=w, color="#2980b9", alpha=0.80, edgecolor="black", lw=0.5,
+            label="Rust CPU Peak RSS (MiB)")
+    ax1.bar(xa + w/2, cu_rss,  width=w, color="#27ae60", alpha=0.80, edgecolor="black", lw=0.5,
+            label="CUDA T4 Peak Host RSS (MiB)")
+    ax1.set_xticks(xa); ax1.set_xticklabels(budgets)
+    ax1.set_xlabel("Host RAM Budget (-m) on HS×PT chr1 (0 B temp disk)")
+    ax1.set_ylabel("Peak Host RSS (MiB)")
+    ax1.set_ylim(0, 3950)
+    ax1.grid(True, axis="y", alpha=0.22)
+    ax1.set_title("(A) Ablation 4A: Zero-Spill Slab Memory Scaling")
+
+    ax1_r = ax1.twinx()
+    ax1_r.plot(xa, cpu_wt, marker="o", ls="--", color="#1f618d", lw=2.0, ms=6.0, label="Rust CPU Wall (s)")
+    ax1_r.plot(xa, cu_wt,  marker="*", ls="-",  color="#1e8449", lw=2.0, ms=8.5, label="CUDA T4 Wall (s)")
+    ax1_r.set_ylabel("Wall Time (s)")
+    ax1_r.set_ylim(0, 365)
+    ax1_r.spines["top"].set_visible(False)
+
+    ax1_r.annotate("60.1× faster\n(5.02 s vs 301.5 s)", xy=(0, 5.02), xytext=(0.82, 128),
+                   fontsize=7.5, fontweight="bold", color="#1e8449",
+                   bbox=dict(boxstyle="round,pad=0.25", fc="#eafaf1", ec="#27ae60", lw=0.7),
+                   arrowprops=dict(arrowstyle="->", color="#1e8449", lw=1.0, connectionstyle="arc3,rad=-0.12"))
+    ax1.annotate("4.4× less\nCPU RSS", xy=(0 - w/2, 702.7), xytext=(0.15, 1750),
+                 fontsize=7.5, fontweight="bold", color="#1f618d",
+                 arrowprops=dict(arrowstyle="->", color="#1f618d", lw=0.9))
+
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax1_r.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper right", frameon=True, framealpha=0.92, fontsize=7.3)
+
+    # --- Panel B: Ablation 4B ((WL, FL) Sensitivity Frontier on Drosophila 2R x 3) ---
+    wls = [12, 16, 24, 32]
+    fl20_sp   = [19.99, 4.14, 3.27, 3.37]
+    fl100_sp  = [19.05, 5.33, 3.43, 3.46]
+    fl1000_sp = [15.37, 3.85, 4.04, 3.87]
+    fl20_comp = [25.27, 5.98, 5.07, 5.19]
+    hsps_hi   = ["11.0k–13.4k\nHSPs", "9.8k–11.1k\nHSPs", "5.7k–6.0k\nHSPs", "3.5k\nHSPs"]
+
+    xb = np.arange(len(wls))
+    wb = 0.25
+    b1 = ax2.bar(xb - wb, fl20_sp,   width=wb, color="#27ae60", edgecolor="black", lw=0.5, label="FL = 20 (Wall Speedup)")
+    b2 = ax2.bar(xb,      fl100_sp,  width=wb, color="#2ecc71", edgecolor="black", lw=0.5, label="FL = 100 (Wall Speedup)")
+    b3 = ax2.bar(xb + wb, fl1000_sp, width=wb, color="#1e8449", edgecolor="black", lw=0.5, label="FL = 1,000 (Wall Speedup)")
+    ax2.plot(xb - wb, fl20_comp, marker="D", ls="None", color="#d35400", ms=5.5, zorder=5,
+             label="FL = 20 Compute Speedup")
+
+    for bars, vals in [(b1, fl20_sp), (b2, fl100_sp), (b3, fl1000_sp)]:
+        for bar, v in zip(bars, vals):
+            ax2.text(bar.get_x() + bar.get_width()/2, v + 0.45, f"{v:.1f}×", ha="center", va="bottom",
+                     fontsize=7.0, fontweight="bold", color="#1c2833")
+    ax2.text(0 - wb, fl20_comp[0] + 0.65, "25.3× comp", ha="center", va="bottom",
+             fontsize=7.4, fontweight="bold", color="#d35400")
+    for i, htxt in enumerate(hsps_hi):
+        y_pos = 21.8 if i > 0 else 11.2
+        if i > 0:
+            ax2.text(i, 9.5, htxt, ha="center", va="bottom", fontsize=7.2, color="#566573",
+                     bbox=dict(boxstyle="round,pad=0.22", fc="#f8f9f9", ec="#d5d8dc", lw=0.6))
+        else:
+            ax2.text(0.55, 22.8, "WL=12: 3.8× more HSPs\n(13,389; 100.000% recall)", ha="left", va="center",
+                     fontsize=7.4, fontweight="bold", color="#1e8449",
+                     bbox=dict(boxstyle="round,pad=0.28", fc="#eafaf1", ec="#27ae60", lw=0.7))
+
+    ax2.set_xticks(xb); ax2.set_xticklabels([f"WL = {w}" for w in wls])
+    ax2.set_xlabel("Seed Word Length (D. melanogaster 2R × D. pseudoobscura 3, 20 Mb)")
+    ax2.set_ylabel("CUDA T4 Speedup over Rust CPU (×)")
+    ax2.set_ylim(0, 28.5)
+    ax2.grid(True, axis="y", alpha=0.22)
+    ax2.set_title("(B) Ablation 4B: Dense Short-Seed & Frequency-Limit Frontier")
+    ax2.legend(loc="upper right", frameon=True, framealpha=0.92, fontsize=7.4)
+
+    plt.tight_layout(pad=1.4)
+    plt.savefig(FIG_DIR / "gecko2_ablations.pdf", bbox_inches="tight")
+    plt.savefig(FIG_DIR / "gecko2_ablations.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
     print("Generated publication figures in paper/figures/:")
     for p in sorted(FIG_DIR.glob("gecko2_*")):
         print(f"  {p.name:36s} {p.stat().st_size:8,d} B")

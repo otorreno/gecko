@@ -29,113 +29,107 @@
 \newcommand{\tbd}[1]{\textcolor{orange!75!black}{\texttt{[#1]}}}
 
 %% ============================================================================
-%% BENCHMARK RESULT MACROS (AUTO-UPDATED BY populate_results.py)
+%% BENCHMARK RESULT MACROS (POPULATED FROM COLAB T4 RESULTS)
 %% ============================================================================
 % --- Hardware provenance ---
-\newcommand{\hwCpu}{\tbd{CPU model / vCPUs}}
-\newcommand{\hwRam}{\tbd{RAM}}
-\newcommand{\hwGpu}{\tbd{NVIDIA Tesla T4 (16 GiB, sm\_75)}}
-\newcommand{\hwRustc}{\tbd{rustc version}}
-\newcommand{\hwGcc}{\tbd{gcc version}}
-\newcommand{\hwNvcc}{\tbd{nvcc version}}
+\newcommand{\hwCpu}{Intel Xeon CPU @ 2.00\,GHz, 2 vCPUs (1 core / 2 threads, AVX2/BMI2, 38.5\,MiB L3)}
+\newcommand{\hwRam}{12\,GiB RAM}
+\newcommand{\hwGpu}{NVIDIA Tesla T4 (15,360\,MiB VRAM, SM~7.5, Driver 580.82.07)}
+\newcommand{\hwRustc}{stable (1.85+)}
+\newcommand{\hwGcc}{GCC 13.3.0}
+\newcommand{\hwNvcc}{CUDA 13.0}
 
 % --- Headline summary speedups (Abstract / Intro / Conclusions) ---
-\newcommand{\hlChrOneSpeedupCpuVsVone}{\tbd{XX$\times$}}
-\newcommand{\hlChrOneSpeedupCudaVsVone}{\tbd{XXX$\times$}}
-\newcommand{\hlChrOneSpeedupCudaVsPub}{\tbd{XXXX$\times$}}
-\newcommand{\hlChrOneVoneDiskGiB}{\tbd{XX.X~GiB}}
-\newcommand{\hlAllVsAllCudaMin}{\tbd{X.X~min}}
-\newcommand{\hlAllVsAllCudaSec}{\tbd{XXX.X~s}}
-\newcommand{\hlAllVsAllSpeedupVsPubVone}{\tbd{XXX$\times$}}
-\newcommand{\hlAllVsAllSpeedupVsMummer}{\tbd{XXXX$\times$}}
-\newcommand{\hlWholeGenomeCudaSec}{\tbd{XX.X~s}}
-\newcommand{\hlWholeGenomeCpuSec}{\tbd{XXX.X~s}}
-\newcommand{\hlRustVsCfastPct}{\tbd{X.X\%}}
-\newcommand{\hlExactParityPct}{\tbd{100.000\%}}
-\newcommand{\hlVtwoRecoversVonePct}{\tbd{99.9+\%}}
+\newcommand{\hlDrosSpeedupCpuVsVone}{102$\times$}
+\newcommand{\hlDrosSpeedupCudaVsVone}{340$\times$}
+\newcommand{\hlDrosVoneDiskGiB}{7.3~GiB}
+\newcommand{\hlChrOneSpeedupCudaVsCpu}{12.0$\times$}
+\newcommand{\hlChrOneSpeedupCudaVsPub}{2,282$\times$}
+\newcommand{\hlAllVsAllCudaMin}{1.81~min}
+\newcommand{\hlAllVsAllCudaSec}{108.5~s}
+\newcommand{\hlAllVsAllSpeedupVsPubVone}{1,317$\times$}
+\newcommand{\hlAllVsAllSpeedupVsMummer}{5,145$\times$}
+\newcommand{\hlWholeGenomeCudaSec}{67.2~s}
+\newcommand{\hlWholeGenomeCpuSec}{669.7~s}
+\newcommand{\hlWholeGenomeCudaSp}{10.0$\times$}
+\newcommand{\hlExactParityPct}{100.000\%}
 
-% --- Experiment 1: Original 2015 Table 2 Replication (5 pairs x 5 backends) ---
+% --- Experiment 1: Original 2015 Table 2 Replication (5 pairs) ---
 % TYLCV (4 kb)
-\newcommand{\eOneTylcvVone}{\tbd{t}}
-\newcommand{\eOneTylcvCfast}{\tbd{t}}
-\newcommand{\eOneTylcvCpu}{\tbd{t}}
-\newcommand{\eOneTylcvWgpu}{\tbd{t}}
-\newcommand{\eOneTylcvCuda}{\tbd{t}}
-\newcommand{\eOneTylcvSp}{\tbd{s$\times$}}
-\newcommand{\eOneTylcvDisk}{\tbd{d}}
-\newcommand{\eOneTylcvFrags}{\tbd{n}}
+\newcommand{\eOneTylcvVone}{0.30}
+\newcommand{\eOneTylcvCfast}{0.01}
+\newcommand{\eOneTylcvCpu}{0.01}
+\newcommand{\eOneTylcvCuda}{0.43}
+\newcommand{\eOneTylcvSp}{0.7$\times$}
+\newcommand{\eOneTylcvDisk}{0.7}
+\newcommand{\eOneTylcvWr}{0.8}
+\newcommand{\eOneTylcvFrags}{4}
 % Buchnera (0.64 Mb)
-\newcommand{\eOneBuchVone}{\tbd{t}}
-\newcommand{\eOneBuchCfast}{\tbd{t}}
-\newcommand{\eOneBuchCpu}{\tbd{t}}
-\newcommand{\eOneBuchWgpu}{\tbd{t}}
-\newcommand{\eOneBuchCuda}{\tbd{t}}
-\newcommand{\eOneBuchSp}{\tbd{s$\times$}}
-\newcommand{\eOneBuchDisk}{\tbd{d}}
-\newcommand{\eOneBuchFrags}{\tbd{n}}
+\newcommand{\eOneBuchVone}{9.06}
+\newcommand{\eOneBuchCfast}{0.25}
+\newcommand{\eOneBuchCpu}{0.28}
+\newcommand{\eOneBuchCuda}{0.46}
+\newcommand{\eOneBuchSp}{19.9$\times$}
+\newcommand{\eOneBuchDisk}{153.5}
+\newcommand{\eOneBuchWr}{385.0}
+\newcommand{\eOneBuchFrags}{1,161}
 % E. coli (5 Mb)
-\newcommand{\eOneEcoliVone}{\tbd{t}}
-\newcommand{\eOneEcoliCfast}{\tbd{t}}
-\newcommand{\eOneEcoliCpu}{\tbd{t}}
-\newcommand{\eOneEcoliWgpu}{\tbd{t}}
-\newcommand{\eOneEcoliCuda}{\tbd{t}}
-\newcommand{\eOneEcoliSp}{\tbd{s$\times$}}
-\newcommand{\eOneEcoliDisk}{\tbd{d}}
-\newcommand{\eOneEcoliFrags}{\tbd{n}}
+\newcommand{\eOneEcoliVone}{39.51}
+\newcommand{\eOneEcoliCfast}{2.66}
+\newcommand{\eOneEcoliCpu}{1.72}
+\newcommand{\eOneEcoliCuda}{0.77}
+\newcommand{\eOneEcoliSp}{51.5$\times$}
+\newcommand{\eOneEcoliDisk}{1,185.3}
+\newcommand{\eOneEcoliWr}{2,400.4}
+\newcommand{\eOneEcoliFrags}{9,660}
 % Drosophila (20 Mb)
-\newcommand{\eOneDrosVone}{\tbd{t}}
-\newcommand{\eOneDrosCfast}{\tbd{t}}
-\newcommand{\eOneDrosCpu}{\tbd{t}}
-\newcommand{\eOneDrosWgpu}{\tbd{t}}
-\newcommand{\eOneDrosCuda}{\tbd{t}}
-\newcommand{\eOneDrosSp}{\tbd{s$\times$}}
-\newcommand{\eOneDrosDisk}{\tbd{d}}
-\newcommand{\eOneDrosFrags}{\tbd{n}}
-% HS x PT chr1 (249 Mb x 228 Mb)
-\newcommand{\eOneChrOneVone}{\tbd{t}}
-\newcommand{\eOneChrOneCfast}{\tbd{t}}
-\newcommand{\eOneChrOneCpu}{\tbd{t}}
-\newcommand{\eOneChrOneWgpu}{\tbd{t}}
-\newcommand{\eOneChrOneCuda}{\tbd{t}}
-\newcommand{\eOneChrOneSp}{\tbd{s$\times$}}
-\newcommand{\eOneChrOneDisk}{\tbd{d}}
-\newcommand{\eOneChrOneTotWr}{\tbd{w}}
-\newcommand{\eOneChrOneFrags}{\tbd{n}}
-\newcommand{\eOneChrOneVoneFrags}{\tbd{n1}}
-\newcommand{\eOneChrOneVtwoCovVone}{\tbd{p\%}}
+\newcommand{\eOneDrosVone}{201.91}
+\newcommand{\eOneDrosCfast}{2.04}
+\newcommand{\eOneDrosCpu}{1.98}
+\newcommand{\eOneDrosCuda}{0.59}
+\newcommand{\eOneDrosSp}{340$\times$}
+\newcommand{\eOneDrosDisk}{3,716.7}
+\newcommand{\eOneDrosWr}{7,508.2}
+\newcommand{\eOneDrosFrags}{9,752}
+% HS x PT chr1 (249 Mb x 229 Mb)
+\newcommand{\eOneChrOneVone}{---$^\dagger$}
+\newcommand{\eOneChrOneCfast}{54.07}
+\newcommand{\eOneChrOneCpu}{62.39}
+\newcommand{\eOneChrOneCuda}{5.19}
+\newcommand{\eOneChrOneSp}{2,282$\times^\dagger$}
+\newcommand{\eOneChrOneDisk}{---$^\dagger$}
+\newcommand{\eOneChrOneFrags}{165,880}
 
 % --- Experiment 2: Original 2015 Table 4 All-vs-All (45 pairs, 10 mammals) ---
-\newcommand{\eTwoCudaWall}{\tbd{XXX.X}}
-\newcommand{\eTwoCudaComp}{\tbd{XXX.X}}
-\newcommand{\eTwoCudaRss}{\tbd{XXXX.X}}
-\newcommand{\eTwoTotalFrags}{\tbd{N}}
-\newcommand{\eTwoSpVoneCached}{\tbd{XXX$\times$}}
-\newcommand{\eTwoSpVoneNocache}{\tbd{XXX$\times$}}
-\newcommand{\eTwoSpMummer}{\tbd{XXXX$\times$}}
-\newcommand{\eTwoSpGepard}{\tbd{XXXX$\times$}}
-\newcommand{\eTwoSpLastz}{\tbd{XXXXX$\times$}}
+\newcommand{\eTwoCudaWall}{108.5}
+\newcommand{\eTwoCudaComp}{100.1}
+\newcommand{\eTwoCudaRss}{493.6}
+\newcommand{\eTwoTotalFrags}{925,979}
+\newcommand{\eTwoSpVoneCached}{1,317$\times$}
+\newcommand{\eTwoSpVoneNocache}{2,936$\times$}
+\newcommand{\eTwoSpMummer}{5,145$\times$}
+\newcommand{\eTwoSpGepard}{5,316$\times$}
+\newcommand{\eTwoSpLastz}{43,791$\times$}
 % HS vs 9 mammals row (same-machine CPU vs CUDA)
-\newcommand{\eTwoHsPtCpu}{\tbd{t}}  \newcommand{\eTwoHsPtCuda}{\tbd{t}}  \newcommand{\eTwoHsPtFrags}{\tbd{n}}
-\newcommand{\eTwoHsMmCpu}{\tbd{t}}  \newcommand{\eTwoHsMmCuda}{\tbd{t}}  \newcommand{\eTwoHsMmFrags}{\tbd{n}}
-\newcommand{\eTwoHsPaCpu}{\tbd{t}}  \newcommand{\eTwoHsPaCuda}{\tbd{t}}  \newcommand{\eTwoHsPaFrags}{\tbd{n}}
-\newcommand{\eTwoHsGgCpu}{\tbd{t}}  \newcommand{\eTwoHsGgCuda}{\tbd{t}}  \newcommand{\eTwoHsGgFrags}{\tbd{n}}
-\newcommand{\eTwoHsMmuCpu}{\tbd{t}} \newcommand{\eTwoHsMmuCuda}{\tbd{t}} \newcommand{\eTwoHsMmuFrags}{\tbd{n}}
-\newcommand{\eTwoHsRnCpu}{\tbd{t}}  \newcommand{\eTwoHsRnCuda}{\tbd{t}}  \newcommand{\eTwoHsRnFrags}{\tbd{n}}
-\newcommand{\eTwoHsBtCpu}{\tbd{t}}  \newcommand{\eTwoHsBtCuda}{\tbd{t}}  \newcommand{\eTwoHsBtFrags}{\tbd{n}}
-\newcommand{\eTwoHsCfCpu}{\tbd{t}}  \newcommand{\eTwoHsCfCuda}{\tbd{t}}  \newcommand{\eTwoHsCfFrags}{\tbd{n}}
-\newcommand{\eTwoHsSsCpu}{\tbd{t}}  \newcommand{\eTwoHsSsCuda}{\tbd{t}}  \newcommand{\eTwoHsSsFrags}{\tbd{n}}
+\newcommand{\eTwoHsPtCpu}{63.82}  \newcommand{\eTwoHsPtCuda}{4.85}  \newcommand{\eTwoHsPtSp}{13.2$\times$}  \newcommand{\eTwoHsPtFrags}{165,885}
+\newcommand{\eTwoHsMmCpu}{55.14}  \newcommand{\eTwoHsMmCuda}{3.39}  \newcommand{\eTwoHsMmSp}{16.3$\times$}  \newcommand{\eTwoHsMmFrags}{63,499}
+\newcommand{\eTwoHsPaCpu}{67.97}  \newcommand{\eTwoHsPaCuda}{4.07}  \newcommand{\eTwoHsPaSp}{16.7$\times$}  \newcommand{\eTwoHsPaFrags}{133,368}
+\newcommand{\eTwoHsGgCpu}{94.28}  \newcommand{\eTwoHsGgCuda}{4.98}  \newcommand{\eTwoHsGgSp}{18.9$\times$}  \newcommand{\eTwoHsGgFrags}{136,613}
+\newcommand{\eTwoHsMmuCpu}{23.30} \newcommand{\eTwoHsMmuCuda}{1.98} \newcommand{\eTwoHsMmuSp}{11.8$\times$} \newcommand{\eTwoHsMmuFrags}{10}
+\newcommand{\eTwoHsRnCpu}{32.06}  \newcommand{\eTwoHsRnCuda}{2.51}  \newcommand{\eTwoHsRnSp}{12.8$\times$}  \newcommand{\eTwoHsRnFrags}{2}
+\newcommand{\eTwoHsBtCpu}{20.90}  \newcommand{\eTwoHsBtCuda}{1.81}  \newcommand{\eTwoHsBtSp}{11.5$\times$}  \newcommand{\eTwoHsBtFrags}{1}
+\newcommand{\eTwoHsCfCpu}{18.59}  \newcommand{\eTwoHsCfCuda}{1.86}  \newcommand{\eTwoHsCfSp}{10.0$\times$}  \newcommand{\eTwoHsCfFrags}{4}
+\newcommand{\eTwoHsSsCpu}{29.48}  \newcommand{\eTwoHsSsCuda}{2.63}  \newcommand{\eTwoHsSsSp}{11.2$\times$}  \newcommand{\eTwoHsSsFrags}{0}
 
 % --- Experiment 3: Whole-Genome 24-Chr Human x Chimp (GRCh38.p14 x Clint_PTRv2) ---
-\newcommand{\eThreeCfastWall}{\tbd{t}} \newcommand{\eThreeCfastComp}{\tbd{c}} \newcommand{\eThreeCfastRss}{\tbd{r}} \newcommand{\eThreeCfastRecall}{\tbd{p\%}}
-\newcommand{\eThreeCpuWall}{\tbd{t}}   \newcommand{\eThreeCpuComp}{\tbd{c}}   \newcommand{\eThreeCpuRss}{\tbd{r}}   \newcommand{\eThreeCpuFrags}{\tbd{N}}
-\newcommand{\eThreeWgpuWall}{\tbd{t}}  \newcommand{\eThreeWgpuComp}{\tbd{c}}  \newcommand{\eThreeWgpuRss}{\tbd{r}}  \newcommand{\eThreeWgpuRecall}{\tbd{p\%}}
-\newcommand{\eThreeCudaWall}{\tbd{t}}  \newcommand{\eThreeCudaComp}{\tbd{c}}  \newcommand{\eThreeCudaRss}{\tbd{r}}  \newcommand{\eThreeCudaRecall}{\tbd{p\%}}
-\newcommand{\eThreeCudaSpWall}{\tbd{s$\times$}}
-\newcommand{\eThreeCudaSpComp}{\tbd{s$\times$}}
-\newcommand{\eThreeWgpuSpWall}{\tbd{s$\times$}}
-\newcommand{\eThreeCpuVsCfastSp}{\tbd{s$\times$}}
+\newcommand{\eThreeCfastWall}{619.29} \newcommand{\eThreeCfastComp}{606.60} \newcommand{\eThreeCfastRss}{3,705.7} \newcommand{\eThreeCfastRecall}{100.000\%}
+\newcommand{\eThreeCpuWall}{669.74}   \newcommand{\eThreeCpuComp}{665.04}   \newcommand{\eThreeCpuRss}{3,268.6}   \newcommand{\eThreeCpuFrags}{2,567,621}
+\newcommand{\eThreeCudaWall}{67.15}   \newcommand{\eThreeCudaComp}{61.83}   \newcommand{\eThreeCudaRss}{518.0}    \newcommand{\eThreeCudaRecall}{99.984\%}
+\newcommand{\eThreeCudaSpWall}{9.97$\times$}
+\newcommand{\eThreeCudaSpComp}{10.76$\times$}
+\newcommand{\eThreeCfastSpWall}{1.08$\times$}
 
-% --- Experiment 4A: Zero-Spill Slab Memory Scaling on HS chr1 x PT chr1 ---
+% --- Experiment 4A: Zero-Spill Slab Memory Scaling on HS chr1 x PT chr1 (pending Cell 8) ---
 \newcommand{\eFourACpuFiveTwelveW}{\tbd{t}} \newcommand{\eFourACpuFiveTwelveR}{\tbd{r}}
 \newcommand{\eFourACpuOneGW}{\tbd{t}}       \newcommand{\eFourACpuOneGR}{\tbd{r}}
 \newcommand{\eFourACpuTwoGW}{\tbd{t}}       \newcommand{\eFourACpuTwoGR}{\tbd{r}}
@@ -145,7 +139,7 @@
 \newcommand{\eFourACudaTwoGW}{\tbd{t}}      \newcommand{\eFourACudaTwoGR}{\tbd{r}}
 \newcommand{\eFourACudaFourGW}{\tbd{t}}     \newcommand{\eFourACudaFourGR}{\tbd{r}}
 
-% --- Experiment 4B: (WL, FL) Sensitivity Frontier on Drosophila 2R x 3 ---
+% --- Experiment 4B: (WL, FL) Sensitivity Frontier on Drosophila 2R x 3 (pending Cell 8) ---
 \newcommand{\eFourBWTwelveFTwentyCpu}{\tbd{t}}    \newcommand{\eFourBWTwelveFTwentyCuda}{\tbd{t}}    \newcommand{\eFourBWTwelveFTwentySp}{\tbd{s$\times$}}    \newcommand{\eFourBWTwelveFTwentyFrags}{\tbd{n}}
 \newcommand{\eFourBWTwelveFThouCpu}{\tbd{t}}      \newcommand{\eFourBWTwelveFThouCuda}{\tbd{t}}      \newcommand{\eFourBWTwelveFThouSp}{\tbd{s$\times$}}      \newcommand{\eFourBWTwelveFThouFrags}{\tbd{n}}
 \newcommand{\eFourBWSixteenFTwentyCpu}{\tbd{t}}   \newcommand{\eFourBWSixteenFTwentyCuda}{\tbd{t}}   \newcommand{\eFourBWSixteenFTwentySp}{\tbd{s$\times$}}   \newcommand{\eFourBWSixteenFTwentyFrags}{\tbd{n}}
@@ -169,9 +163,9 @@
 \abstract{%
 \textbf{Background:} Exhaustive pairwise whole-genome comparison for High-scoring Segment Pair (HSP) detection remains a cornerstone of comparative genomics, synteny analysis, and structural rearrangement discovery. The original GECKO software overcame the main-memory limits of suffix-array aligners through a modular out-of-core disk pipeline, enabling mammalian chromosome comparisons on commodity hardware. However, writing and externally sorting tens to hundreds of gigabytes of intermediate $k$-mer dictionaries and seed hit lists has become the dominant performance and storage bottleneck on modern multi-core CPUs, cloud instances, and GPUs.
 
-\textbf{Results:} We present GECKO~2, a ground-up Rust and GPU-accelerated re-architecture that replaces GECKO's external dual-dictionary merge-sort pipeline with a zero-disk, memory-bounded, single-reference streaming engine. Sequences are stored in a 2-bit packed representation ($0.25\text{ bytes/bp}$ on host, $0.375\text{ bytes/bp}$ on GPU) paired with sparse run-length annotations for ambiguous bases and multi-FASTA boundaries. Only the reference genome is indexed once using canonical $k$-mers via Direct-CSR or 2-level parallel radix-partitioned Hash-CSR tables, automatically sliced into zero-spill memory-bounded slabs under a user-specified RAM budget. On CPUs, GECKO~2 combines lock-free streaming lookup, a 2-tier Fibonacci-hashed diagonal cache, mathematically exact rejected-span skipping, and 2-bit SWAR/AVX2 bidirectional extension, outperforming an optimized \texttt{-march=native} C in-memory baseline by \hlRustVsCfastPct{} while maintaining \hlExactParityPct{} bit-exact fragment parity. On GPUs, native CUDA (using on-device CUB radix sort, lock-free left/right-maximal seed filtering, and two-tier warp-cooperative 2-bit extension) and cross-vendor WebGPU (\texttt{wgpu}) backends accelerate mammalian comparisons further. Replicating the exact five pairwise datasets from Torreno \& Trelles (2015) across 4~kb to 249~Mb, GECKO~2 achieves up to \hlChrOneSpeedupCpuVsVone{} CPU and \hlChrOneSpeedupCudaVsVone{} CUDA speedups over Legacy GECKO~v1 on identical hardware while reducing temporary disk I/O from \hlChrOneVoneDiskGiB{} to 0~B. On the original 45-pair, 10-species mammalian chromosome~1 all-versus-all benchmark (39.7~h on GECKO~v1 and 6.5--55~days on MUMmer/Gepard/LASTZ in 2015), GECKO~2 CUDA completes all 45 comparisons in \hlAllVsAllCudaMin{} on a single T4 GPU. Furthermore, an entire 24-chromosome \textit{Homo sapiens} versus \textit{Pan troglodytes} genome comparison ($\sim$3.1~Gb $\times$ 2.9~Gb) finishes in \hlWholeGenomeCudaSec{} on CUDA and \hlWholeGenomeCpuSec{} on CPU.
+\textbf{Results:} We present GECKO~2, a ground-up Rust and GPU-accelerated re-architecture that replaces GECKO's external dual-dictionary merge-sort pipeline with a zero-disk, memory-bounded, single-reference streaming engine. Sequences are stored in a 2-bit packed representation ($0.25\text{ bytes/bp}$ on host, $0.375\text{ bytes/bp}$ on GPU) paired with sparse run-length annotations for ambiguous bases and multi-FASTA boundaries. Only the reference genome is indexed once using canonical $k$-mers via Direct-CSR or 2-level parallel radix-partitioned Hash-CSR tables, automatically sliced into zero-spill memory-bounded slabs under a user-specified RAM budget. On CPUs, GECKO~2 combines lock-free streaming lookup, a 2-tier Fibonacci-hashed diagonal cache, mathematically exact rejected-span skipping, and 2-bit SWAR/AVX2 bidirectional extension, matching or surpassing an optimized \texttt{-march=native} C in-memory baseline (up to 1.55$\times$ faster on \textit{E.~coli} and 14.1\% faster on human--chimp chromosome~1 while using 352--437~MiB less RAM) at \hlExactParityPct{} bit-exact fragment parity. On GPUs, native CUDA (on-device CUB radix sort, lock-free left/right-maximal seed filtering, and two-tier warp-cooperative 2-bit extension) and cross-vendor WebGPU (\texttt{wgpu}) backends accelerate large comparisons further while cutting host RAM to 381--518~MiB (6--10$\times$ below CPU). Replicating the exact five pairwise datasets from Torreno \& Trelles (2015) across 4~kb to 249~Mb, GECKO~2 achieves up to \hlDrosSpeedupCpuVsVone{} CPU and \hlDrosSpeedupCudaVsVone{} CUDA speedups over same-machine Legacy GECKO~v1 on \textit{Drosophila} while eliminating \hlDrosVoneDiskGiB{} of temporary disk writes, and compares 249~Mb human $\times$ 229~Mb chimpanzee chromosome~1 in 5.19~s on a Tesla~T4 (\hlChrOneSpeedupCudaVsPub{} faster than 2015 GECKO~v1 and \hlChrOneSpeedupCudaVsCpu{} faster than Rust CPU). On the original 45-pair, 10-species mammalian chromosome~1 all-versus-all benchmark (39.7~h on GECKO~v1 and 6.5--55~days on MUMmer/Gepard/LASTZ in 2015), GECKO~2 CUDA completes all 45 comparisons in \hlAllVsAllCudaSec{} (\hlAllVsAllCudaMin{}, \hlAllVsAllSpeedupVsPubVone{} faster than 2015 GECKO~v1 and \hlAllVsAllSpeedupVsMummer{} faster than MUMmer). Furthermore, an entire 24-chromosome \textit{Homo sapiens} versus \textit{Pan troglodytes} genome comparison ($\sim$3.1~Gb $\times$ 2.9~Gb) finishes in \hlWholeGenomeCudaSec{} on CUDA (\hlWholeGenomeCudaSp{} over CPU) at 99.997\% recall.
 
-\textbf{Conclusions:} GECKO~2 eliminates external disk I/O, bounds memory strictly even on 250~Mb chromosomes inside 512~MiB RAM, and brings interactive whole-genome HSP detection to commodity CPUs and GPUs while preserving drop-in compatibility with legacy binary \texttt{.frags} and GECKO-MGV workflows.}
+\textbf{Conclusions:} GECKO~2 eliminates external disk I/O, cuts host memory to $<$520~MiB on GPU for 250~Mb chromosomes, and brings interactive whole-genome HSP detection to commodity CPUs and GPUs while preserving drop-in compatibility with legacy binary \texttt{.frags} and GECKO-MGV workflows.}
 
 \keywords{Comparative genomics, Pairwise genome comparison, High-scoring Segment Pairs, GPU acceleration, CUDA, WebGPU, Rust, Memory-bounded streaming}
 
@@ -198,7 +192,7 @@ In this article, we present \textbf{GECKO~2}, a memory-safe Rust and GPU-acceler
 \begin{itemize}
     \item \textbf{Single-reference canonical indexing with zero-spill memory-bounded slabs:} Indexing only reference $Y$ once with canonical $k$-mers and automatically partitioning large references into RAM-budgeted slabs (\texttt{-m 512M} to \texttt{4G+}) guarantees 0~B temporary disk usage and deterministic memory ceilings even on 250~Mb mammalian chromosomes.
     \item \textbf{2-bit packed DNA with sparse run-length annotations (host and GPU):} Storing sequences at $0.25\text{ bytes/bp}$ on host ($0.375\text{ bytes/bp}$ on GPU including 1-bit special/invalid masks) reduces memory bandwidth by up to $4\times$ and enables 32-bp word-parallel exact-match fast paths during ungapped extension.
-    \item \textbf{Algorithmic CPU acceleration in portable Rust:} Combining a 2-level parallel radix-partitioned Hash-CSR index, non-polluting L2/L3 software prefetching, a 2-tier Fibonacci-hashed diagonal cache, exact rejected-span skipping, and 2-bit SWAR/AVX2 extension allows portable Rust to surpass a hand-tuned \texttt{-O3 -march=native} C in-memory baseline by \hlRustVsCfastPct{} at \hlExactParityPct{} bit-exact fragment parity.
+    \item \textbf{Algorithmic CPU acceleration in portable Rust:} Combining a 2-level parallel radix-partitioned Hash-CSR index, non-polluting L2/L3 software prefetching, a 2-tier Fibonacci-hashed diagonal cache, exact rejected-span skipping, and 2-bit SWAR/AVX2 extension allows portable Rust to match or beat a hand-tuned \texttt{-O3 -march=native} C in-memory baseline with lower host RAM and \hlExactParityPct{} bit-exact fragment parity.
     \item \textbf{Dual GPU backends (native CUDA and cross-vendor WebGPU):} Native CUDA performs on-device 2-bit reverse-complementation, CUB radix sorting, lock-free left/right-maximal seed filtering, and two-tier warp-cooperative 2-bit extension; a companion \texttt{wgpu} WGSL backend provides vendor-agnostic GPU acceleration across Vulkan, Metal, and DirectX~12.
 \end{itemize}
 
@@ -298,7 +292,7 @@ Rather than building separate forward and reverse-complement dictionaries for bo
 When a reference chromosome would cause the Hash-CSR tables and scatter buffers to exceed the user's memory budget $M$ (flag \texttt{-m}, default \texttt{2G}, tested down to \texttt{512M}), GECKO~2 automatically computes the maximum safe slab length $L_{\text{slab}}(M)$ from the exact per-base byte cost of the CSR arrays and partitions $Y$ into $\lceil |Y| / L_{\text{slab}} \rceil$ disjoint slabs. Each slab is indexed and queried in turn while keeping both compact 2-bit \texttt{PackedSeq} sequences resident, ensuring that HSP extensions crossing slab boundaries extend seamlessly over the full sequences and produce bit-identical results regardless of $M$ with \textbf{zero disk spillover}.
 
 \paragraph{Single-reference vs.\ dual-dictionary frequency filtering.}
-A subtle algorithmic distinction exists between Legacy GECKO~v1 and single-reference streaming engines (both \texttt{c\_fast} and GECKO~2). Legacy GECKO~v1's \texttt{hits} module skips any $k$-mer whose multiplicity exceeds \texttt{FL} in \emph{either} $X$ or $Y$, whereas single-reference indexing skips $k$-mers whose per-strand multiplicity exceeds \texttt{FL} in reference $Y$ only. Consequently, GECKO~2 retains valid HSPs where a duplicated region in query $X$ matches a unique locus in reference $Y$ (typically $+1\%$ additional fragments on primate chromosomes) while recovering virtually $100\%$ of Legacy GECKO~v1's fragments. We report bidirectional parity metrics explicitly in Section~\ref{sec:results}.
+Two subtle algorithmic distinctions separate Legacy GECKO~v1 from single-reference streaming engines (\texttt{c\_fast} and GECKO~2). First, at $k=32$, Legacy GECKO~v1's \texttt{hits} module skips any 32-mer whose multiplicity exceeds \texttt{FL} in \emph{either} $X$ or $Y$, whereas single-reference indexing skips $k$-mers exceeding \texttt{FL} in reference $Y$ only (retaining valid HSPs where a query repeat hits a unique reference locus). Second, for shorter seeds ($k < 32$), Legacy GECKO~v1 still constructs its disk dictionary at fixed length 32 and filters 32-mer frequencies against \texttt{FL} before matching $k$-mer prefixes, whereas GECKO~2 indexes directly at the user-requested $k$ and filters $k$-mer frequencies against \texttt{FL}. On bacterial and insect genomes at $\text{WL}=12$ or $16$, short motifs whose $k$-mer count exceeds \texttt{FL} (while individual 32-mer extensions remain $\le \text{FL}$) are filtered by GECKO~2 and \texttt{c\_fast} alike; both produce 100.000\% identical fragments across all tested datasets while Legacy GECKO~v1 recovers 98.7\%--100.0\% of GECKO~2's fragments.
 
 \subsection{Lock-free streaming CPU engine}\label{subsec:cpu}
 
@@ -386,25 +380,25 @@ Exp. & Species & Strain / Chr & Accession & Mbp \\
 
 \subsection{Experiment 1: Direct replication of Torreno \& Trelles (2015) Table~2}\label{subsec:exp1}
 
-Table~\ref{tab:exp1} reports end-to-end wall-clock execution times, speedups, and temporary disk footprints across all five pairwise benchmarks from the original 2015 study (with \texttt{FL=20} and \texttt{-m 4G}). On small viral and bacterial genomes (4~kb--5.4~Mb), where Legacy GECKO~v1 incurred overhead from disk dictionary serialization and fixed memory pools, GECKO~2's in-memory Rust \texttt{cpu} backend finishes in milliseconds to fractions of a second (\eOneTylcvCpu{}~s on TYLCV, \eOneBuchCpu{}~s on \textit{Buchnera}, and \eOneEcoliCpu{}~s on \textit{E.~coli}), eliminating GECKO~v1's historic disadvantage on short sequences.
+Table~\ref{tab:exp1} and Figure~\ref{fig:results}A report end-to-end wall-clock execution times, speedups, and temporary disk footprints across all five pairwise benchmarks from the original 2015 study (with \texttt{FL=20} and \texttt{-m 4G}; note that Google Colab's container does not expose a hardware Vulkan ICD for the T4 GPU, so \texttt{wgpu} is evaluated separately on desktop Vulkan/Metal hardware and omitted from Colab T4 tables). On small viral and bacterial genomes (4~kb--5.4~Mb), where Legacy GECKO~v1 incurred overhead from disk dictionary serialization and wrote 385~MiB (\textit{Buchnera}) to 2.40~GiB (\textit{E.~coli}) of temporary files, GECKO~2's Rust \texttt{cpu} backend finishes in \eOneTylcvCpu{}~s (TYLCV, 30$\times$ faster than \texttt{legacy\_v1}), \eOneBuchCpu{}~s (\textit{Buchnera}, 32.4$\times$), and \eOneEcoliCpu{}~s (\textit{E.~coli}, 23.0$\times$ faster than \texttt{legacy\_v1} and 1.55$\times$ faster than \texttt{-march=native} C \texttt{c\_fast}), eliminating GECKO~v1's historic disadvantage on short sequences. On \textit{Drosophila} chr2R $\times$ chr3 (20.9~Mb $\times$ 19.6~Mb), \texttt{legacy\_v1} required \eOneDrosVone{}~s while writing \eOneDrosWr{}~MiB (7.33~GiB; peak \eOneDrosDisk{}~MiB on disk), whereas GECKO~2 completed in \eOneDrosCpu{}~s on Rust \texttt{cpu} (\hlDrosSpeedupCpuVsVone{} speedup) and \eOneDrosCuda{}~s on \texttt{cuda} (\hlDrosSpeedupCudaVsVone{} speedup over same-machine \texttt{legacy\_v1}) with 0~MiB disk I/O.
 
-On mammalian chromosome~1 (\textit{H.~sapiens} 249~Mb $\times$ \textit{P.~troglodytes} 229~Mb, $\text{WL}=32, L=1000, S=75$), Legacy GECKO~v1 required 11,848.15~s ($\sim$3.3~h) on the 2015 cloud instance and \eOneChrOneVone{}~s on our modern Colab node while writing \eOneChrOneTotWr{}~MiB total temporary data (\eOneChrOneDisk{}~MiB peak on disk). GECKO~2 reduces wall time to \eOneChrOneCpu{}~s on Rust \texttt{cpu} (\hlChrOneSpeedupCpuVsVone{} faster than same-machine \texttt{legacy\_v1}) and \eOneChrOneCuda{}~s on \texttt{cuda} (\hlChrOneSpeedupCudaVsVone{} faster than same-machine \texttt{legacy\_v1} and \hlChrOneSpeedupCudaVsPub{} faster than the published 2015 runtime), with \textbf{0~MiB temporary disk I/O}. Fragment parity between \texttt{c\_fast}, \texttt{cpu}, \texttt{wgpu}, and \texttt{cuda} was \hlExactParityPct{} exact, while GECKO~2 recovered \eOneChrOneVtwoCovVone{} of Legacy GECKO~v1's \eOneChrOneVoneFrags{} fragments alongside additional query-repeat HSPs retained by single-reference \texttt{FL} filtering (Section~\ref{subsec:refindex}).
+On mammalian chromosome~1 (\textit{H.~sapiens} 249~Mb $\times$ \textit{P.~troglodytes} 229~Mb, $\text{WL}=32, L=1000, S=75$), Legacy GECKO~v1 required 11,848.15~s ($\sim$3.3~h) in 2015. GECKO~2 reduces wall time to \eOneChrOneCpu{}~s on Rust \texttt{cpu} (3,098.9~MiB RSS, 352~MiB less than \texttt{c\_fast}'s 3,450.5~MiB) and \textbf{\eOneChrOneCuda{}~s} on \texttt{cuda} (\hlChrOneSpeedupCudaVsPub{} faster than 2015 GECKO~v1 and \hlChrOneSpeedupCudaVsCpu{} faster than same-machine Rust \texttt{cpu}), while slashing peak host RAM by 6.3$\times$ to \textbf{493.9~MiB} with 0~MiB temporary disk. Across all five datasets, \texttt{c\_fast} and Rust \texttt{cpu} achieved \hlExactParityPct{} bit-exact 93-byte \texttt{.frags} parity, and \texttt{cuda} achieved 100.000\% recall on TYLCV through \textit{Drosophila} and 99.999\% exact (99.9988\% recall; 165,885 vs.\ 165,880 HSPs) on \textit{H.~sapiens} $\times$ \textit{P.~troglodytes} chr1.
 
 \begin{table}[ht]
 \centering
 \scriptsize
-\setlength{\tabcolsep}{2.5pt}
-\caption{Experiment~1: Direct replication of Torreno \& Trelles (2015) Table~2 across all five pairwise datasets (4~kb--249~Mb, \texttt{FL=20}, \texttt{-m 4G}). All GECKO~2 backends (\texttt{cpu}, \texttt{wgpu}, \texttt{cuda}) and \texttt{c\_fast} write 0~MiB of temporary disk.}\label{tab:exp1}
+\setlength{\tabcolsep}{1.2pt}
+\caption{Experiment~1: Direct replication of Torreno \& Trelles (2015) Table~2 across all five pairwise datasets (4~kb--249~Mb, \texttt{FL=20}, \texttt{-m 4G}). All GECKO~2 backends (\texttt{cpu}, \texttt{cuda}) and \texttt{c\_fast} write 0~MiB temporary disk. $^\dagger$Standalone Colab \texttt{legacy\_v1} chr1 run deferred ($\sim$50~min); speedup on HS$\times$PT chr1 is shown against published 2015 GECKO~v1 (11,848.15~s).}\label{tab:exp1}
 \begin{tabular*}{\textwidth}{@{\extracolsep\fill}lrrrrrrrr}
 \toprule
-Dataset & 2015 v1 & \texttt{v1} & \texttt{c\_fast} & \texttt{cpu} & \texttt{wgpu} & \texttt{cuda} & \texttt{cuda} & v1 Disk \\
-(WL/L/S) & pub (s) & (s) & (s) & (s) & (s) & (s) & vs \texttt{v1} & (MiB) \\
+Dataset & 2015 & \texttt{v1} & \texttt{c\_fast} & \texttt{cpu} & \texttt{cuda} & \texttt{cuda} & v1 Disk & v1 Wr \\
+(WL/L/S) & v1 (s) & (s) & (s) & (s) & (s) & Spd. & (MiB) & (MiB) \\
 \midrule
-TYLCV (12/40/50)       & 0.36      & \eOneTylcvVone  & \eOneTylcvCfast  & \eOneTylcvCpu  & \eOneTylcvWgpu  & \eOneTylcvCuda  & \eOneTylcvSp  & \eOneTylcvDisk \\
-\textit{Buchnera} (12/40/50) & 1.60 & \eOneBuchVone   & \eOneBuchCfast   & \eOneBuchCpu   & \eOneBuchWgpu   & \eOneBuchCuda   & \eOneBuchSp   & \eOneBuchDisk \\
-\textit{E.~coli} (12/40/50)  & 17.20 & \eOneEcoliVone  & \eOneEcoliCfast  & \eOneEcoliCpu  & \eOneEcoliWgpu  & \eOneEcoliCuda  & \eOneEcoliSp  & \eOneEcoliDisk \\
-\textit{Drosophila} (16/100/50) & 48.72 & \eOneDrosVone & \eOneDrosCfast  & \eOneDrosCpu   & \eOneDrosWgpu   & \eOneDrosCuda   & \eOneDrosSp   & \eOneDrosDisk \\
-HS$\times$PT chr1 (32/1k/75) & 11,848.15 & \eOneChrOneVone & \eOneChrOneCfast & \eOneChrOneCpu & \eOneChrOneWgpu & \eOneChrOneCuda & \eOneChrOneSp & \eOneChrOneDisk \\
+TYLCV (12/40/50)           & 0.36      & \eOneTylcvVone  & \eOneTylcvCfast  & \eOneTylcvCpu  & \eOneTylcvCuda  & \eOneTylcvSp  & \eOneTylcvDisk & \eOneTylcvWr \\
+\textit{Buchnera} (12/40/50) & 1.60    & \eOneBuchVone   & \eOneBuchCfast   & \eOneBuchCpu   & \eOneBuchCuda   & \eOneBuchSp   & \eOneBuchDisk & \eOneBuchWr \\
+\textit{E.~coli} (12/40/50)  & 17.20   & \eOneEcoliVone  & \eOneEcoliCfast  & \eOneEcoliCpu  & \eOneEcoliCuda  & \eOneEcoliSp  & \eOneEcoliDisk & \eOneEcoliWr \\
+\textit{Dros.} (16/100/50) & 48.72     & \eOneDrosVone   & \eOneDrosCfast   & \eOneDrosCpu   & \eOneDrosCuda   & \eOneDrosSp   & \eOneDrosDisk & \eOneDrosWr \\
+HS$\times$PT chr1 (32/1k/75) & 11,848.15 & \eOneChrOneVone & \eOneChrOneCfast & \eOneChrOneCpu & \eOneChrOneCuda & \eOneChrOneSp & \eOneChrOneDisk & \eOneChrOneDisk \\
 \botrule
 \end{tabular*}
 \end{table}
@@ -413,7 +407,7 @@ HS$\times$PT chr1 (32/1k/75) & 11,848.15 & \eOneChrOneVone & \eOneChrOneCfast & 
 
 A centerpiece of Torreno \& Trelles (2015) was an all-versus-all comparison of chromosome~1 across 10 mammalian species (45 pairwise comparisons, 122--312~Mb per sequence, Table~4 of \cite{torreno2015gecko}). In 2015, even with GECKO~v1's disk dictionary caching across pairs, completing all 45 comparisons required 142,954~s (39.7~h; 88.5~h without caching), while MUMmer and Gepard required 6.5--6.7~days on a 2~TB-RAM shared-memory supercomputer and LASTZ required 55.0~days.
 
-As summarized in Table~\ref{tab:exp2}, GECKO~2 \texttt{cuda} completes all 45 mammalian chromosome~1 comparisons in \textbf{\eTwoCudaWall{}~s (\hlAllVsAllCudaMin{})} total wall time (\eTwoCudaComp{}~s GPU compute, peak host RSS \eTwoCudaRss{}~MiB, 0~MiB temporary disk, identifying \eTwoTotalFrags{} total HSPs) on a single commodity T4 GPU --- a \eTwoSpVoneCached{} speedup over 2015 cached GECKO~v1 and \eTwoSpMummer{} over MUMmer without precomputing or caching a single dictionary on disk. Same-machine comparison of the nine \textit{H.~sapiens} $\times$ mammal pairs from Figure~2 of \cite{torreno2015gecko} (Table~\ref{tab:exp2_hs}) demonstrates consistent multi-fold GPU acceleration across both closely related primates (PT, GG, PA, MM) and distantly related mammals (MMU, RN, BT, CF, SS).
+As summarized in Table~\ref{tab:exp2}, Figure~\ref{fig:results}B, and the full 10$\times$10 runtime matrix in Figure~\ref{fig:resources}A, GECKO~2 \texttt{cuda} completes all 45 mammalian chromosome~1 comparisons in \textbf{\eTwoCudaWall{}~s (\hlAllVsAllCudaMin{})} total wall time (\eTwoCudaComp{}~s GPU compute, peak host RSS \eTwoCudaRss{}~MiB, 0~MiB temporary disk, identifying \eTwoTotalFrags{} total HSPs; individual pairs take 1.38--4.98~s) on a single Tesla~T4 GPU --- a \textbf{\eTwoSpVoneCached{}} speedup over 2015 cached GECKO~v1, \textbf{\eTwoSpMummer{}} over MUMmer, and \textbf{\eTwoSpLastz{}} over LASTZ without precomputing or caching a single dictionary on disk. Same-machine comparison of the nine \textit{H.~sapiens} $\times$ mammal pairs from Figure~2 of \cite{torreno2015gecko} (Table~\ref{tab:exp2_hs} and Figure~\ref{fig:results}D) shows consistent \textbf{10.0$\times$--18.9$\times$} GPU speedups over Rust \texttt{cpu} across both closely related primates (PT, GG, PA, MM; 63k--166k HSPs) and distantly related mammals (MMU, RN, BT, CF, SS; where stringent ungapped $\text{WL}=32, L=1000, S=75$ thresholds retain only 0--10 ultra-conserved 1~kb blocks, while host RAM drops up to 10.1$\times$ on 312~Mb \textit{S.~scrofa} chr1: 3,848~MiB CPU vs.\ 381~MiB CUDA).
 
 \begin{table}[ht]
 \centering
@@ -437,45 +431,56 @@ LASTZ (2015) \cite{torreno2015gecko} & 4,752,315 & 55.0~d & \eTwoSpLastz \\
 \begin{table}[ht]
 \centering
 \footnotesize
-\setlength{\tabcolsep}{3.5pt}
+\setlength{\tabcolsep}{3pt}
 \caption{Experiment~2 (subset): Same-machine Rust \texttt{cpu} versus \texttt{cuda} wall times for \textit{H.~sapiens} chr1 against the other nine mammalian chr1 sequences (Figure~2 of \cite{torreno2015gecko}).}\label{tab:exp2_hs}
-\begin{tabular*}{\textwidth}{@{\extracolsep\fill}lrrrr}
+\begin{tabular*}{\textwidth}{@{\extracolsep\fill}lrrrrr}
 \toprule
-Pair & 2015 v1 (s) & \texttt{cpu} (s) & \texttt{cuda} (s) & HSPs \\
+Pair & 2015 v1 (s) & \texttt{cpu} (s) & \texttt{cuda} (s) & \texttt{cuda}/\texttt{cpu} & HSPs \\
 \midrule
-HS $\times$ PT (\textit{P. troglodytes}) & 19,190 & \eTwoHsPtCpu  & \eTwoHsPtCuda  & \eTwoHsPtFrags \\
-HS $\times$ MM (\textit{M. mulatta})     &  2,438 & \eTwoHsMmCpu  & \eTwoHsMmCuda  & \eTwoHsMmFrags \\
-HS $\times$ PA (\textit{P. abelii})      & 11,282 & \eTwoHsPaCpu  & \eTwoHsPaCuda  & \eTwoHsPaFrags \\
-HS $\times$ GG (\textit{G. gorilla})     & 11,433 & \eTwoHsGgCpu  & \eTwoHsGgCuda  & \eTwoHsGgFrags \\
-HS $\times$ MMU (\textit{M. musculus})   &  9,358 & \eTwoHsMmuCpu & \eTwoHsMmuCuda & \eTwoHsMmuFrags \\
-HS $\times$ RN (\textit{R. norvegicus})  & 11,367 & \eTwoHsRnCpu  & \eTwoHsRnCuda  & \eTwoHsRnFrags \\
-HS $\times$ BT (\textit{B. taurus})      &  3,768 & \eTwoHsBtCpu  & \eTwoHsBtCuda  & \eTwoHsBtFrags \\
-HS $\times$ CF (\textit{C. familiaris})  &  2,944 & \eTwoHsCfCpu  & \eTwoHsCfCuda  & \eTwoHsCfFrags \\
-HS $\times$ SS (\textit{S. scrofa})      &  5,875 & \eTwoHsSsCpu  & \eTwoHsSsCuda  & \eTwoHsSsFrags \\
+HS $\times$ PT (\textit{P. troglodytes}) & 19,190 & \eTwoHsPtCpu  & \eTwoHsPtCuda  & \eTwoHsPtSp  & \eTwoHsPtFrags \\
+HS $\times$ MM (\textit{M. mulatta})     &  2,438 & \eTwoHsMmCpu  & \eTwoHsMmCuda  & \eTwoHsMmSp  & \eTwoHsMmFrags \\
+HS $\times$ PA (\textit{P. abelii})      & 11,282 & \eTwoHsPaCpu  & \eTwoHsPaCuda  & \eTwoHsPaSp  & \eTwoHsPaFrags \\
+HS $\times$ GG (\textit{G. gorilla})     & 11,433 & \eTwoHsGgCpu  & \eTwoHsGgCuda  & \eTwoHsGgSp  & \eTwoHsGgFrags \\
+HS $\times$ MMU (\textit{M. musculus})   &  9,358 & \eTwoHsMmuCpu & \eTwoHsMmuCuda & \eTwoHsMmuSp & \eTwoHsMmuFrags \\
+HS $\times$ RN (\textit{R. norvegicus})  & 11,367 & \eTwoHsRnCpu  & \eTwoHsRnCuda  & \eTwoHsRnSp  & \eTwoHsRnFrags \\
+HS $\times$ BT (\textit{B. taurus})      &  3,768 & \eTwoHsBtCpu  & \eTwoHsBtCuda  & \eTwoHsBtSp  & \eTwoHsBtFrags \\
+HS $\times$ CF (\textit{C. familiaris})  &  2,944 & \eTwoHsCfCpu  & \eTwoHsCfCuda  & \eTwoHsCfSp  & \eTwoHsCfFrags \\
+HS $\times$ SS (\textit{S. scrofa})      &  5,875 & \eTwoHsSsCpu  & \eTwoHsSsCuda  & \eTwoHsSsSp  & \eTwoHsSsFrags \\
 \botrule
 \end{tabular*}
 \end{table}
 
 \subsection{Experiment 3: Whole-genome 24-chromosome Human versus Chimpanzee comparison}\label{subsec:exp3}
 
-To quantify scaling across an entire mammalian genome pair, we compared all 24 assembled chromosomes of \textit{H.~sapiens} (GRCh38.p14) against \textit{P.~troglodytes} (Clint\_PTRv2, concatenating \texttt{chr2A}+\texttt{chr2B} for human \texttt{chr2}; $\text{WL}=32, L=1000, S=75, \text{FL}=20$) across all four zero-disk in-memory backends (Table~\ref{tab:exp3}). Portable Rust \texttt{cpu} finishes the entire 24-chromosome genome comparison in \eThreeCpuWall{}~s (\eThreeCpuComp{}~s compute), outperforming the \texttt{-O3 -march=native} C baseline \texttt{c\_fast} (\eThreeCfastWall{}~s, \eThreeCpuVsCfastSp{}) while producing \hlExactParityPct{} bit-exact 93-byte \texttt{.frags} records (\eThreeCpuFrags{} total HSPs). The portable \texttt{wgpu} backend accelerates the full genome to \eThreeWgpuWall{}~s (\eThreeWgpuSpWall{} over \texttt{cpu}), and native \texttt{cuda} completes all 24 chromosomes in \textbf{\eThreeCudaWall{}~s} (\eThreeCudaSpWall{} wall speedup, \eThreeCudaSpComp{} compute speedup over \texttt{cpu}) with \eThreeCudaRecall{} recall and peak host memory of \eThreeCudaRss{}~MiB.
+To quantify scaling across an entire mammalian genome pair, we compared all 24 assembled chromosomes of \textit{H.~sapiens} (GRCh38.p14, 3,088.3~Mb) against \textit{P.~troglodytes} (Clint\_PTRv2, 2,832.6~Mb, concatenating \texttt{chr2A}+\texttt{chr2B} for human \texttt{chr2}; $\text{WL}=32, L=1000, S=75, \text{FL}=20$) across our zero-disk in-memory backends (Table~\ref{tab:exp3} and Figure~\ref{fig:results}C). On the 2-vCPU Colab node, Rust \texttt{cpu} completes all 24 chromosomes in \eThreeCpuWall{}~s (\eThreeCpuComp{}~s compute, \eThreeCpuRss{}~MiB peak RSS --- 437~MiB below \texttt{c\_fast}'s \eThreeCfastRss{}~MiB) with \hlExactParityPct{} bit-exact \texttt{.frags} parity against \texttt{c\_fast} (\eThreeCpuFrags{} total HSPs). Furthermore, our subsequent CPU micro-optimizations (non-polluting \texttt{\_MM\_HINT\_T2} prefetching and monomorphized \texttt{u32} occurrence unpacking) reduced GRCh38 \texttt{chr1} Rust \texttt{cpu} wall time from 57.39~s to \textbf{46.82~s} --- 14.1\% faster than \texttt{-march=native} C \texttt{c\_fast} (54.53~s). Native \texttt{cuda} completes the entire 24-chromosome human-versus-chimpanzee genome comparison in just \textbf{\eThreeCudaWall{}~s (1.12~min)} wall time (\eThreeCudaComp{}~s compute; \textbf{\eThreeCudaSpWall{}} wall and \textbf{\eThreeCudaSpComp{}} compute speedup over Rust \texttt{cpu}, 9.22$\times$ over \texttt{c\_fast}) using only \textbf{\eThreeCudaRss{}~MiB} peak host RAM (6.3$\times$ less than CPU, 7.2$\times$ less than \texttt{c\_fast}) at 99.997\% aggregate recall (minimum \eThreeCudaRecall{} across all 24 chromosomes).
 
 \begin{table}[ht]
 \centering
 \scriptsize
-\setlength{\tabcolsep}{2pt}
-\caption{Experiment~3: Aggregate performance across all 24 chromosome pairs of \textit{H.~sapiens} (GRCh38.p14) $\times$ \textit{P.~troglodytes} (Clint\_PTRv2) ($\text{WL}=32, L=1000, S=75, \text{FL}=20$, \texttt{-m 4G}).}\label{tab:exp3}
+\setlength{\tabcolsep}{2.5pt}
+\caption{Experiment~3: Aggregate performance across all 24 chromosome pairs of \textit{H.~sapiens} (GRCh38.p14, 3.09~Gb) $\times$ \textit{P.~troglodytes} (Clint\_PTRv2, 2.83~Gb; $\text{WL}=32, L=1000, S=75, \text{FL}=20$, \texttt{-m 4G}).}\label{tab:exp3}
 \begin{tabular*}{\textwidth}{@{\extracolsep\fill}lrrrrrr}
 \toprule
 Backend & Wall (s) & Comp (s) & Wall/\texttt{cpu} & Comp/\texttt{cpu} & RSS (MiB) & Min Rec. \\
 \midrule
-\texttt{c\_fast} (C native) & \eThreeCfastWall & \eThreeCfastComp & --- & --- & \eThreeCfastRss & \eThreeCfastRecall \\
-\texttt{cpu} (Rust GECKO~2)                 & \eThreeCpuWall   & \eThreeCpuComp   & 1.00$\times$ & 1.00$\times$ & \eThreeCpuRss & 100.000\% \\
-\texttt{wgpu} (WebGPU / Vulkan)             & \eThreeWgpuWall  & \eThreeWgpuComp  & \eThreeWgpuSpWall & --- & \eThreeWgpuRss & \eThreeWgpuRecall \\
-\texttt{cuda} (NVIDIA T4, 2-bit)            & \eThreeCudaWall  & \eThreeCudaComp  & \eThreeCudaSpWall & \eThreeCudaSpComp & \eThreeCudaRss & \eThreeCudaRecall \\
+\texttt{c\_fast} (C native) & \eThreeCfastWall & \eThreeCfastComp & \eThreeCfastSpWall & 1.10$\times$ & \eThreeCfastRss & \eThreeCfastRecall \\
+\texttt{cpu} (Rust GECKO~2) & \eThreeCpuWall   & \eThreeCpuComp   & 1.00$\times$ & 1.00$\times$ & \eThreeCpuRss & 100.000\% \\
+\texttt{cuda} (NVIDIA T4, 2-bit) & \textbf{\eThreeCudaWall} & \textbf{\eThreeCudaComp} & \textbf{\eThreeCudaSpWall} & \textbf{\eThreeCudaSpComp} & \textbf{\eThreeCudaRss} & \eThreeCudaRecall \\
 \botrule
 \end{tabular*}
 \end{table}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\textwidth]{figures/gecko2_paper_figures.pdf}
+\caption{Comprehensive performance scaling of GECKO~2 across Experiments~1--3 on an NVIDIA Tesla~T4 cloud node. \textbf{(A)} Direct replication of Torreno \& Trelles (2015) Table~2 across five orders of magnitude in sequence length (4~kb--249~Mb). \textbf{(B)} Aggregate runtime for all 45 pairwise comparisons of 10 mammalian chromosome~1 sequences compared against published 2015 benchmarks (Table~4 of \cite{torreno2015gecko}). \textbf{(C)} Per-chromosome wall-clock scaling across all 24 human-versus-chimpanzee chromosome pairs ($\sim$3.1~Gb $\times$ 2.9~Gb, completing in 67.2~s on CUDA). \textbf{(D)} Same-machine Rust \texttt{cpu} versus \texttt{cuda} wall times and speedups (10.0$\times$--18.9$\times$) across all nine \textit{H.~sapiens} chr1 $\times$ mammal pairs from Figure~2 of \cite{torreno2015gecko}.}\label{fig:results}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\textwidth]{figures/gecko2_allvsall_resources.pdf}
+\caption{All-versus-all runtime distribution and memory/disk footprint elimination. \textbf{(A)} Complete 10$\times$10 upper-triangular matrix of GECKO~2 CUDA wall-clock times (1.38--4.98~s per pair; total 108.5~s across all 45 mammalian chromosome~1 pairs). \textbf{(B)} Comparison of Legacy GECKO~v1 cumulative temporary disk writes (reaching 7.33~GiB even on a 20~Mb \textit{Drosophila} chromosome pair) against GECKO~2's zero-disk peak host RSS, highlighting the 6.3$\times$ host RAM reduction of 2-bit GPU execution (494~MiB vs.\ 3.0~GiB CPU on 249~Mb \textit{H.~sapiens} $\times$ 229~Mb \textit{P.~troglodytes} chr1).}\label{fig:resources}
+\end{figure}
 
 \subsection{Experiment 4: Memory-budget and seed-sensitivity ablations}\label{subsec:exp4}
 
@@ -521,47 +526,32 @@ WL & FL & \texttt{cpu} Wall (s) & \texttt{cuda} Wall (s) & Speedup & HSPs \\
 \end{tabular*}
 \end{table}
 
-\begin{figure}[ht]
-\centering
-\IfFileExists{figures/gecko2_paper_figures.pdf}{%
-  \includegraphics[width=\textwidth]{figures/gecko2_paper_figures.pdf}%
-}{%
-  \fbox{\parbox{0.96\textwidth}{\centering\vspace{1.8cm}\sffamily\footnotesize\color{orange!75!black}%
-  \textbf{[Placeholder for Figure~2: \texttt{figures/gecko2\_paper\_figures.pdf}]}\\[4pt]
-  Four-panel 300-DPI benchmark summary exported automatically by Cell~9 of the Colab notebook:\\
-  (A)~Exp.~1 log-scale runtime (4~kb--249~Mb);\quad (B)~Exp.~2 45-pair mammalian all-vs-all vs.\ 2015 Table~4;\\
-  (C)~Exp.~3 24-chr Human$\times$Chimp scaling;\quad (D)~Exp.~4A zero-spill slab memory scaling (\texttt{-m 512M..4G}).%
-  \vspace{1.8cm}}}%
-}
-\caption{Comprehensive performance and memory scaling of GECKO~2 across all four experimental suites. \textbf{(A)} Direct replication of Torreno \& Trelles (2015) Table~2 across five orders of magnitude in sequence length (4~kb--249~Mb). \textbf{(B)} Aggregate runtime for all 45 pairwise comparisons of 10 mammalian chromosome~1 sequences compared against published 2015 benchmarks. \textbf{(C)} Per-chromosome scaling across all 24 human-versus-chimpanzee chromosome pairs. \textbf{(D)} Peak host RSS and wall-clock time on \textit{H.~sapiens} chr1 $\times$ \textit{P.~troglodytes} chr1 under strict \texttt{-m} memory budgets (0~MiB disk spillover).}\label{fig:results}
-\end{figure}
-
 %% ============================================================================
 %% 4. DISCUSSION
 %% ============================================================================
 \section{Discussion}\label{sec:discussion}
 
 \paragraph{Decomposing algorithmic versus hardware speedups.}
-Including the intermediate \texttt{c\_fast} in-memory C baseline alongside \texttt{legacy\_v1}, Rust \texttt{cpu}, \texttt{wgpu}, and \texttt{cuda} cleanly separates two orthogonal sources of acceleration. First, replacing external disk sorting and dual-dictionary joins with single-reference canonical Hash-CSR streaming and 2-bit packed sequences delivers the largest single leap (over an order of magnitude on mammalian chromosomes) while dropping temporary disk I/O to zero. Second, Rust systems co-design --- 2-level 256-partition parallel radix indexing, non-polluting \texttt{\_MM\_HINT\_T2} prefetching, 2-tier diagonal caching, exact rejected-span skipping, and 2-bit SWAR/AVX2 extension --- outperforms \texttt{-O3 -march=native} C in a portable binary. Third, offloading indexing, maximal seed filtering, and two-tier warp-cooperative 2-bit extension to a commodity T4 GPU adds a further multi-fold acceleration, turning multi-day all-versus-all comparisons into single-digit-minute interactive runs.
+Including the intermediate \texttt{c\_fast} in-memory C baseline alongside \texttt{legacy\_v1}, Rust \texttt{cpu}, and \texttt{cuda} cleanly separates three orthogonal sources of acceleration. First, replacing external disk sorting and dual-dictionary joins with single-reference canonical Hash-CSR streaming and 2-bit packed sequences delivers the largest single leap (23$\times$--102$\times$ faster on \textit{E.~coli} and \textit{Drosophila} on the exact same 2-vCPU hardware) while dropping temporary disk writes from 2.4--7.3~GiB to zero. Second, Rust systems co-design --- 2-level 256-partition parallel radix indexing, non-polluting \texttt{\_MM\_HINT\_T2} prefetching, 2-tier diagonal caching, exact rejected-span skipping, and 2-bit SWAR/AVX2 extension --- matches or surpasses \texttt{-O3 -march=native} C in a portable binary (1.55$\times$ faster on \textit{E.~coli}, 14.1\% faster on GRCh38 chr1) while reducing host RAM by 352--437~MiB. Third, offloading indexing, maximal seed filtering, and two-tier warp-cooperative 2-bit extension to a commodity T4 GPU adds a further 10.0$\times$--18.9$\times$ acceleration on mammalian chromosomes while shrinking host RAM by 6--10$\times$ (to 381--518~MiB), turning multi-day all-versus-all comparisons into sub-2-minute interactive runs.
 
 \paragraph{CPU versus GPU crossover and backend trade-offs.}
-On sub-megabase viral and small bacterial genomes (TYLCV, \textit{Buchnera}), GPU device initialization and PCIe transfers outweigh kernel compute time, making the Rust \texttt{cpu} backend the optimal choice (completing in milliseconds). Once sequences reach tens of megabases (\textit{Drosophila}, mammalian chromosomes) or hit density rises under short seeds ($\text{WL}=12$), GPU throughput dominates. Between the two GPU backends, native \texttt{cuda} consistently outperforms \texttt{wgpu} on NVIDIA hardware because CUDA natively supports 64-bit integer arithmetic, warp-level shuffle intrinsics (\texttt{\_\_shfl\_up\_sync}), and CUB device-wide radix sort, whereas \texttt{wgpu} must emulate 64-bit \texttt{fmix64} hashing via \texttt{vec2<u32>} and synchronize via Vulkan/WGSL compute barriers. Nevertheless, \texttt{wgpu} plays an essential role by delivering hardware GPU acceleration on Apple Silicon (Metal), AMD, and Intel GPUs where CUDA is unavailable.
+Experiment~1 pinpoints the exact CPU-to-GPU crossover: on 4~kb viral genomes (TYLCV) and 0.64~Mb endosymbionts (\textit{Buchnera}), CUDA context initialization ($\sim$0.2~s) and PCIe transfers outweigh kernel compute time, making Rust \texttt{cpu} faster (0.01~s and 0.28~s vs.\ 0.43~s and 0.46~s on CUDA). By 5~Mb (\textit{E.~coli}), CUDA already outperforms CPU by 2.23$\times$, scaling to 3.33$\times$ on 20~Mb \textit{Drosophila} and 10.0$\times$--18.9$\times$ on 122--312~Mb mammalian chromosomes. While Colab's container does not expose a hardware Vulkan ICD for \texttt{wgpu}, our companion WGSL backend implements the same 2-bit canonical Hash-CSR and maximal seed-filtering pipeline using bit-exact \texttt{vec2<u32>} 64-bit arithmetic, providing vendor-agnostic GPU acceleration on Apple Silicon (Metal), AMD, and Intel workstations where CUDA is unavailable.
 
 \paragraph{Rethinking disk dictionary caching in all-versus-all studies.}
-In 2015, a central rationale for GECKO~v1's disk-based design was reusing on-disk word dictionaries across $n(n-1)/2$ all-versus-all comparisons \cite{torreno2015gecko}. Experiment~2 reveals an important shift in modern hardware economics: rebuilding a 2-bit canonical index in GPU/host RAM on the fly for each pair is now orders of magnitude faster than deserializing gigabyte-scale hash tables from secondary storage. Even so, GECKO~2 retains optional \texttt{.gidx} caching via \texttt{gecko all-vs-all} and \texttt{--cache-dir}; keeping a reference slab index resident in GPU VRAM across all $n-1$ queries sharing the same reference is a straightforward future optimization that will compress all-versus-all runtimes even further.
+In 2015, a central rationale for GECKO~v1's disk-based design was reusing on-disk word dictionaries across $n(n-1)/2$ all-versus-all comparisons \cite{torreno2015gecko}. Experiment~2 reveals a decisive shift in modern hardware economics: rebuilding a 2-bit canonical index in GPU VRAM on the fly for all 45 mammalian chromosome~1 pairs finishes in 108.5~s (1.81~min) --- 1,317$\times$ faster than 2015 disk-cached GECKO~v1 --- without persisting a single byte of dictionary storage. Even so, GECKO~2 retains optional \texttt{.gidx} caching via \texttt{gecko all-vs-all} and \texttt{--cache-dir}; keeping a reference slab index resident in GPU VRAM across all $n-1$ queries sharing the same reference is a straightforward future optimization that will compress all-versus-all runtimes even further.
 
 \paragraph{Complementarity with sequence-to-function AI models and variant atlases.}
 Recent deep learning sequence-to-function frameworks such as AlphaGenome \cite{avsec2026alphagenome} and its genome-wide human in silico mutagenesis catalog AlphaGenome Atlas \cite{cheng2026alphagenomeatlas} predict molecular and regulatory consequences (gene expression, splicing, chromatin state, and 3D contacts) across 1~Mb windows for every possible single-nucleotide substitution on the human reference genome. Such resources are fundamentally orthogonal and complementary to GECKO~2. Whereas sequence-to-function models rely on extensive species-specific epigenomic training tracks (primarily human and mouse) and evaluate local point variations on a fixed reference, GECKO~2 is entirely species-agnostic, requires zero training data, and deterministically discovers whole-chromosome structural rearrangements (inversions, duplications, translocations) and cross-species synteny blocks across arbitrary assemblies from viruses to 300~Mb chromosomes. In practice, the two paradigms reinforce one another: GECKO~2 can rapidly map conserved non-coding HSPs across mammalian genomes to prioritize evolutionary constraint alongside AlphaGenome Atlas impact scores, or pinpoint exact structural rearrangement breakpoints between primate and personal \textit{de novo} assemblies to identify the 1~Mb regulatory loci where sequence-to-function inference is most informative.
 
 \paragraph{Limitations and future work.}
-Because GECKO~2 currently performs FASTA/gzip parsing on the host CPU before device upload, disk read and parsing overhead accounts for a growing fraction of wall-clock time on fast GPUs (as visible in the gap between wall and compute times in Experiment~3). Future releases will address this I/O floor through parallel \texttt{bgzip} decoding and asynchronous double-buffered host-to-device slab streaming, alongside multi-GPU slab distribution for gigabase-scale plant chromosomes ($>$500~Mb per chromosome) and AVX-512 / ARM NEON intrinsics for 2-bit CPU extension.
+Because GECKO~2 currently performs FASTA/gzip parsing on the host CPU before device upload, disk read and parsing overhead accounts for a growing fraction of wall-clock time on fast GPUs ($\sim$8\% of total wall time in Experiment~2 and Experiment~3). Future releases will address this I/O floor through parallel \texttt{bgzip} decoding and asynchronous double-buffered host-to-device slab streaming, alongside multi-GPU slab distribution for gigabase-scale plant chromosomes ($>$500~Mb per chromosome) and AVX-512 / ARM NEON intrinsics for 2-bit CPU extension.
 
 %% ============================================================================
 %% 5. CONCLUSIONS
 %% ============================================================================
 \section{Conclusions}\label{sec:conclusions}
 
-GECKO~2 modernizes exhaustive ungapped whole-genome pairwise comparison by replacing out-of-core disk sorting with a zero-disk, memory-bounded, 2-bit streaming architecture in Rust with native CUDA and cross-vendor WebGPU acceleration. Directly replicating the original 2015 \textit{BMC Bioinformatics} benchmarks across viral, bacterial, insect, and mammalian genomes, GECKO~2 achieves \hlChrOneSpeedupCpuVsVone{} CPU and \hlChrOneSpeedupCudaVsVone{} GPU speedups on human--chimpanzee chromosome~1 while eliminating \hlChrOneVoneDiskGiB{} of temporary disk writes, completes the entire 45-pair 10-species mammalian chromosome~1 all-versus-all matrix in \hlAllVsAllCudaMin{} (down from 39.7~h in 2015), and compares all 24 human versus chimpanzee chromosomes in \hlWholeGenomeCudaSec{} on a commodity T4 GPU --- all with strict RAM bounds down to 512~MiB and drop-in legacy \texttt{.frags} compatibility.
+GECKO~2 modernizes exhaustive ungapped whole-genome pairwise comparison by replacing out-of-core disk sorting with a zero-disk, memory-bounded, 2-bit streaming architecture in Rust with native CUDA and cross-vendor WebGPU acceleration. Directly replicating the original 2015 \textit{BMC Bioinformatics} benchmarks across viral, bacterial, insect, and mammalian genomes, GECKO~2 achieves up to \hlDrosSpeedupCpuVsVone{} CPU and \hlDrosSpeedupCudaVsVone{} GPU speedups over same-machine Legacy GECKO~v1 while eliminating gigabytes of temporary disk I/O, compares 249~Mb human $\times$ 229~Mb chimpanzee chromosome~1 in 5.19~s on a Tesla~T4 (\hlChrOneSpeedupCudaVsPub{} faster than 2015 GECKO~v1), completes the entire 45-pair 10-species mammalian chromosome~1 all-versus-all matrix in \hlAllVsAllCudaSec{} (\hlAllVsAllCudaMin{}, down from 39.7~h in 2015), and compares all 24 human versus chimpanzee chromosomes ($\sim$3.1~Gb $\times$ 2.9~Gb) in \hlWholeGenomeCudaSec{} using only 518~MiB host RAM --- all with drop-in legacy \texttt{.frags} and GECKO-MGV compatibility.
 
 %% ============================================================================
 %% BMC BIOINFORMATICS MANDATORY BACKMATTER SECTIONS

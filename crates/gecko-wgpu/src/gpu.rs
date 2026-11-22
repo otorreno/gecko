@@ -421,7 +421,16 @@ impl WgpuContext {
             ],
         });
 
-        let tile_bp: u32 = 8 * 1024 * 1024;
+        let mut init_tile_bp: u32 = if wl <= 14 {
+            1024 * 1024
+        } else if wl <= 19 {
+            4 * 1024 * 1024
+        } else {
+            8 * 1024 * 1024
+        };
+        if !soft_mask && init_tile_bp > 1024 * 1024 {
+            init_tile_bp >>= 1;
+        }
         let stride: u32 = 16;
         let len_x = seq_x.seq.len as u32;
         let len_y = seq_y.seq.len as u32;
@@ -432,9 +441,16 @@ impl WgpuContext {
         let mut tot_leftmax: u64 = 0;
         let mut tot_extended: u64 = 0;
 
-        let mut tile_start: u32 = 0;
-        while tile_start < len_x {
-            let tile_end = tile_start.saturating_add(tile_bp).min(len_x);
+        let mut tile_stack: Vec<(u32, u32)> = Vec::new();
+        let mut ts: u32 = 0;
+        while ts < len_x {
+            let te = ts.saturating_add(init_tile_bp).min(len_x);
+            tile_stack.push((ts, te));
+            ts = te;
+        }
+        tile_stack.reverse();
+
+        while let Some((tile_start, tile_end)) = tile_stack.pop() {
             let q_params = QueryParams {
                 len_x,
                 len_y,
@@ -465,11 +481,14 @@ impl WgpuContext {
             }
             self.queue.submit(Some(enc.finish()));
 
-            let mut n_hits = self.read_u32_buffer(&buf_hit_count);
-            if n_hits > max_hits {
-                n_hits = max_hits;
+            let n_hits = self.read_u32_buffer(&buf_hit_count);
+            if n_hits > max_hits && (tile_end - tile_start) > 1 {
+                let mid = tile_start + (tile_end - tile_start) / 2;
+                tile_stack.push((mid, tile_end));
+                tile_stack.push((tile_start, mid));
+                continue;
             }
-            tot_leftmax += n_hits as u64;
+            let n_hits = n_hits.min(max_hits);
 
             if n_hits > 0 {
                 let e_params = ExtendParams {
@@ -499,16 +518,23 @@ impl WgpuContext {
                     pass.dispatch_workgroups(ext_wg, 1, 1);
                 }
                 self.queue.submit(Some(enc.finish()));
-                tot_extended += n_hits as u64;
 
-                let n_frags = self.read_u32_buffer(&buf_frag_count).min(max_frags) as usize;
+                let n_frags_raw = self.read_u32_buffer(&buf_frag_count);
+                if n_frags_raw > max_frags && (tile_end - tile_start) > 1 {
+                    let mid = tile_start + (tile_end - tile_start) / 2;
+                    tile_stack.push((mid, tile_end));
+                    tile_stack.push((tile_start, mid));
+                    continue;
+                }
+                let n_frags = n_frags_raw.min(max_frags) as usize;
                 if n_frags > 0 {
                     let tile_frags: Vec<FragOut> = self.read_vec_buffer(&buf_out_frags, n_frags);
                     raw_frags.extend_from_slice(&tile_frags);
                 }
             }
 
-            tile_start = tile_end;
+            tot_leftmax += n_hits as u64;
+            tot_extended += n_hits as u64;
         }
 
         Ok(GpuRunStats {

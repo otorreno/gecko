@@ -13,9 +13,9 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 
-#define GECKO_EXTRACT_CHUNK_BP 256U
-#define GECKO_QUERY_TILE_BP    (8ULL * 1024ULL * 1024ULL)
-#define GECKO_MAX_TILE_HITS    (16ULL * 1024ULL * 1024ULL)
+#define GECKO_EXTRACT_CHUNK_BP 4096U
+#define GECKO_QUERY_TILE_BP    (16ULL * 1024ULL * 1024ULL)
+#define GECKO_MAX_TILE_HITS    (32ULL * 1024ULL * 1024ULL)
 #define GECKO_MAX_TILE_FRAGS   (4ULL * 1024ULL * 1024ULL)
 #define GECKO_SHORT_CAP        512
 
@@ -71,7 +71,7 @@ __device__ __forceinline__ uint8_t base_to_2bit(uint8_t c, bool soft_mask) {
     if (u == 'A') return 0;
     if (u == 'C') return 1;
     if (u == 'G') return 2;
-    if (u == 'T') return 3;
+    if (u == 'T' || u == 'U') return 3;
     return 4;
 }
 
@@ -150,7 +150,8 @@ uint32_t gpu_query_tile_left_maximal(
     uint32_t *d_hit_count,
     uint32_t *d_filt_count,
     uint32_t max_hits,
-    uint32_t &out_raw_leftmax
+    uint32_t &out_raw_leftmax,
+    bool &out_overflowed
 );
 
 uint32_t gpu_extend_tile_two_tier(
@@ -171,7 +172,8 @@ uint32_t gpu_extend_tile_two_tier(
     uint32_t *d_long_count,
     GpuFrag *d_out_frags,
     uint32_t *d_frag_count,
-    uint32_t max_frags
+    uint32_t max_frags,
+    bool &out_overflowed
 );
 
 #endif /* GECKO_RUST_CUDA_COMMON_CUH */

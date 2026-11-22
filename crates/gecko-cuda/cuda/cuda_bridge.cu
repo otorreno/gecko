@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "cuda_common.cuh"
@@ -143,23 +144,65 @@ extern "C" int gecko_cuda_query_and_extend(
     std::vector<GpuFrag> all_frags;
     std::vector<GpuFrag> tile_frags;
 
-    for (uint64_t tile_start = 0; tile_start < lenX; tile_start += GECKO_QUERY_TILE_BP) {
-        uint64_t tile_end = std::min<uint64_t>(tile_start + GECKO_QUERY_TILE_BP, lenX);
+    /* Choose an initial tile size tuned to k-mer density, and adaptively halve
+     * any tile that overflows GECKO_MAX_TILE_HITS or GECKO_MAX_TILE_FRAGS so
+     * zero hits and zero fragments are ever dropped. */
+    uint64_t init_tile_bp = GECKO_QUERY_TILE_BP;
+    if (h->wl <= 14) {
+        init_tile_bp = 1ULL * 1024ULL * 1024ULL;
+    } else if (h->wl <= 19) {
+        init_tile_bp = 4ULL * 1024ULL * 1024ULL;
+    }
+    if (!h->soft_mask && init_tile_bp > 1ULL * 1024ULL * 1024ULL) {
+        init_tile_bp >>= 1;
+    }
+
+    std::vector<std::pair<uint64_t, uint64_t>> tile_stack;
+    for (uint64_t ts = 0; ts < lenX; ts += init_tile_bp) {
+        uint64_t te = std::min<uint64_t>(ts + init_tile_bp, lenX);
+        tile_stack.push_back({ts, te});
+    }
+    std::reverse(tile_stack.begin(), tile_stack.end());
+
+    while (!tile_stack.empty()) {
+        uint64_t tile_start = tile_stack.back().first;
+        uint64_t tile_end = tile_stack.back().second;
+        tile_stack.pop_back();
+
         uint32_t raw_leftmax = 0;
+        bool hit_overflow = false;
         uint32_t n_filt = gpu_query_tile_left_maximal(
             d_seqX, lenX, h->d_seqY, h->d_seqY_rc, h->lenY, h->idx,
             h->wl, h->soft_mask, h->compare_reverse,
             tile_start, tile_end,
             d_hits, d_hits_sorted, d_hit_flags, d_hit_count, d_filt_count,
-            (uint32_t)GECKO_MAX_TILE_HITS, raw_leftmax);
-        out->leftmax_hits += raw_leftmax;
-        out->extended_hits += n_filt;
-        if (n_filt == 0) continue;
+            (uint32_t)GECKO_MAX_TILE_HITS, raw_leftmax, hit_overflow);
+        if (hit_overflow && (tile_end - tile_start) > 1) {
+            uint64_t mid = tile_start + (tile_end - tile_start) / 2;
+            tile_stack.push_back({mid, tile_end});
+            tile_stack.push_back({tile_start, mid});
+            continue;
+        }
+        if (n_filt == 0) {
+            out->leftmax_hits += raw_leftmax;
+            continue;
+        }
 
+        bool frag_overflow = false;
         uint32_t n_frags = gpu_extend_tile_two_tier(
             d_hits, n_filt, d_seqX, lenX, h->d_seqY, h->d_seqY_rc, h->lenY,
             h->wl, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
-            d_long_seeds, d_long_count, d_out_frags, d_frag_count, (uint32_t)GECKO_MAX_TILE_FRAGS);
+            d_long_seeds, d_long_count, d_out_frags, d_frag_count,
+            (uint32_t)GECKO_MAX_TILE_FRAGS, frag_overflow);
+        if (frag_overflow && (tile_end - tile_start) > 1) {
+            uint64_t mid = tile_start + (tile_end - tile_start) / 2;
+            tile_stack.push_back({mid, tile_end});
+            tile_stack.push_back({tile_start, mid});
+            continue;
+        }
+
+        out->leftmax_hits += raw_leftmax;
+        out->extended_hits += n_filt;
 
         if (n_frags > 0) {
             tile_frags.resize(n_frags);

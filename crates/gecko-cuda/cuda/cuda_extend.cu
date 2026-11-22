@@ -336,8 +336,10 @@ uint32_t gpu_extend_tile_two_tier(
     uint32_t *d_long_count,
     GpuFrag *d_out_frags,
     uint32_t *d_frag_count,
-    uint32_t max_frags
+    uint32_t max_frags,
+    bool &out_overflowed
 ) {
+    out_overflowed = false;
     CUDA_CHECK_VOID(cudaMemset(d_long_count, 0, sizeof(uint32_t)));
     CUDA_CHECK_VOID(cudaMemset(d_frag_count, 0, sizeof(uint32_t)));
     if (n_hits == 0) return 0;
@@ -362,5 +364,9 @@ uint32_t gpu_extend_tile_two_tier(
 
     uint32_t h_nfrags = 0;
     CUDA_CHECK_VOID(cudaMemcpy(&h_nfrags, d_frag_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    return (h_nfrags > max_frags) ? max_frags : h_nfrags;
+    if (h_nfrags > max_frags) {
+        out_overflowed = true;
+        return 0;
+    }
+    return h_nfrags;
 }

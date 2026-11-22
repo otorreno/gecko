@@ -89,9 +89,11 @@ static __global__ void query_left_maximal_kernel(
                         bool right_ext = next_x_valid && ((uint64_t)posY_orig + (uint64_t)wl < lenY) &&
                                          (norm_seed_byte(seqY[(uint64_t)posY_orig + (uint64_t)wl], soft_mask) == next_x);
                         if (!left_ext || !right_ext) {
-                            uint32_t slot = atomicAdd(hit_count, 1U);
-                            if (slot < max_hits) {
-                                out_hits[slot] = pack_hit_key(0U, posX, posY_orig);
+                            if (*hit_count <= max_hits) {
+                                uint32_t slot = atomicAdd(hit_count, 1U);
+                                if (slot < max_hits) {
+                                    out_hits[slot] = pack_hit_key(0U, posX, posY_orig);
+                                }
                             }
                         }
                     }
@@ -102,9 +104,11 @@ static __global__ void query_left_maximal_kernel(
                         bool right_ext = next_x_valid && ((uint64_t)posY_rc + (uint64_t)wl < lenY) &&
                                          (norm_seed_byte(seqY_rc[(uint64_t)posY_rc + (uint64_t)wl], soft_mask) == next_x);
                         if (!left_ext || !right_ext) {
-                            uint32_t slot = atomicAdd(hit_count, 1U);
-                            if (slot < max_hits) {
-                                out_hits[slot] = pack_hit_key(1U, posX, posY_rc);
+                            if (*hit_count <= max_hits) {
+                                uint32_t slot = atomicAdd(hit_count, 1U);
+                                if (slot < max_hits) {
+                                    out_hits[slot] = pack_hit_key(1U, posX, posY_rc);
+                                }
                             }
                         }
                     }
@@ -160,8 +164,11 @@ uint32_t gpu_query_tile_left_maximal(
     uint32_t *d_hit_count,
     uint32_t *d_filt_count,
     uint32_t max_hits,
-    uint32_t &out_raw_leftmax
+    uint32_t &out_raw_leftmax,
+    bool &out_overflowed
 ) {
+    out_overflowed = false;
+    out_raw_leftmax = 0;
     CUDA_CHECK_VOID(cudaMemset(d_hit_count, 0, sizeof(uint32_t)));
 
     uint64_t n_threads = ((tile_end - tile_start) + 15) / 16;
@@ -176,8 +183,8 @@ uint32_t gpu_query_tile_left_maximal(
     uint32_t h_nhits = 0;
     CUDA_CHECK_VOID(cudaMemcpy(&h_nhits, d_hit_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
     if (h_nhits > max_hits) {
-        fprintf(stderr, "Warning: tile hit buffer capped (%u > %u).\n", h_nhits, max_hits);
-        h_nhits = max_hits;
+        out_overflowed = true;
+        return 0;
     }
     out_raw_leftmax = h_nhits;
     if (h_nhits <= 1) return h_nhits;

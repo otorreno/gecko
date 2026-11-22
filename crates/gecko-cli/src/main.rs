@@ -14,7 +14,8 @@ use gecko_core::formats::modern::{
 };
 use gecko_core::formats::plot::{ColorMode, PlotOptions, PlotOrigin, write_dotplot_png_path};
 use gecko_core::kmer::{DictOptions, INDEX_WORD_SIZE, KmerDict};
-use gecko_core::pipeline::{CompareConfig, compare_genomes, compare_with_dicts};
+use gecko_core::pipeline::{CompareConfig, compare_genomes, compare_with_ref_index};
+use gecko_core::ref_index::RefIndex;
 use gecko_core::seq::Genome;
 use gecko_core::{Fragment, Scoring};
 
@@ -711,48 +712,71 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
     };
     config.validate()?;
 
-    // Load and pre-index every genome once (forward + revcomp).
+    // Load all genomes once; index one reference genome `j` at a time (one canonical RefIndex
+    // instead of 2 KmerDicts per genome) to minimize peak RAM while reusing the index across
+    // all queries `0..j`.
     let mut genomes = Vec::with_capacity(files.len());
-    let mut dicts_fwd = Vec::with_capacity(files.len());
-    let mut rev_genomes = Vec::with_capacity(files.len());
-    let mut dicts_rev = Vec::with_capacity(files.len());
-
-    let dict_opts = DictOptions {
-        soft_mask: config.soft_mask,
-        memory_budget: config.memory_budget,
-        index_k: INDEX_WORD_SIZE,
-    };
-
     for path in &files {
-        let g = Genome::from_fasta_path(path)?;
-        let rc = g.reverse_complement();
-        let d_fwd = KmerDict::build(&g, dict_opts)?;
-        let d_rev = KmerDict::build(&rc, dict_opts)?;
-        genomes.push(g);
-        dicts_fwd.push(d_fwd);
-        rev_genomes.push(rc);
-        dicts_rev.push(d_rev);
+        genomes.push(Genome::from_fasta_path(path)?);
     }
 
     let total_pairs = files.len() * (files.len() - 1) / 2;
     let mut done = 0usize;
-    for i in 0..files.len() {
-        for j in (i + 1)..files.len() {
+    for j in 1..files.len() {
+        // Check if any pair `(i, j)` actually needs running before indexing `genomes[j]`.
+        let needed_queries: Vec<usize> = (0..j)
+            .filter(|&i| {
+                let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
+                !(args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists())
+            })
+            .collect();
+
+        if needed_queries.is_empty() {
+            for i in 0..j {
+                done += 1;
+                let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
+                eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
+            }
+            continue;
+        }
+
+        let use_ref_index = RefIndex::fits_in_budget(
+            &genomes[j],
+            config.word_length,
+            config.soft_mask,
+            config.compare_reverse,
+            config.memory_budget,
+        );
+
+        let cached_ref = if use_ref_index {
+            let idx = RefIndex::build(
+                &genomes[j],
+                config.word_length,
+                config.freq_limit,
+                config.soft_mask,
+            )?;
+            let rev = if config.compare_reverse {
+                Some(genomes[j].reverse_complement())
+            } else {
+                None
+            };
+            Some((idx, rev))
+        } else {
+            None
+        };
+
+        for i in 0..j {
             done += 1;
             let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
             if args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists() {
                 eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
                 continue;
             }
-            let res = compare_with_dicts(
-                &genomes[i],
-                &dicts_fwd[i],
-                &genomes[j],
-                &dicts_fwd[j],
-                Some(&rev_genomes[j]),
-                Some(&dicts_rev[j]),
-                &config,
-            )?;
+            let res = if let Some((ref idx, ref rev)) = cached_ref {
+                compare_with_ref_index(&genomes[i], &genomes[j], idx, rev.as_ref(), &config)?
+            } else {
+                compare_genomes(&genomes[i], &genomes[j], &config, None)?
+            };
             let q_fname = files[i].file_name().and_then(|s| s.to_str()).unwrap_or("");
             let r_fname = files[j].file_name().and_then(|s| s.to_str()).unwrap_or("");
             let meta = res.metadata(q_fname, r_fname, &genomes[i], &genomes[j], &config);

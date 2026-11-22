@@ -8,7 +8,9 @@ use crate::formats::csv::ComparisonMetadata;
 use crate::formats::frags::Fragment;
 use crate::hits::{HitOptions, generate_and_consume_hits, generate_and_consume_hits_from_index};
 use crate::kmer::{DictOptions, INDEX_WORD_SIZE, KmerDict, KmerIndex};
+use crate::ref_index::RefIndex;
 use crate::seq::Genome;
+use crate::stream::compare_streaming;
 
 /// Full configuration for a pairwise GECKO comparison.
 #[derive(Debug, Clone)]
@@ -19,7 +21,7 @@ pub struct CompareConfig {
     pub min_similarity: f32,
     /// Seed k-mer length (`4..=32`; no longer limited to multiples of 4).
     pub word_length: usize,
-    /// Skip dictionary 32-mers occurring more than `freq_limit` times (default `1000`).
+    /// Skip reference words occurring more than `freq_limit` times per strand (default `1000`).
     pub freq_limit: u64,
     /// Subsampling cap per word list (default `10_000`).
     pub max_rep: usize,
@@ -27,7 +29,7 @@ pub struct CompareConfig {
     pub fixed_length: bool,
     /// If true (default), lowercase bases do not seed k-mers (soft-masking) but can extend.
     pub soft_mask: bool,
-    /// Memory budget in bytes for sorting/buffering before spilling to temporary disk runs.
+    /// Memory budget in bytes for indexing/sorting before falling back to out-of-core disk runs.
     pub memory_budget: usize,
     /// Whether to compare the reverse complement of the reference (`true` by default).
     pub compare_reverse: bool,
@@ -136,7 +138,46 @@ impl CompareResult {
 
 /// Run a full pairwise genome comparison, optionally reusing cached `.gidx` dictionaries in
 /// `cache_dir`.
+///
+/// Uses the streaming canonical-index engine (`RefIndex`) whenever `cache_dir` is `None` and the
+/// estimated reference index memory fits within `config.memory_budget`; otherwise automatically
+/// falls back to the out-of-core `KmerIndex::OnDisk` / `.gidx` pipeline.
 pub fn compare_genomes(
+    query: &Genome,
+    reference: &Genome,
+    config: &CompareConfig,
+    cache_dir: Option<&Path>,
+) -> Result<CompareResult> {
+    config.validate()?;
+
+    if cache_dir.is_none()
+        && RefIndex::fits_in_budget(
+            reference,
+            config.word_length,
+            config.soft_mask,
+            config.compare_reverse,
+            config.memory_budget,
+        )
+    {
+        let ref_index = RefIndex::build(
+            reference,
+            config.word_length,
+            config.freq_limit,
+            config.soft_mask,
+        )?;
+        let rev_ref = if config.compare_reverse {
+            Some(reference.reverse_complement())
+        } else {
+            None
+        };
+        return compare_streaming(query, reference, &ref_index, rev_ref.as_ref(), config);
+    }
+
+    compare_genomes_kmer_index(query, reference, config, cache_dir)
+}
+
+/// Out-of-core / `.gidx`-cached comparison using legacy sorted [`KmerIndex`] dictionaries.
+pub(crate) fn compare_genomes_kmer_index(
     query: &Genome,
     reference: &Genome,
     config: &CompareConfig,
@@ -180,7 +221,19 @@ pub fn compare_genomes(
     Ok(result)
 }
 
-/// Compare two genomes using pre-built [`KmerDict`]s (ideal for all-vs-all workflows).
+/// Compare a query genome against a pre-built canonical [`RefIndex`] (ideal for all-vs-all
+/// and multi-query workflows).
+pub fn compare_with_ref_index(
+    query: &Genome,
+    reference: &Genome,
+    ref_index: &RefIndex,
+    rev_ref: Option<&Genome>,
+    config: &CompareConfig,
+) -> Result<CompareResult> {
+    compare_streaming(query, reference, ref_index, rev_ref, config)
+}
+
+/// Compare two genomes using pre-built [`KmerDict`]s (ideal for `.gidx`-cached workflows).
 pub fn compare_with_dicts(
     query: &Genome,
     dict_x: &KmerDict,
@@ -436,11 +489,133 @@ mod tests {
             ..cfg_mem.clone()
         };
 
-        let res_mem = compare_genomes(&q, &r, &cfg_mem, None).unwrap();
+        let res_mem = compare_genomes_kmer_index(&q, &r, &cfg_mem, None).unwrap();
         let res_disk = compare_genomes(&q, &r, &cfg_disk, None).unwrap();
+        let res_stream = compare_genomes(&q, &r, &cfg_mem, None).unwrap();
         assert_eq!(res_mem.fragments.len(), 2);
         assert_eq!(res_mem.fragments, res_disk.fragments);
+        assert_eq!(res_stream.fragments, res_disk.fragments);
         assert_eq!(res_mem.stats.raw_hits, res_disk.stats.raw_hits);
         assert_eq!(res_mem.stats.filtered_hits, res_disk.stats.filtered_hits);
+    }
+
+    #[test]
+    fn streaming_ref_index_matches_legacy_multi_fasta() {
+        let mut seed = 0x5EED_CAFE_1234_5678u64;
+        let bases = *b"ACGT";
+        let mut next_dna = |n: usize| {
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                out.push(bases[((seed >> 32) & 3) as usize]);
+            }
+            String::from_utf8(out).unwrap()
+        };
+
+        let fwd1 = next_dna(150);
+        let fwd2 = next_dna(120);
+        let rev1 = next_dna(140);
+        let rev1_rc: String = rev1
+            .bytes()
+            .rev()
+            .map(crate::seq::complement_base)
+            .map(|b| b as char)
+            .collect();
+        // Palindromic 64 bp HSP (identical to its reverse complement).
+        let half_pal = next_dna(32);
+        let pal: String = format!(
+            "{half_pal}{}",
+            half_pal
+                .bytes()
+                .rev()
+                .map(crate::seq::complement_base)
+                .map(|b| b as char)
+                .collect::<String>()
+        );
+        // Soft-masked lowercase flank around an uppercase seed.
+        let masked_hsp = format!(
+            "{}{}{}",
+            fwd2[..30].to_ascii_lowercase(),
+            &fwd2[30..90],
+            fwd2[90..].to_ascii_lowercase()
+        );
+
+        let q = Genome::from_records(
+            "q",
+            [
+                (
+                    "q0",
+                    format!(
+                        "{}{fwd1}{}{rev1}{}",
+                        next_dna(200),
+                        next_dna(200),
+                        next_dna(200)
+                    ),
+                ),
+                (
+                    "q1",
+                    format!(
+                        "{}{masked_hsp}{}{pal}{}",
+                        next_dna(180),
+                        next_dna(180),
+                        next_dna(180)
+                    ),
+                ),
+            ],
+        );
+        let r = Genome::from_records(
+            "r",
+            [
+                (
+                    "r0",
+                    format!(
+                        "{}{rev1_rc}{}{pal}{}",
+                        next_dna(190),
+                        next_dna(190),
+                        next_dna(190)
+                    ),
+                ),
+                (
+                    "r1",
+                    format!(
+                        "{}{fwd1}{}{masked_hsp}{}",
+                        next_dna(210),
+                        next_dna(210),
+                        next_dna(210)
+                    ),
+                ),
+            ],
+        );
+
+        // Test both Direct CSR (wl = 8) and Hash-CSR (wl = 16, wl = 32), plus forward-only.
+        for &(wl, compare_reverse) in &[(8, true), (16, true), (32, true), (16, false)] {
+            let cfg = CompareConfig {
+                min_length: 50,
+                min_similarity: 75.0,
+                word_length: wl,
+                compare_reverse,
+                ..Default::default()
+            };
+
+            let res_stream = compare_genomes(&q, &r, &cfg, None).unwrap();
+            let res_legacy = compare_genomes_kmer_index(&q, &r, &cfg, None).unwrap();
+
+            let mut f_stream = res_stream.fragments.clone();
+            let mut f_legacy = res_legacy.fragments.clone();
+            let key = |f: &Fragment| (f.strand, f.seq_x, f.seq_y, f.diag, f.x_start, f.x_end);
+            f_stream.sort_by_key(key);
+            f_legacy.sort_by_key(key);
+
+            assert_eq!(
+                f_stream, f_legacy,
+                "fragment mismatch for wl={wl}, compare_reverse={compare_reverse}"
+            );
+            assert!(
+                !f_stream.is_empty(),
+                "expected non-empty fragments for wl={wl}"
+            );
+        }
     }
 }

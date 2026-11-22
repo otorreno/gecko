@@ -7,7 +7,8 @@ use flate2::read::MultiGzDecoder;
 use crate::error::{GeckoError, Result};
 
 /// Separator byte placed between concatenated multi-FASTA records in `Genome::data`.
-pub const SEQ_SEP: u8 = b'*';
+/// Stored as `0x00` so SIMD uppercasing (`b & 0xDF`) preserves separators identically.
+pub const SEQ_SEP: u8 = 0u8;
 
 /// Metadata for a single sequence record inside a [`Genome`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +27,7 @@ pub struct SeqRecord {
 
 /// An in-memory FASTA collection (single or multi-FASTA).
 ///
-/// Sequences are stored contiguously in `data`, separated by [`SEQ_SEP`] (`'*'`),
+/// Sequences are stored contiguously in `data`, separated by [`SEQ_SEP`] (`0x00`),
 /// preserving original ASCII case so soft-masked lowercase bases can be skipped
 /// during k-mer seeding while still participating in ungapped extension.
 #[derive(Debug, Clone)]
@@ -46,6 +47,7 @@ impl Genome {
     pub fn from_fasta_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
+        let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
         let mut reader = BufReader::with_capacity(1 << 20, file);
 
         // Auto-detect gzip via magic bytes 0x1f 0x8b
@@ -57,35 +59,54 @@ impl Genome {
         let name = file_stem_name(path);
         if is_gz {
             let gz = MultiGzDecoder::new(reader);
-            Self::from_fasta_reader(BufReader::with_capacity(1 << 20, gz), name, path)
+            Self::from_fasta_reader_with_hint(
+                BufReader::with_capacity(1 << 20, gz),
+                name,
+                path,
+                file_len.saturating_mul(3),
+            )
         } else {
-            Self::from_fasta_reader(reader, name, path)
+            Self::from_fasta_reader_with_hint(reader, name, path, file_len)
         }
     }
 
     /// Parse FASTA records from any [`BufRead`] source.
-    pub fn from_fasta_reader<R: BufRead>(mut reader: R, name: String, path: &Path) -> Result<Self> {
-        let mut data = Vec::new();
+    pub fn from_fasta_reader<R: BufRead>(reader: R, name: String, path: &Path) -> Result<Self> {
+        Self::from_fasta_reader_with_hint(reader, name, path, 0)
+    }
+
+    fn from_fasta_reader_with_hint<R: BufRead>(
+        mut reader: R,
+        name: String,
+        path: &Path,
+        capacity_hint: usize,
+    ) -> Result<Self> {
+        let mut data = Vec::with_capacity(capacity_hint);
         let mut records: Vec<SeqRecord> = Vec::new();
         let mut total_bases: u64 = 0;
-        let mut line = String::new();
+        let mut line = Vec::with_capacity(256);
         let mut in_record = false;
 
         loop {
             line.clear();
-            let n = reader.read_line(&mut line)?;
+            let n = reader.read_until(b'\n', &mut line)?;
             if n == 0 {
                 break;
             }
-            let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
-            if trimmed.is_empty() {
+            let mut end = line.len();
+            while end > 0 && (line[end - 1] == b'\n' || line[end - 1] == b'\r') {
+                end -= 1;
+            }
+            if end == 0 {
                 continue;
             }
-            if let Some(rest) = trimmed.strip_prefix('>') {
+            let trimmed = &line[..end];
+            if trimmed[0] == b'>' {
                 if in_record {
                     data.push(SEQ_SEP);
                 }
-                let header = rest.trim_start().to_string();
+                let header_str = String::from_utf8_lossy(&trimmed[1..]);
+                let header = header_str.trim_start().to_string();
                 let id = header.split_whitespace().next().unwrap_or("").to_string();
                 let start_with_sep = data.len() as u64;
                 records.push(SeqRecord {
@@ -104,12 +125,20 @@ impl Genome {
                     });
                 }
                 let rec = records.last_mut().unwrap();
-                for &b in trimmed.as_bytes() {
-                    if b.is_ascii_alphabetic() || b == SEQ_SEP {
-                        data.push(b);
-                        if b != SEQ_SEP {
+                // Fast path: most FASTA lines consist purely of ASCII letters.
+                if trimmed.iter().all(|b| b.is_ascii_alphabetic()) {
+                    data.extend_from_slice(trimmed);
+                    let len = trimmed.len() as u64;
+                    rec.len += len;
+                    total_bases += len;
+                } else {
+                    for &b in trimmed {
+                        if b.is_ascii_alphabetic() {
+                            data.push(b);
                             rec.len += 1;
                             total_bases += 1;
+                        } else if b == b'*' || b == SEQ_SEP {
+                            data.push(SEQ_SEP);
                         }
                     }
                 }
@@ -312,13 +341,13 @@ mod tests {
         assert_eq!(g.records[1].len, 4);
         assert_eq!(g.records[1].start_with_sep, 9);
         assert_eq!(g.records[1].start_no_sep, 8);
-        assert_eq!(&g.data, b"ACGTacGT*TTAA");
+        assert_eq!(&g.data, b"ACGTacGT\0TTAA");
 
         let rc = g.reverse_complement();
         assert_eq!(rc.num_records(), 2);
         assert_eq!(rc.records[0].id, "seqB");
         assert_eq!(rc.records[1].id, "seqA");
-        assert_eq!(&rc.data, b"TTAA*ACgtACGT");
+        assert_eq!(&rc.data, b"TTAA\0ACgtACGT");
     }
 
     #[test]

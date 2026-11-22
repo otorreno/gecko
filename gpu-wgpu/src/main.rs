@@ -86,14 +86,19 @@ fn main() -> ExitCode {
 
     let t0 = Instant::now();
 
-    let s_x = match FastSeq::load_fasta(Path::new(seq_x_path)) {
+    let (res_x, res_y) = std::thread::scope(|s| {
+        let hx = s.spawn(|| FastSeq::load_fasta(Path::new(seq_x_path)));
+        let ry = FastSeq::load_fasta(Path::new(seq_y_path));
+        (hx.join().expect("load_fasta X thread panicked"), ry)
+    });
+    let s_x = match res_x {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let s_y = match FastSeq::load_fasta(Path::new(seq_y_path)) {
+    let s_y = match res_y {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error: {e}");

@@ -26,6 +26,8 @@
 #include <math.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 
 #if defined(__AVX2__)
@@ -99,100 +101,143 @@ static unsigned char comp_base(unsigned char c) {
     }
 }
 
+static inline int line_is_pure_alpha(const unsigned char *p, size_t len) {
+    uint8_t bad = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t u = (uint8_t)((p[i] & 0xDFU) - (uint8_t)'A');
+        bad |= (uint8_t)(u >= 26U);
+    }
+    return bad == 0;
+}
+
+static inline void append_seq_line(const unsigned char *p, size_t line_len, unsigned char *dst, uint64_t *pos) {
+    if (line_is_pure_alpha(p, line_len)) {
+        memcpy(dst + *pos, p, line_len);
+        *pos += line_len;
+    } else {
+        for (size_t i = 0; i < line_len; i++) {
+            unsigned char c = p[i];
+            if ((uint8_t)((c & 0xDFU) - (uint8_t)'A') < 26U) {
+                dst[(*pos)++] = c;
+            } else if (c == '*') {
+                dst[(*pos)++] = 0x00;
+            }
+        }
+    }
+}
+
 static FastSeq *load_fasta(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
         fprintf(stderr, "Error: cannot open FASTA file: %s\n", path);
         exit(1);
     }
-
-    fseeko(f, 0, SEEK_END);
-    off_t fsize = ftello(f);
-    fseeko(f, 0, SEEK_SET);
-    if (fsize <= 0) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
         fprintf(stderr, "Error: empty FASTA file: %s\n", path);
         exit(1);
     }
+    size_t fsize = (size_t)st.st_size;
 
     FastSeq *fs = (FastSeq *)calloc(1, sizeof(FastSeq));
     if (!fs) terror("OOM FastSeq");
 
-    /* Allocate data with 64 bytes padding before/after for safe unaligned AVX2 loads */
-    size_t alloc_cap = (size_t)fsize + 128;
-    unsigned char *raw_alloc = (unsigned char *)calloc(alloc_cap, 1);
+    unsigned char *raw_alloc = (unsigned char *)malloc(fsize + 128);
     if (!raw_alloc) terror("OOM sequence buffer");
-    fs->data = raw_alloc + 64; /* 64 bytes of zero guard before data[0] */
+    memset(raw_alloc, 0, 64);
+    fs->data = raw_alloc + 64;
 
     size_t starts_cap = 1024;
     fs->seq_starts = (uint64_t *)malloc(starts_cap * sizeof(uint64_t));
     if (!fs->seq_starts) terror("OOM seq_starts");
 
-    const size_t io_buf_sz = 4 * 1024 * 1024;
-    unsigned char *io_buf = (unsigned char *)malloc(io_buf_sz);
-    if (!io_buf) terror("OOM io_buf");
+    const size_t CHUNK_CAP = 4 * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc(CHUNK_CAP);
+    if (!buf) terror("OOM read buffer");
 
+    unsigned char *dst = fs->data;
     uint64_t pos = 0;
     uint64_t n_seqs = 0;
-    int in_header = 0;
-    int capture_first_id = 0;
-    size_t id_len = 0;
     int seen_first_gt = 0;
+    size_t carry = 0;
+    size_t pred_w = 0;
 
-    size_t nread;
-    while ((nread = fread(io_buf, 1, io_buf_sz, f)) > 0) {
-        for (size_t i = 0; i < nread; i++) {
-            unsigned char c = io_buf[i];
-            if (in_header) {
-                if (c == '\n') {
-                    in_header = 0;
-                    capture_first_id = 0;
-                } else if (capture_first_id) {
-                    if (id_len == 0 && c == ' ') {
-                        /* skip leading spaces after '>' like LeeSeqDB */
-                    } else if (c == ' ' || c == '\r' || c == '\t') {
-                        capture_first_id = 0;
-                    } else if (id_len < MAXLID) {
-                        fs->ident[id_len++] = (char)c;
-                    }
-                }
+    ssize_t nr;
+    while ((nr = read(fd, buf + carry, CHUNK_CAP - carry)) > 0) {
+        size_t tot = carry + (size_t)nr;
+        const unsigned char *c = buf;
+        const unsigned char *e = buf + tot;
+
+        while (c < e) {
+            if (seen_first_gt && pred_w > 0 && c + pred_w < e && c[pred_w] == '\n' && line_is_pure_alpha(c, pred_w)) {
+                memcpy(dst + pos, c, pred_w);
+                pos += pred_w;
+                c += pred_w + 1;
                 continue;
             }
-            if (c == '>') {
-                in_header = 1;
+            const unsigned char *nl = (const unsigned char *)memchr(c, '\n', (size_t)(e - c));
+            if (!nl) break;
+
+            size_t line_len = (size_t)(nl - c);
+            int has_cr = (line_len > 0 && c[line_len - 1] == '\r');
+            if (has_cr) line_len--;
+
+            if (line_len > 0 && c[0] == '>') {
                 if (!seen_first_gt) {
                     seen_first_gt = 1;
-                    capture_first_id = 1;
                     fs->seq_starts[0] = 0;
                     n_seqs = 1;
+                    size_t k = 1;
+                    while (k < line_len && c[k] == ' ') k++;
+                    size_t id_len = 0;
+                    while (k < line_len && c[k] != ' ' && c[k] != '\t' && id_len < MAXLID) {
+                        fs->ident[id_len++] = (char)c[k++];
+                    }
+                    fs->ident[id_len] = '\0';
                 } else {
-                    fs->data[pos++] = 0x00; /* separator equivalent to '*' */
+                    dst[pos++] = 0x00;
                     if (n_seqs + 1 >= starts_cap) {
                         starts_cap *= 2;
                         fs->seq_starts = (uint64_t *)realloc(fs->seq_starts, starts_cap * sizeof(uint64_t));
                         if (!fs->seq_starts) terror("OOM seq_starts realloc");
                     }
-                    fs->seq_starts[n_seqs] = pos;
-                    n_seqs++;
+                    fs->seq_starts[n_seqs++] = pos;
                 }
-                continue;
+            } else if (seen_first_gt && line_len > 0) {
+                if (!has_cr && line_len >= 16) pred_w = line_len;
+                append_seq_line(c, line_len, dst, &pos);
             }
-            if (!seen_first_gt) continue;
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
-                fs->data[pos++] = c;
-            } else if (c == '*') {
-                fs->data[pos++] = 0x00;
+            c = nl + 1;
+        }
+
+        carry = (size_t)(e - c);
+        if (carry > 0) {
+            if (carry == CHUNK_CAP) {
+                if (seen_first_gt && buf[0] != '>') append_seq_line(buf, carry, dst, &pos);
+                carry = 0;
+            } else {
+                memmove(buf, c, carry);
             }
         }
     }
 
-    fs->ident[id_len] = '\0';
+    if (carry > 0) {
+        size_t line_len = carry;
+        if (buf[line_len - 1] == '\r') line_len--;
+        if (seen_first_gt && line_len > 0 && buf[0] != '>') {
+            append_seq_line(buf, line_len, dst, &pos);
+        }
+    }
+
+    free(buf);
+    close(fd);
+
+    memset(dst + pos, 0, 64);
     fs->buf_len = pos;
     fs->n_seqs = n_seqs;
     fs->n_bases = (n_seqs > 0) ? (pos - (n_seqs - 1)) : 0;
     fs->seq_starts[n_seqs] = pos + 1;
-
-    free(io_buf);
-    fclose(f);
     return fs;
 }
 
@@ -205,23 +250,28 @@ static FastSeq *build_revcomp_seq(const FastSeq *src) {
     rc->n_bases = src->n_bases;
     rc->n_seqs = src->n_seqs;
 
-    unsigned char *raw_alloc = (unsigned char *)calloc(src->buf_len + 128, 1);
+    unsigned char *raw_alloc = (unsigned char *)malloc(src->buf_len + 128);
     if (!raw_alloc) terror("OOM rc data");
+    memset(raw_alloc, 0, 64);
     rc->data = raw_alloc + 64;
+    memset(rc->data + src->buf_len, 0, 64);
+
+    unsigned char comp_lut[256];
+    for (int i = 0; i < 256; i++) comp_lut[i] = comp_base((unsigned char)i);
 
     uint64_t L = src->buf_len;
+    const unsigned char *sdata = src->data;
+    unsigned char *rdata = rc->data;
     for (uint64_t i = 0; i < L; i++) {
-        rc->data[i] = comp_base(src->data[L - 1 - i]);
+        rdata[i] = comp_lut[sdata[L - 1 - i]];
     }
 
     rc->seq_starts = (uint64_t *)malloc((src->n_seqs + 1) * sizeof(uint64_t));
     if (!rc->seq_starts) terror("OOM rc seq_starts");
     rc->seq_starts[0] = 0;
     uint64_t s = 1;
-    for (uint64_t i = 0; i < L; i++) {
-        if (rc->data[i] == 0x00) {
-            rc->seq_starts[s++] = i + 1;
-        }
+    for (uint64_t k = src->n_seqs; k > 1; k--) {
+        rc->seq_starts[s++] = L - src->seq_starts[k - 1] + 1;
     }
     rc->seq_starts[rc->n_seqs] = L + 1;
     return rc;
@@ -1658,8 +1708,77 @@ static size_t dedup_frags(struct FragFile *arr, size_t n) {
 }
 
 /* ============================================================================
- * Output Writers (100% GECKO-compatible .frags, .INF, .MAT, .csv)
+ * Fast Buffered Output Writers (100% GECKO-compatible .frags, .INF, .MAT, .csv)
  * ============================================================================ */
+static inline void put_be64(uint8_t *dst, uint64_t v) {
+    uint64_t be = __builtin_bswap64(v);
+    memcpy(dst, &be, 8);
+}
+
+static inline void put_be32(uint8_t *dst, uint32_t v) {
+    uint32_t be = __builtin_bswap32(v);
+    memcpy(dst, &be, 4);
+}
+
+static inline void pack_frag_be93(uint8_t *dst, const struct FragFile *f) {
+    put_be64(dst +  0, (uint64_t)f->diag);
+    put_be64(dst +  8, f->xStart);
+    put_be64(dst + 16, f->yStart);
+    put_be64(dst + 24, f->xEnd);
+    put_be64(dst + 32, f->yEnd);
+    put_be64(dst + 40, f->length);
+    put_be64(dst + 48, f->ident);
+    put_be64(dst + 56, f->score);
+    uint32_t sim_bits;
+    memcpy(&sim_bits, &f->similarity, 4);
+    put_be32(dst + 64, sim_bits);
+    put_be64(dst + 68, f->seqX);
+    put_be64(dst + 76, f->seqY);
+    put_be64(dst + 84, (uint64_t)f->block);
+    dst[92] = (uint8_t)f->strand;
+}
+
+static inline char *append_u64(char *p, uint64_t v) {
+    char tmp[24];
+    int n = 0;
+    do {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v);
+    while (n > 0) *p++ = tmp[--n];
+    return p;
+}
+
+static inline char *append_fixed2(char *p, double val) {
+    if (val < 0.0) { *p++ = '-'; val = -val; }
+    uint64_t scaled = (uint64_t)(val * 100.0 + 0.5);
+    p = append_u64(p, scaled / 100);
+    *p++ = '.';
+    uint64_t frac = scaled % 100;
+    *p++ = (char)('0' + (frac / 10));
+    *p++ = (char)('0' + (frac % 10));
+    return p;
+}
+
+static inline char *format_csv_frag(char *p, const struct FragFile *f, uint64_t ys, uint64_t ye) {
+    double pct_ident = 100.0 * ((double)f->ident / (double)f->length);
+    memcpy(p, "Frag,", 5); p += 5;
+    p = append_u64(p, f->xStart); *p++ = ',';
+    p = append_u64(p, ys); *p++ = ',';
+    p = append_u64(p, f->xEnd); *p++ = ',';
+    p = append_u64(p, ye); *p++ = ',';
+    *p++ = f->strand; *p++ = ',';
+    p = append_u64(p, (uint64_t)f->block); *p++ = ',';
+    p = append_u64(p, f->length); *p++ = ',';
+    p = append_u64(p, f->score); *p++ = ',';
+    p = append_u64(p, f->ident); *p++ = ',';
+    p = append_fixed2(p, (double)f->similarity); *p++ = ',';
+    p = append_fixed2(p, pct_ident); *p++ = ',';
+    p = append_u64(p, f->seqX); *p++ = ',';
+    p = append_u64(p, f->seqY); *p++ = '\n';
+    return p;
+}
+
 static void write_outputs(
     const char *out_prefix,
     const char *seqX_path,
@@ -1677,100 +1796,110 @@ static void write_outputs(
     long coverage[1000][100]
 ) {
     char path[1024];
+    uint64_t n0 = sX->n_bases;
+    uint64_t n1 = sY->n_bases;
+    const size_t BUF_CAP = 4 * 1024 * 1024;
+    uint8_t *io_buf = (uint8_t *)malloc(BUF_CAP);
+    if (!io_buf) terror("OOM output io_buf");
 
-    /* 1. Binary .frags file (GECKO big-endian format) */
+    /* 1. Fast buffered binary .frags file (GECKO big-endian 93-byte records) */
     snprintf(path, sizeof(path), "%s.frags", out_prefix);
     FILE *fOut = fopen(path, "wb");
     if (!fOut) terror("opening output .frags file");
-
-    uint64_t n0 = sX->n_bases;
-    uint64_t n1 = sY->n_bases;
-    writeSequenceLength(&n0, fOut);
-    writeSequenceLength(&n1, fOut);
-
+    put_be64(io_buf, n0);
+    put_be64(io_buf + 8, n1);
+    size_t bpos = 16;
     for (size_t i = 0; i < nf_f; i++) {
-        struct FragFile tmp = frags_f[i];
-        writeFragment(&tmp, fOut);
+        if (bpos + 93 > BUF_CAP) { fwrite(io_buf, 1, bpos, fOut); bpos = 0; }
+        pack_frag_be93(io_buf + bpos, &frags_f[i]);
+        bpos += 93;
     }
     for (size_t i = 0; i < nf_r; i++) {
-        struct FragFile tmp = frags_r[i];
-        writeFragment(&tmp, fOut);
+        if (bpos + 93 > BUF_CAP) { fwrite(io_buf, 1, bpos, fOut); bpos = 0; }
+        pack_frag_be93(io_buf + bpos, &frags_r[i]);
+        bpos += 93;
     }
+    if (bpos > 0) fwrite(io_buf, 1, bpos, fOut);
     fclose(fOut);
 
-    /* 2. .frags.MAT file */
+    /* 2. Fast buffered .frags.MAT file */
     snprintf(path, sizeof(path), "%s.frags.MAT", out_prefix);
-    FILE *fMat = fopen(path, "wt");
+    FILE *fMat = fopen(path, "wb");
     if (!fMat) terror("opening output .frags.MAT file");
+    char *cp = (char *)io_buf;
+    char *cend = cp + BUF_CAP - 64;
     for (int i = 0; i < 1000; i++) {
         for (int j = 0; j < 100; j++) {
-            fprintf(fMat, "%ld\t", coverage[i][j]);
+            if (cp >= cend) { fwrite(io_buf, 1, (size_t)(cp - (char *)io_buf), fMat); cp = (char *)io_buf; }
+            cp = append_u64(cp, (uint64_t)coverage[i][j]);
+            *cp++ = '\t';
         }
-        fprintf(fMat, "\n");
+        *cp++ = '\n';
     }
+    if (cp > (char *)io_buf) fwrite(io_buf, 1, (size_t)(cp - (char *)io_buf), fMat);
     fclose(fMat);
 
     /* 3. .frags.INF file */
+    char inf_hdr[2048];
+    int hdr_len = snprintf(inf_hdr, sizeof(inf_hdr),
+        "All by-Identity Ungapped Fragments (gecko_fast in-memory engine)\n"
+        "[GECKO-compatible output]\n"
+        "SeqX filename        : %s\n"
+        "SeqY filename        : %s\n"
+        "SeqX name            : %s\n"
+        "SeqY name            : %s\n"
+        "SeqX length          : %" PRIu64 "\n"
+        "SeqY length          : %" PRIu64 "\n"
+        "Min.fragment.length  : %" PRIu64 "\n"
+        "Min.Identity         : %" PRIu64 "\n"
+        "Tot Hits (seeds)     : %" PRIu64 "\n"
+        "Tot Hits (seeds) used: %" PRIu64 "\n"
+        "Total fragments      : %" PRIu64 "\n"
+        "========================================================\n",
+        seqX_path, seqY_path, sX->ident, sY->ident, n0, n1, Lmin, SimTh,
+        tot_hits, tot_hits_used, (uint64_t)(nf_f + nf_r));
+
     snprintf(path, sizeof(path), "%s.frags.INF", out_prefix);
-    FILE *fInf = fopen(path, "wt");
+    FILE *fInf = fopen(path, "wb");
     if (!fInf) terror("opening output .frags.INF file");
-    fprintf(fInf, "All by-Identity Ungapped Fragments (gecko_fast in-memory engine)\n");
-    fprintf(fInf, "[GECKO-compatible output]\n");
-    fprintf(fInf, "SeqX filename        : %s\n", seqX_path);
-    fprintf(fInf, "SeqY filename        : %s\n", seqY_path);
-    fprintf(fInf, "SeqX name            : %s\n", sX->ident);
-    fprintf(fInf, "SeqY name            : %s\n", sY->ident);
-    fprintf(fInf, "SeqX length          : %" PRIu64 "\n", n0);
-    fprintf(fInf, "SeqY length          : %" PRIu64 "\n", n1);
-    fprintf(fInf, "Min.fragment.length  : %" PRIu64 "\n", Lmin);
-    fprintf(fInf, "Min.Identity         : %" PRIu64 "\n", SimTh);
-    fprintf(fInf, "Tot Hits (seeds)     : %" PRIu64 "\n", tot_hits);
-    fprintf(fInf, "Tot Hits (seeds) used: %" PRIu64 "\n", tot_hits_used);
-    fprintf(fInf, "Total fragments      : %" PRIu64 "\n", (uint64_t)(nf_f + nf_r));
-    fprintf(fInf, "========================================================\n");
+    fwrite(inf_hdr, 1, (size_t)hdr_len, fInf);
     fclose(fInf);
 
-    /* 4. .csv file (matching workflow.sh + getInfoCSB.c output exactly) */
+    /* 4. Fast buffered .csv file */
     snprintf(path, sizeof(path), "%s.csv", out_prefix);
-    FILE *fCsv = fopen(path, "wt");
+    FILE *fCsv = fopen(path, "wb");
     if (!fCsv) terror("opening output .csv file");
-    fprintf(fCsv, "All by-Identity Ungapped Fragments (gecko_fast in-memory engine)\n");
-    fprintf(fCsv, "[GECKO-compatible output]\n");
-    fprintf(fCsv, "SeqX filename        : %s\n", seqX_path);
-    fprintf(fCsv, "SeqY filename        : %s\n", seqY_path);
-    fprintf(fCsv, "SeqX name            : %s\n", sX->ident);
-    fprintf(fCsv, "SeqY name            : %s\n", sY->ident);
-    fprintf(fCsv, "SeqX length          : %" PRIu64 "\n", n0);
-    fprintf(fCsv, "SeqY length          : %" PRIu64 "\n", n1);
-    fprintf(fCsv, "Min.fragment.length  : %" PRIu64 "\n", Lmin);
-    fprintf(fCsv, "Min.Identity         : %" PRIu64 "\n", SimTh);
-    fprintf(fCsv, "Tot Hits (seeds)     : %" PRIu64 "\n", tot_hits);
-    fprintf(fCsv, "Tot Hits (seeds) used: %" PRIu64 "\n", tot_hits_used);
-    fprintf(fCsv, "Total fragments      : %" PRIu64 "\n", (uint64_t)(nf_f + nf_r));
-    fprintf(fCsv, "========================================================\n");
-    fprintf(fCsv, "Total CSB: 0\n");
-    fprintf(fCsv, "========================================================\n");
-    fprintf(fCsv, "Type,xStart,yStart,xEnd,yEnd,strand(f/r),block,length,score,ident,similarity,%%ident,SeqX,SeqY\n");
+    fwrite(inf_hdr, 1, (size_t)hdr_len, fCsv);
+    static const char csv_cols[] =
+        "Total CSB: 0\n"
+        "========================================================\n"
+        "Type,xStart,yStart,xEnd,yEnd,strand(f/r),block,length,score,ident,similarity,%ident,SeqX,SeqY\n";
+    fwrite(csv_cols, 1, sizeof(csv_cols) - 1, fCsv);
 
+    cp = (char *)io_buf;
+    cend = cp + BUF_CAP - 512;
     for (size_t i = 0; i < nf_f; i++) {
-        const struct FragFile *f = &frags_f[i];
-        double pct_ident = 100.0 * ((double)f->ident / (double)f->length);
-        fprintf(fCsv, "Frag,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%c,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%.2f,%.2f,%" PRIu64 ",%" PRIu64 "\n",
-                f->xStart, f->yStart, f->xEnd, f->yEnd, f->strand,
-                (uint64_t)f->block, f->length, f->score, f->ident,
-                f->similarity, pct_ident, f->seqX, f->seqY);
+        if (cp >= cend) { fwrite(io_buf, 1, (size_t)(cp - (char *)io_buf), fCsv); cp = (char *)io_buf; }
+        cp = format_csv_frag(cp, &frags_f[i], frags_f[i].yStart, frags_f[i].yEnd);
     }
     for (size_t i = 0; i < nf_r; i++) {
-        const struct FragFile *f = &frags_r[i];
-        double pct_ident = 100.0 * ((double)f->ident / (double)f->length);
-        uint64_t ys = n1 - f->yStart - 1;
-        uint64_t ye = n1 - f->yEnd - 1;
-        fprintf(fCsv, "Frag,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%c,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%.2f,%.2f,%" PRIu64 ",%" PRIu64 "\n",
-                f->xStart, ys, f->xEnd, ye, f->strand,
-                (uint64_t)f->block, f->length, f->score, f->ident,
-                f->similarity, pct_ident, f->seqX, f->seqY);
+        if (cp >= cend) { fwrite(io_buf, 1, (size_t)(cp - (char *)io_buf), fCsv); cp = (char *)io_buf; }
+        cp = format_csv_frag(cp, &frags_r[i], n1 - frags_r[i].yStart - 1, n1 - frags_r[i].yEnd - 1);
     }
+    if (cp > (char *)io_buf) fwrite(io_buf, 1, (size_t)(cp - (char *)io_buf), fCsv);
     fclose(fCsv);
+    free(io_buf);
+}
+
+typedef struct {
+    const char *path;
+    FastSeq *out;
+} LoadTask;
+
+static void *load_fasta_thread(void *arg) {
+    LoadTask *t = (LoadTask *)arg;
+    t->out = load_fasta(t->path);
+    return NULL;
 }
 
 /* ============================================================================
@@ -1826,14 +1955,20 @@ int main(int argc, char **argv) {
     init_base_table();
     double t0 = now_sec();
 
-    /* 1. Load sequences & generate in-memory reverse complement of Y */
-    FastSeq *sX = load_fasta(seqX_path);
+    /* 1. Load seqX and seqY concurrently on 2 threads, then build in-memory revcomp of Y */
+    LoadTask load_x_task = { .path = seqX_path, .out = NULL };
+    pthread_t load_x_th;
+    pthread_create(&load_x_th, NULL, load_fasta_thread, &load_x_task);
+
     FastSeq *sY = load_fasta(seqY_path);
     if (sY->buf_len >= (1ULL << 31)) {
+        pthread_join(load_x_th, NULL);
         fprintf(stderr, "Error: reference sequence exceeds 2.14 Gb limit for 32-bit position packing.\n");
         return 1;
     }
     FastSeq *sY_rc = build_revcomp_seq(sY);
+    pthread_join(load_x_th, NULL);
+    FastSeq *sX = load_x_task.out;
 
     double t_load = now_sec();
 

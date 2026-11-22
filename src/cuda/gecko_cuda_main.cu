@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <algorithm>
+#include <thread>
 #include <vector>
 
 #include "cuda_common.cuh"
@@ -54,29 +55,40 @@ int main(int argc, char **argv) {
 
     double t0 = gecko_now_sec();
 
-    /* 1. Load FASTA sequences on host */
-    FastSeq *sX = gecko_load_fasta(seqX_path);
+    /* 1. Load seqX on a background thread while main thread loads seqY and immediately
+     *    starts GPU upload + reverse-complement + GPU index construction for seqY! */
+    FastSeq *sX = nullptr;
+    std::thread load_x_thread([&]() { sX = gecko_load_fasta(seqX_path); });
+
     FastSeq *sY = gecko_load_fasta(seqY_path);
-    if (sX->buf_len >= (1ULL << 31) || sY->buf_len >= (1ULL << 31)) {
-        fprintf(stderr, "Error: sequences >= 2.14 Gb exceed 31-bit packed hit coordinates.\n");
+    if (sY->buf_len >= (1ULL << 31)) {
+        load_x_thread.join();
+        fprintf(stderr, "Error: reference >= 2.14 Gb exceeds 31-bit packed hit coordinates.\n");
         return 1;
     }
-    uint64_t min_len = fixedL ? Lmin : (uint64_t)((double)std::min(sX->n_bases, sY->n_bases) * ((double)Lmin / 100.0));
     FastSeq sY_rc_meta = gecko_build_rc_meta(sY);
     double t_load = gecko_now_sec();
 
-    /* 2. Upload sequences & build reverse complement on GPU */
+    /* 2. Upload seqY, build Y_rc on GPU, and build GPU canonical index while seqX finishes loading */
     uint8_t *d_seqX = nullptr, *d_seqY = nullptr, *d_seqY_rc = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_seqX, sX->buf_len + 64));
     CUDA_CHECK(cudaMalloc(&d_seqY, sY->buf_len + 64));
     CUDA_CHECK(cudaMalloc(&d_seqY_rc, sY->buf_len + 64));
-    CUDA_CHECK(cudaMemcpy(d_seqX, sX->data, sX->buf_len + 64, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_seqY, sY->data, sY->buf_len + 64, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_seqY_rc + sY->buf_len, 0, 64));
     gpu_build_revcomp(d_seqY, d_seqY_rc, sY->buf_len);
 
     /* 3. Stage 1: GPU Canonical k-mer Index Construction */
     GpuRefIndex idx = gpu_build_ref_index(d_seqY, sY->buf_len, WL, freq_limit);
+
+    /* Join seqX loader and upload seqX */
+    load_x_thread.join();
+    if (sX->buf_len >= (1ULL << 31)) {
+        fprintf(stderr, "Error: query >= 2.14 Gb exceeds 31-bit packed hit coordinates.\n");
+        return 1;
+    }
+    uint64_t min_len = fixedL ? Lmin : (uint64_t)((double)std::min(sX->n_bases, sY->n_bases) * ((double)Lmin / 100.0));
+    CUDA_CHECK(cudaMalloc(&d_seqX, sX->buf_len + 64));
+    CUDA_CHECK(cudaMemcpy(d_seqX, sX->data, sX->buf_len + 64, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaDeviceSynchronize());
     double t_index = gecko_now_sec();
 

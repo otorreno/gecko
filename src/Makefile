@@ -15,7 +15,7 @@ CUDA_SRCS=cuda/gecko_cuda_main.cu cuda/cuda_io.cu cuda/cuda_index.cu cuda/cuda_q
 gecko_cuda: $(CUDA_SRCS) cuda/cuda_common.cuh
 	$(CC) $(CFLAGS) -c comparisonFunctions.c -o cuda/comparisonFunctions.o
 	$(CC) $(CFLAGS) -c commonFunctions.c -o cuda/commonFunctions.o
-	$(NVCC) -O3 -std=c++17 $(CUDA_ARCH) -D_FILE_OFFSET_BITS=64 -I. $(CUDA_SRCS) cuda/comparisonFunctions.o cuda/commonFunctions.o -o $(BIN)/gecko_cuda
+	$(NVCC) -O3 -std=c++17 $(CUDA_ARCH) -D_FILE_OFFSET_BITS=64 -I. $(CUDA_SRCS) cuda/comparisonFunctions.o cuda/commonFunctions.o -Xcompiler -pthread -o $(BIN)/gecko_cuda
 
 gecko_wgpu:
 	cargo build --release --manifest-path ../gpu-wgpu/Cargo.toml

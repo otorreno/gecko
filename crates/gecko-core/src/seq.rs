@@ -300,6 +300,79 @@ impl PackedSeq {
             special_runs,
         }
     }
+
+    /// Build a 1-bit/bp bitmap (`u32` words, padded with 2 trailing `0u32` sentinels) marking
+    /// every special position (`'N'`, `SEQ_SEP`, or rare IUPAC code). Returns `None` if empty.
+    pub fn special_bitmap(&self) -> Option<Vec<u32>> {
+        if self.special_runs.is_empty() || self.len == 0 {
+            return None;
+        }
+        Some(build_runs_bitmap(self.len, &[&self.special_runs]))
+    }
+
+    /// Build a 1-bit/bp bitmap (`u32` words, padded with 2 trailing `0u32` sentinels) marking
+    /// every position that cannot participate in a seed k-mer (special bases, plus soft-masked
+    /// lowercase runs when `soft_mask` is true).
+    ///
+    /// Returns `None` if all positions are valid seed bases. Callers can also check
+    /// `self.invalid_bitmap_aliases_special(soft_mask)` to reuse `special_bitmap` directly
+    /// without allocating or uploading a second bitmap.
+    pub fn invalid_seed_bitmap(&self, soft_mask: bool) -> Option<Vec<u32>> {
+        if self.len == 0 {
+            return None;
+        }
+        let has_soft = soft_mask && !self.soft_runs.is_empty();
+        if self.special_runs.is_empty() && !has_soft {
+            return None;
+        }
+        if has_soft {
+            Some(build_runs_bitmap(
+                self.len,
+                &[&self.special_runs, &self.soft_runs],
+            ))
+        } else {
+            Some(build_runs_bitmap(self.len, &[&self.special_runs]))
+        }
+    }
+
+    /// Returns `true` when the invalid-seed bitmap is identical to `special_bitmap`
+    /// (i.e. `!soft_mask || self.soft_runs.is_empty()`), allowing GPU backends to alias both.
+    #[inline]
+    pub fn invalid_bitmap_aliases_special(&self, soft_mask: bool) -> bool {
+        !soft_mask || self.soft_runs.is_empty()
+    }
+}
+
+/// Fill a 1-bit/bp `u32` bitmap (with 2 trailing zero sentinel words for unaligned 32-bit loads)
+/// from one or more sorted half-open `[start, end)` run lists.
+fn build_runs_bitmap(len: usize, run_slices: &[&[(u64, u64)]]) -> Vec<u32> {
+    let n_words = len.div_ceil(32);
+    let mut words = vec![0u32; n_words + 2];
+    for runs in run_slices {
+        for &(s, e) in *runs {
+            let start = (s as usize).min(len);
+            let end = (e as usize).min(len);
+            if start >= end {
+                continue;
+            }
+            let w_s = start >> 5;
+            let b_s = start & 31;
+            let last = end - 1;
+            let w_e = last >> 5;
+            let b_e = last & 31;
+            if w_s == w_e {
+                let mask = (u32::MAX << b_s) & (u32::MAX >> (31 - b_e));
+                words[w_s] |= mask;
+            } else {
+                words[w_s] |= u32::MAX << b_s;
+                if w_s + 1 < w_e {
+                    words[w_s + 1..w_e].fill(u32::MAX);
+                }
+                words[w_e] |= u32::MAX >> (31 - b_e);
+            }
+        }
+    }
+    words
 }
 
 #[inline(always)]
@@ -987,6 +1060,32 @@ mod tests {
                     "valid_run mismatch at i={i}, soft_mask={soft_mask}"
                 );
             }
+            let inv_bm = g.seq.invalid_seed_bitmap(soft_mask).unwrap();
+            for (i, &is_valid) in got.iter().enumerate() {
+                let bit_set = ((inv_bm[i >> 5] >> (i & 31)) & 1) != 0;
+                assert_eq!(
+                    bit_set, !is_valid,
+                    "invalid_seed_bitmap mismatch at i={i}, soft_mask={soft_mask}"
+                );
+            }
+        }
+        let sp_bm = g.seq.special_bitmap().unwrap();
+        for (i, &b) in expected_raw.iter().enumerate() {
+            let bit_set = ((sp_bm[i >> 5] >> (i & 31)) & 1) != 0;
+            let want_sp = !matches!(
+                b,
+                b'A' | b'C' | b'G' | b'T' | b'U' | b'a' | b'c' | b'g' | b't' | b'u'
+            );
+            assert_eq!(bit_set, want_sp, "special_bitmap mismatch at i={i}");
+        }
+        // Multi-word run (> 100 bp) bitmap verification
+        let long_n = format!("AAAA{}TTTT{}CCCC", "N".repeat(100), "a".repeat(75));
+        let g2 = Genome::from_records("g2", [("s0", long_n.as_bytes())]);
+        let inv2 = g2.seq.invalid_seed_bitmap(true).unwrap();
+        for (i, &b) in long_n.as_bytes().iter().enumerate() {
+            let bit_set = ((inv2[i >> 5] >> (i & 31)) & 1) != 0;
+            let want_inv = !matches!(b, b'A' | b'C' | b'G' | b'T');
+            assert_eq!(bit_set, want_inv, "multi-word bitmap mismatch at i={i}");
         }
     }
 }

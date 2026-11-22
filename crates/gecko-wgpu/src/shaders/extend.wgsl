@@ -1,6 +1,6 @@
 // extend.wgsl
-// WGSL compute shader for exact GECKO bidirectional ungapped extension
-// supporting configurable scoring and '*' (42) / 0x00 multi-FASTA separators.
+// 2-bit PackedSeq WGSL compute shader for exact GECKO bidirectional ungapped extension
+// supporting configurable scoring, 'N' penalties, multi-FASTA SEQ_SEP, and rare IUPAC codes.
 
 struct ExtendParams {
     len_x: u32,
@@ -13,8 +13,24 @@ struct ExtendParams {
     match_score: i32,
     mismatch_penalty: i32,
     n_penalty: i32,
+    sp_x_off: u32,       // word offset into special_bm, or 0xFFFFFFFF if none
+    sp_y_off: u32,
+    sp_yrc_off: u32,
+    sep_x_off: u32,      // u32 offset into meta_buf
+    sep_x_len: u32,
+    sep_y_off: u32,
+    sep_y_len: u32,
+    sep_yrc_off: u32,
+    sep_yrc_len: u32,
+    iupac_x_off: u32,    // u32 offset into meta_buf (pairs of [pos, upper_ascii])
+    iupac_x_len: u32,
+    iupac_y_off: u32,
+    iupac_y_len: u32,
+    iupac_yrc_off: u32,
+    iupac_yrc_len: u32,
     _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
 };
 
 struct HitRec {
@@ -36,25 +52,79 @@ struct FragOut {
 };
 
 @group(0) @binding(0) var<uniform> params: ExtendParams;
-@group(0) @binding(1) var<storage, read> seq_x: array<u32>;
-@group(0) @binding(2) var<storage, read> seq_y: array<u32>;
-@group(0) @binding(3) var<storage, read> seq_y_rc: array<u32>;
-@group(0) @binding(4) var<storage, read> hits: array<HitRec>;
-@group(0) @binding(5) var<storage, read_write> out_frags: array<FragOut>;
-@group(0) @binding(6) var<storage, read_write> frag_count: atomic<u32>;
+@group(0) @binding(1) var<storage, read> seq_x_bits: array<u32>;
+@group(0) @binding(2) var<storage, read> seq_y_bits: array<u32>;
+@group(0) @binding(3) var<storage, read> seq_y_rc_bits: array<u32>;
+@group(0) @binding(4) var<storage, read> special_bm: array<u32>;
+@group(0) @binding(5) var<storage, read> meta_buf: array<u32>;
+@group(0) @binding(6) var<storage, read> hits: array<HitRec>;
+@group(0) @binding(7) var<storage, read_write> out_frags: array<FragOut>;
+@group(0) @binding(8) var<storage, read_write> frag_count: atomic<u32>;
 
-fn read_raw_x(idx: u32) -> u32 {
-    return (seq_x[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xFFu;
+const NONE_OFF: u32 = 0xFFFFFFFFu;
+
+fn base_2bit_x(pos: u32) -> u32 {
+    return (seq_x_bits[pos >> 4u] >> ((pos & 15u) * 2u)) & 3u;
 }
 
-fn read_raw_y(idx: u32, is_rev: u32) -> u32 {
+fn base_2bit_y(pos: u32, is_rev: u32) -> u32 {
     var word: u32 = 0u;
     if (is_rev == 0u) {
-        word = seq_y[idx >> 2u];
+        word = seq_y_bits[pos >> 4u];
     } else {
-        word = seq_y_rc[idx >> 2u];
+        word = seq_y_rc_bits[pos >> 4u];
     }
-    return (word >> ((idx & 3u) * 8u)) & 0xFFu;
+    return (word >> ((pos & 15u) * 2u)) & 3u;
+}
+
+fn is_special(bm_off: u32, pos: u32) -> bool {
+    if (bm_off == NONE_OFF) {
+        return false;
+    }
+    return ((special_bm[bm_off + (pos >> 5u)] >> (pos & 31u)) & 1u) != 0u;
+}
+
+fn base_2bit_to_ascii(b: u32) -> u32 {
+    if (b == 0u) { return 65u; } // 'A'
+    if (b == 1u) { return 67u; } // 'C'
+    if (b == 2u) { return 71u; } // 'G'
+    return 84u;                  // 'T'
+}
+
+fn decode_special(pos: u32, sep_off: u32, sep_len: u32, iupac_off: u32, iupac_len: u32) -> u32 {
+    if (sep_len > 0u) {
+        var lo: u32 = 0u;
+        var hi: u32 = sep_len;
+        loop {
+            if (lo >= hi) { break; }
+            let mid = lo + ((hi - lo) >> 1u);
+            if (meta_buf[sep_off + mid] < pos) {
+                lo = mid + 1u;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < sep_len && meta_buf[sep_off + lo] == pos) {
+            return 0u; // SEQ_SEP
+        }
+    }
+    if (iupac_len > 0u) {
+        var lo: u32 = 0u;
+        var hi: u32 = iupac_len;
+        loop {
+            if (lo >= hi) { break; }
+            let mid = lo + ((hi - lo) >> 1u);
+            if (meta_buf[iupac_off + mid * 2u] < pos) {
+                lo = mid + 1u;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < iupac_len && meta_buf[iupac_off + lo * 2u] == pos) {
+            return meta_buf[iupac_off + lo * 2u + 1u];
+        }
+    }
+    return 78u; // 'N'
 }
 
 @compute @workgroup_size(128)
@@ -73,9 +143,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let mm_pen = params.mismatch_penalty;
     let n_pen = params.n_penalty;
 
+    let sp_x_off = params.sp_x_off;
+    let sp_y_off = select(params.sp_y_off, params.sp_yrc_off, is_rev != 0u);
+    let sep_y_off = select(params.sep_y_off, params.sep_yrc_off, is_rev != 0u);
+    let sep_y_len = select(params.sep_y_len, params.sep_yrc_len, is_rev != 0u);
+    let iupac_y_off = select(params.iupac_y_off, params.iupac_yrc_off, is_rev != 0u);
+    let iupac_y_len = select(params.iupac_y_len, params.iupac_yrc_len, is_rev != 0u);
+
     // Forward pass
-    var xfil = pos_x + wl;
-    var ycol = pos_y + wl;
+    let xfil = pos_x + wl;
+    let ycol = pos_y + wl;
     let rem_fwd = min(params.len_x - xfil, params.len_y - ycol);
 
     var xfilmax = pos_x + wl - 1u;
@@ -86,26 +163,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var max_ident: u32 = wl;
 
     for (var step: u32 = 0u; step < rem_fwd; step = step + 1u) {
-        let rx = read_raw_x(xfil + step);
-        let ry = read_raw_y(ycol + step, is_rev);
-        if (rx == 0u || ry == 0u || rx == 42u || ry == 42u) {
-            break;
-        }
-        let cx = rx & 0xDFu;
-        let cy = ry & 0xDFu;
-        if (cx == 78u || cy == 78u) { // 'N'
-            fscore = fscore - n_pen;
-        } else if (cx == cy) {
-            fscore = fscore + match_sc;
-            n_ident = n_ident + 1u;
-            if (fscore_max < fscore) {
-                fscore_max = fscore;
-                xfilmax = xfil + step;
-                ycolmax = ycol + step;
-                max_ident = n_ident;
+        let px = xfil + step;
+        let py = ycol + step;
+        let sp_x = is_special(sp_x_off, px);
+        let sp_y = is_special(sp_y_off, py);
+        if (!sp_x && !sp_y) {
+            if (base_2bit_x(px) == base_2bit_y(py, is_rev)) {
+                fscore = fscore + match_sc;
+                n_ident = n_ident + 1u;
+                if (fscore_max < fscore) {
+                    fscore_max = fscore;
+                    xfilmax = px;
+                    ycolmax = py;
+                    max_ident = n_ident;
+                }
+            } else {
+                fscore = fscore - mm_pen;
             }
         } else {
-            fscore = fscore - mm_pen;
+            let cx = select(
+                base_2bit_to_ascii(base_2bit_x(px)),
+                decode_special(px, params.sep_x_off, params.sep_x_len, params.iupac_x_off, params.iupac_x_len),
+                sp_x
+            );
+            let cy = select(
+                base_2bit_to_ascii(base_2bit_y(py, is_rev)),
+                decode_special(py, sep_y_off, sep_y_len, iupac_y_off, iupac_y_len),
+                sp_y
+            );
+            if (cx == 0u || cy == 0u) {
+                break;
+            }
+            if (cx == 78u || cy == 78u) {
+                fscore = fscore - n_pen;
+            } else if (cx == cy) {
+                fscore = fscore + match_sc;
+                n_ident = n_ident + 1u;
+                if (fscore_max < fscore) {
+                    fscore_max = fscore;
+                    xfilmax = px;
+                    ycolmax = py;
+                    max_ident = n_ident;
+                }
+            } else {
+                fscore = fscore - mm_pen;
+            }
         }
         if (fscore < 0) {
             break;
@@ -120,26 +222,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     n_ident = max_ident;
 
     for (var step: u32 = 1u; step <= rem_bwd; step = step + 1u) {
-        let rx = read_raw_x(pos_x - step);
-        let ry = read_raw_y(pos_y - step, is_rev);
-        if (rx == 0u || ry == 0u || rx == 42u || ry == 42u) {
-            break;
-        }
-        let cx = rx & 0xDFu;
-        let cy = ry & 0xDFu;
-        if (cx == 78u || cy == 78u) {
-            fscore = fscore - n_pen;
-        } else if (cx == cy) {
-            fscore = fscore + match_sc;
-            n_ident = n_ident + 1u;
-            if (fscore_max < fscore) {
-                fscore_max = fscore;
-                xfilmax2 = pos_x - step;
-                ycolmax2 = pos_y - step;
-                max_ident = n_ident;
+        let px = pos_x - step;
+        let py = pos_y - step;
+        let sp_x = is_special(sp_x_off, px);
+        let sp_y = is_special(sp_y_off, py);
+        if (!sp_x && !sp_y) {
+            if (base_2bit_x(px) == base_2bit_y(py, is_rev)) {
+                fscore = fscore + match_sc;
+                n_ident = n_ident + 1u;
+                if (fscore_max < fscore) {
+                    fscore_max = fscore;
+                    xfilmax2 = px;
+                    ycolmax2 = py;
+                    max_ident = n_ident;
+                }
+            } else {
+                fscore = fscore - mm_pen;
             }
         } else {
-            fscore = fscore - mm_pen;
+            let cx = select(
+                base_2bit_to_ascii(base_2bit_x(px)),
+                decode_special(px, params.sep_x_off, params.sep_x_len, params.iupac_x_off, params.iupac_x_len),
+                sp_x
+            );
+            let cy = select(
+                base_2bit_to_ascii(base_2bit_y(py, is_rev)),
+                decode_special(py, sep_y_off, sep_y_len, iupac_y_off, iupac_y_len),
+                sp_y
+            );
+            if (cx == 0u || cy == 0u) {
+                break;
+            }
+            if (cx == 78u || cy == 78u) {
+                fscore = fscore - n_pen;
+            } else if (cx == cy) {
+                fscore = fscore + match_sc;
+                n_ident = n_ident + 1u;
+                if (fscore_max < fscore) {
+                    fscore_max = fscore;
+                    xfilmax2 = px;
+                    ycolmax2 = py;
+                    max_ident = n_ident;
+                }
+            } else {
+                fscore = fscore - mm_pen;
+            }
         }
         if (fscore < 0) {
             break;

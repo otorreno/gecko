@@ -249,4 +249,58 @@ mod tests {
             assert_eq!(gpu_res.fragments, cpu_res.fragments);
         }
     }
+
+    #[test]
+    fn multi_fasta_softmask_n_and_iupac_match_cpu() {
+        let block_a = "acgtacgtacgtACGTCCGGTTAAACGTTTGGCCAAAACCCGGGTTTACGTACGGTTAACCGGAATTNNNNTTGGCCAACCGGTTAAccggttaa";
+        let block_b =
+            "GCTAGCTAGGCCTTAAACCGGTTTGGCCAATTCCGGATRYGCTAGCTAGGCCTTAAACCGGTTTGGCCAATTCCGGAT";
+        let block_b_rc: String = block_b
+            .bytes()
+            .rev()
+            .map(complement_base)
+            .map(|b| b as char)
+            .collect();
+
+        let query = Genome::from_records(
+            "q",
+            [
+                ("q0", format!("TTTTTTTTTT{block_a}GGGGGGGGGG")),
+                ("q1", format!("CCCCCCCCCC{block_b}AAAAAAAAAA")),
+            ],
+        );
+        let reference = Genome::from_records(
+            "r",
+            [
+                ("r0", format!("AAAAAAAAAA{block_b_rc}TTTTTTTTTT")),
+                ("r1", format!("GGGGGGGGGG{block_a}CCCCCCCCCC")),
+            ],
+        );
+
+        for soft_mask in [true, false] {
+            let cfg = CompareConfig {
+                min_length: 40,
+                min_similarity: 60.0,
+                word_length: 12,
+                soft_mask,
+                ..Default::default()
+            };
+            let cpu_res = compare_genomes(&query, &reference, &cfg, None).unwrap();
+            assert_eq!(cpu_res.stats.forward_fragments, 1);
+            assert_eq!(cpu_res.stats.reverse_fragments, 1);
+
+            if probe_wgpu(true).is_ok() {
+                let (gpu_res, _) = compare_wgpu(&query, &reference, &cfg, true).unwrap();
+                let mut f_cpu = cpu_res.fragments.clone();
+                let mut f_gpu = gpu_res.fragments.clone();
+                let key = |f: &Fragment| (f.strand, f.seq_x, f.seq_y, f.diag, f.x_start, f.x_end);
+                f_cpu.sort_by_key(key);
+                f_gpu.sort_by_key(key);
+                assert_eq!(
+                    f_gpu, f_cpu,
+                    "2-bit WGPU mismatch for soft_mask={soft_mask}"
+                );
+            }
+        }
+    }
 }

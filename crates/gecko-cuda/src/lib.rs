@@ -68,6 +68,108 @@ mod ffi {
         pub bucket_bits: i32,
     }
 
+    #[repr(C)]
+    pub struct GeckoPackedSeqHost {
+        pub bits: *const u64,
+        pub bits_words: u64,
+        pub special_bm: *const u32,
+        pub invalid_bm: *const u32,
+        pub bm_words: u64,
+        pub sep_pos: *const u32,
+        pub n_seps: u32,
+        pub iupac_pos: *const u32,
+        pub iupac_byte: *const u8,
+        pub n_iupac: u32,
+        pub len: u64,
+    }
+
+    /// Owns transient sparse bitmaps & u32 index slices for the duration of a CUDA upload call
+    /// while borrowing `PackedSeq::bits` zero-copy.
+    struct HostPackedView<'a> {
+        bits: &'a [u64],
+        special_bm: Option<Vec<u32>>,
+        invalid_bm: Option<Vec<u32>>,
+        alias_invalid_to_special: bool,
+        sep_pos: Vec<u32>,
+        iupac_pos: Vec<u32>,
+        iupac_byte: Vec<u8>,
+        len: u64,
+    }
+
+    impl<'a> HostPackedView<'a> {
+        fn new(genome: &'a Genome, soft_mask: bool) -> Self {
+            let seq = &genome.seq;
+            let special_bm = seq.special_bitmap();
+            let alias = seq.invalid_bitmap_aliases_special(soft_mask);
+            let invalid_bm = if alias {
+                None
+            } else {
+                seq.invalid_seed_bitmap(soft_mask)
+            };
+            let sep_pos: Vec<u32> = seq.sep_pos.iter().map(|&p| p as u32).collect();
+            let mut iupac_pos = Vec::with_capacity(seq.iupac.len());
+            let mut iupac_byte = Vec::with_capacity(seq.iupac.len());
+            for &(p, b) in &seq.iupac {
+                iupac_pos.push(p as u32);
+                iupac_byte.push(b);
+            }
+            Self {
+                bits: &seq.bits,
+                special_bm,
+                invalid_bm,
+                alias_invalid_to_special: alias,
+                sep_pos,
+                iupac_pos,
+                iupac_byte,
+                len: seq.len as u64,
+            }
+        }
+
+        fn as_ffi(&self) -> GeckoPackedSeqHost {
+            let special_ptr = self
+                .special_bm
+                .as_ref()
+                .map_or(std::ptr::null(), Vec::as_ptr);
+            let invalid_ptr = if self.alias_invalid_to_special {
+                special_ptr
+            } else {
+                self.invalid_bm
+                    .as_ref()
+                    .map_or(std::ptr::null(), Vec::as_ptr)
+            };
+            let bm_words = self
+                .special_bm
+                .as_ref()
+                .or(self.invalid_bm.as_ref())
+                .map_or(0u64, |v| v.len() as u64);
+            GeckoPackedSeqHost {
+                bits: self.bits.as_ptr(),
+                bits_words: self.bits.len() as u64,
+                special_bm: special_ptr,
+                invalid_bm: invalid_ptr,
+                bm_words,
+                sep_pos: if self.sep_pos.is_empty() {
+                    std::ptr::null()
+                } else {
+                    self.sep_pos.as_ptr()
+                },
+                n_seps: self.sep_pos.len() as u32,
+                iupac_pos: if self.iupac_pos.is_empty() {
+                    std::ptr::null()
+                } else {
+                    self.iupac_pos.as_ptr()
+                },
+                iupac_byte: if self.iupac_byte.is_empty() {
+                    std::ptr::null()
+                } else {
+                    self.iupac_byte.as_ptr()
+                },
+                n_iupac: self.iupac_pos.len() as u32,
+                len: self.len,
+            }
+        }
+    }
+
     unsafe extern "C" {
         fn gecko_cuda_probe(
             name_buf: *mut c_char,
@@ -78,8 +180,7 @@ mod ffi {
         ) -> c_int;
 
         fn gecko_cuda_prepare_ref(
-            seq_y: *const u8,
-            len_y: u64,
+            ref_seq: *const GeckoPackedSeqHost,
             wl: c_int,
             freq_limit: u32,
             soft_mask: c_int,
@@ -88,8 +189,7 @@ mod ffi {
 
         fn gecko_cuda_query_and_extend(
             handle: *const GeckoCudaRefHandle,
-            seq_x: *const u8,
-            len_x: u64,
+            query_seq: *const GeckoPackedSeqHost,
             min_len: u32,
             sim_th: f32,
             match_score: c_int,
@@ -270,11 +370,11 @@ mod ffi {
         let info = probe_cuda().map_err(GeckoError::InvalidParameter)?;
 
         let handle = {
-            let ref_ascii = reference.seq.to_ascii_vec();
+            let ref_view = HostPackedView::new(reference, config.soft_mask);
+            let ref_ffi = ref_view.as_ffi();
             RefGuard(unsafe {
                 gecko_cuda_prepare_ref(
-                    ref_ascii.as_ptr(),
-                    ref_ascii.len() as u64,
+                    &ref_ffi,
                     config.word_length as c_int,
                     config.freq_limit as u32,
                     c_int::from(config.soft_mask),
@@ -297,12 +397,12 @@ mod ffi {
 
         let mut raw = GeckoCudaResult::default();
         let rc = {
-            let q_ascii = query.seq.to_ascii_vec();
+            let q_view = HostPackedView::new(query, config.soft_mask);
+            let q_ffi = q_view.as_ffi();
             unsafe {
                 gecko_cuda_query_and_extend(
                     handle.0,
-                    q_ascii.as_ptr(),
-                    q_ascii.len() as u64,
+                    &q_ffi,
                     min_len as u32,
                     config.min_similarity,
                     config.scoring.match_score as c_int,
@@ -329,8 +429,8 @@ mod ffi {
     }
 
     /// Overlapped I/O + GPU pipeline: loads `query_path` on a background thread while
-    /// the main thread loads `ref_path`, uploads it to the GPU, builds `Y_rc`, and constructs
-    /// the CUB Hash-CSR reference index.
+    /// the main thread loads `ref_path`, zero-copy uploads 2-bit `PackedSeq` to the GPU,
+    /// builds 2-bit `Y_rc`, and constructs the CUB Hash-CSR reference index.
     pub fn compare_cuda_paths_overlapped(
         query_path: &std::path::Path,
         ref_path: &std::path::Path,
@@ -349,11 +449,11 @@ mod ffi {
                 ));
             }
             let handle = {
-                let ref_ascii = reference.seq.to_ascii_vec();
+                let ref_view = HostPackedView::new(&reference, config.soft_mask);
+                let ref_ffi = ref_view.as_ffi();
                 RefGuard(unsafe {
                     gecko_cuda_prepare_ref(
-                        ref_ascii.as_ptr(),
-                        ref_ascii.len() as u64,
+                        &ref_ffi,
                         config.word_length as c_int,
                         config.freq_limit as u32,
                         c_int::from(config.soft_mask),
@@ -385,12 +485,12 @@ mod ffi {
 
         let mut raw = GeckoCudaResult::default();
         let rc = {
-            let q_ascii = query.seq.to_ascii_vec();
+            let q_view = HostPackedView::new(&query, config.soft_mask);
+            let q_ffi = q_view.as_ffi();
             unsafe {
                 gecko_cuda_query_and_extend(
                     handle.0,
-                    q_ascii.as_ptr(),
-                    q_ascii.len() as u64,
+                    &q_ffi,
                     min_len as u32,
                     config.min_similarity,
                     config.scoring.match_score as c_int,

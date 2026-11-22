@@ -20,9 +20,9 @@ struct QueryParams {
     max_hits: u32,
     stride: u32,
     flags: u32,
+    inv_y_word_off: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 #[repr(C)]
@@ -38,8 +38,24 @@ struct ExtendParams {
     match_score: i32,
     mismatch_penalty: i32,
     n_penalty: i32,
+    sp_x_off: u32,
+    sp_y_off: u32,
+    sp_yrc_off: u32,
+    sep_x_off: u32,
+    sep_x_len: u32,
+    sep_y_off: u32,
+    sep_y_len: u32,
+    sep_yrc_off: u32,
+    sep_yrc_len: u32,
+    iupac_x_off: u32,
+    iupac_x_len: u32,
+    iupac_y_off: u32,
+    iupac_y_len: u32,
+    iupac_yrc_off: u32,
+    iupac_yrc_len: u32,
     _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
 }
 
 #[repr(C)]
@@ -213,36 +229,135 @@ impl WgpuContext {
             ));
         }
 
-        let buf_x = {
-            let x_bytes = seq_x.seq.to_ascii_vec_padded_u32();
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("seq_x"),
-                    contents: &x_bytes,
-                    usage: wgpu::BufferUsages::STORAGE,
-                })
+        const NONE_OFF: u32 = u32::MAX;
+
+        // Zero-copy 2-bit/bp sequence buffers (0.25 bytes/bp — 4x smaller than ASCII).
+        let buf_x = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("seq_x_bits"),
+                contents: bytemuck::cast_slice(&seq_x.seq.bits),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let buf_y = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("seq_y_bits"),
+                contents: bytemuck::cast_slice(&seq_y.seq.bits),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let dummy_bits = [0u64; 2];
+        let buf_y_rc = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("seq_y_rc_bits"),
+                contents: bytemuck::cast_slice(match seq_y_rc {
+                    Some(rc) => rc.seq.bits.as_slice(),
+                    None => &dummy_bits,
+                }),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        // Pack invalid-seed bitmaps (X then Y) into a single storage buffer for query.wgsl.
+        let inv_x = seq_x.seq.invalid_seed_bitmap(soft_mask);
+        let inv_y = seq_y.seq.invalid_seed_bitmap(soft_mask);
+        let has_inv_x = inv_x.is_some();
+        let has_inv_y = inv_y.is_some();
+        let mut invalid_bm_data: Vec<u32> = Vec::new();
+        if let Some(bm) = inv_x {
+            invalid_bm_data.extend_from_slice(&bm);
+        }
+        let inv_y_word_off = invalid_bm_data.len() as u32;
+        if let Some(bm) = inv_y {
+            invalid_bm_data.extend_from_slice(&bm);
+        }
+        if invalid_bm_data.is_empty() {
+            invalid_bm_data.push(0);
+        }
+        let buf_invalid_bm = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("invalid_bm"),
+                contents: bytemuck::cast_slice(&invalid_bm_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        // Pack special bitmaps (X, Y, Y_rc) into a single storage buffer for extend.wgsl.
+        let mut special_bm_data: Vec<u32> = Vec::new();
+        let sp_x_off = if let Some(bm) = seq_x.seq.special_bitmap() {
+            let off = special_bm_data.len() as u32;
+            special_bm_data.extend_from_slice(&bm);
+            off
+        } else {
+            NONE_OFF
         };
-        let buf_y = {
-            let y_bytes = seq_y.seq.to_ascii_vec_padded_u32();
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("seq_y"),
-                    contents: &y_bytes,
-                    usage: wgpu::BufferUsages::STORAGE,
-                })
+        let sp_y_off = if let Some(bm) = seq_y.seq.special_bitmap() {
+            let off = special_bm_data.len() as u32;
+            special_bm_data.extend_from_slice(&bm);
+            off
+        } else {
+            NONE_OFF
         };
-        let buf_y_rc = {
-            let y_rc_bytes = match seq_y_rc {
-                Some(rc) => rc.seq.to_ascii_vec_padded_u32(),
-                None => vec![0u8; 16],
-            };
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("seq_y_rc"),
-                    contents: &y_rc_bytes,
-                    usage: wgpu::BufferUsages::STORAGE,
-                })
+        let sp_yrc_off = if let Some(rc) = seq_y_rc {
+            if let Some(bm) = rc.seq.special_bitmap() {
+                let off = special_bm_data.len() as u32;
+                special_bm_data.extend_from_slice(&bm);
+                off
+            } else {
+                NONE_OFF
+            }
+        } else {
+            NONE_OFF
         };
+        if special_bm_data.is_empty() {
+            special_bm_data.push(0);
+        }
+        let buf_special_bm = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("special_bm"),
+                contents: bytemuck::cast_slice(&special_bm_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        // Pack sparse SEQ_SEP and rare IUPAC metadata (X, Y, Y_rc) into one tiny buffer.
+        let mut meta_data: Vec<u32> = Vec::new();
+        let push_seps = |buf: &mut Vec<u32>, seps: &[u64]| -> (u32, u32) {
+            let off = buf.len() as u32;
+            buf.extend(seps.iter().map(|&p| p as u32));
+            (off, seps.len() as u32)
+        };
+        let push_iupac = |buf: &mut Vec<u32>, iupac: &[(u64, u8)]| -> (u32, u32) {
+            let off = buf.len() as u32;
+            for &(p, b) in iupac {
+                buf.push(p as u32);
+                buf.push(b as u32);
+            }
+            (off, iupac.len() as u32)
+        };
+        let (sep_x_off, sep_x_len) = push_seps(&mut meta_data, &seq_x.seq.sep_pos);
+        let (sep_y_off, sep_y_len) = push_seps(&mut meta_data, &seq_y.seq.sep_pos);
+        let (sep_yrc_off, sep_yrc_len) = match seq_y_rc {
+            Some(rc) => push_seps(&mut meta_data, &rc.seq.sep_pos),
+            None => (0, 0),
+        };
+        let (iupac_x_off, iupac_x_len) = push_iupac(&mut meta_data, &seq_x.seq.iupac);
+        let (iupac_y_off, iupac_y_len) = push_iupac(&mut meta_data, &seq_y.seq.iupac);
+        let (iupac_yrc_off, iupac_yrc_len) = match seq_y_rc {
+            Some(rc) => push_iupac(&mut meta_data, &rc.seq.iupac),
+            None => (0, 0),
+        };
+        if meta_data.is_empty() {
+            meta_data.push(0);
+        }
+        let buf_meta = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("meta_buf"),
+                contents: bytemuck::cast_slice(&meta_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
         let buf_bucket_off = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -368,7 +483,7 @@ impl WgpuContext {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: buf_y_rc.as_entire_binding(),
+                    resource: buf_invalid_bm.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -419,14 +534,22 @@ impl WgpuContext {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: buf_hits.as_entire_binding(),
+                    resource: buf_special_bm.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: buf_out_frags.as_entire_binding(),
+                    resource: buf_meta.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
+                    resource: buf_hits.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: buf_out_frags.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
                     resource: buf_frag_count.as_entire_binding(),
                 },
             ],
@@ -445,9 +568,10 @@ impl WgpuContext {
         let stride: u32 = 16;
         let len_x = seq_x.seq.len as u32;
         let len_y = seq_y.seq.len as u32;
-        let flags = (u32::from(soft_mask))
-            | (u32::from(compare_reverse) << 1)
-            | (u32::from(idx.has_dropped) << 2);
+        let flags = u32::from(compare_reverse)
+            | (u32::from(idx.has_dropped) << 1)
+            | (u32::from(has_inv_x) << 2)
+            | (u32::from(has_inv_y) << 3);
         let sim_th_x100 = (min_similarity * 100.0).round().max(0.0) as u32;
 
         let mut raw_frags = Vec::new();
@@ -474,9 +598,9 @@ impl WgpuContext {
                 max_hits,
                 stride,
                 flags,
+                inv_y_word_off,
                 _pad0: 0,
                 _pad1: 0,
-                _pad2: 0,
             };
             self.queue
                 .write_buffer(&buf_q_params, 0, bytemuck::bytes_of(&q_params));
@@ -515,8 +639,24 @@ impl WgpuContext {
                     match_score: scoring.match_score as i32,
                     mismatch_penalty: scoring.mismatch_penalty as i32,
                     n_penalty: scoring.n_penalty as i32,
+                    sp_x_off,
+                    sp_y_off,
+                    sp_yrc_off,
+                    sep_x_off,
+                    sep_x_len,
+                    sep_y_off,
+                    sep_y_len,
+                    sep_yrc_off,
+                    sep_yrc_len,
+                    iupac_x_off,
+                    iupac_x_len,
+                    iupac_y_off,
+                    iupac_y_len,
+                    iupac_yrc_off,
+                    iupac_yrc_len,
                     _pad0: 0,
                     _pad1: 0,
+                    _pad2: 0,
                 };
                 self.queue
                     .write_buffer(&buf_e_params, 0, bytemuck::bytes_of(&e_params));

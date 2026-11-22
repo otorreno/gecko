@@ -1,23 +1,54 @@
 /*
  * cuda_extend.cu
  *
- * Stage 3: Two-tier GPU bidirectional ungapped extension matching GECKO's exact
- * scoring model with configurable (match, mismatch, N) scores and '*' / 0x00 separators:
- *  - Tier 1 (Short, 1 thread/seed, 512 bp cap): filters out 95%+ of noise hits.
- *  - Tier 2 (Long, 1 full 32-thread warp/seed): zero-divergence warp prefix sums.
+ * Stage 3: Two-tier 2-bit GPU bidirectional ungapped extension matching GECKO's
+ * exact scoring model (+match, -mismatch, -n_penalty, SEQ_SEP, rare IUPAC):
+ *  - Tier 1 (Short, 1 thread/seed, 512 bp cap): 32-base word-loaded register stepping.
+ *  - Tier 2 (Long, 1 full 32-thread warp/seed): single warp-broadcast 64-bit word load
+ *    per 32 bp + 1-cycle 32-bp exact-match fast path + zero-divergence warp prefix sums.
  */
 
 #include <climits>
 #include "cuda_common.cuh"
 
+static __device__ __forceinline__ int score_special_pair(
+    const GpuSeqView &seqX,
+    uint32_t px,
+    bool sp_x,
+    const GpuSeqView &dy,
+    uint32_t py,
+    bool sp_y,
+    int match_score,
+    int mismatch_penalty,
+    int n_penalty,
+    bool &is_sep,
+    int &is_match
+) {
+    uint8_t cx = sp_x ? decode_special_byte(seqX, px) : base_2bit_to_ascii(base_2bit_dev(seqX.bits, px));
+    uint8_t cy = sp_y ? decode_special_byte(dy, py) : base_2bit_to_ascii(base_2bit_dev(dy.bits, py));
+    if (cx == 0U || cy == 0U) {
+        is_sep = true;
+        is_match = 0;
+        return 0;
+    }
+    if (cx == (uint8_t)'N' || cy == (uint8_t)'N') {
+        is_match = 0;
+        return -n_penalty;
+    }
+    if (cx == cy) {
+        is_match = 1;
+        return match_score;
+    }
+    is_match = 0;
+    return -mismatch_penalty;
+}
+
 static __global__ void extend_short_kernel(
     const uint64_t * __restrict__ hits,
     uint32_t n_hits,
-    const uint8_t * __restrict__ seqX,
-    uint64_t lenX,
-    const uint8_t * __restrict__ seqY,
-    const uint8_t * __restrict__ seqY_rc,
-    uint64_t lenY,
+    GpuSeqView seqX,
+    GpuSeqView seqY,
+    GpuSeqView seqY_rc,
     int wl,
     uint32_t min_len,
     float sim_th,
@@ -38,11 +69,13 @@ static __global__ void extend_short_kernel(
     int64_t diag;
     unpack_hit_key(key, is_rev, posX, posY, diag);
 
-    const uint8_t *dy = is_rev ? seqY_rc : seqY;
+    const GpuSeqView &dy = is_rev ? seqY_rc : seqY;
 
     int64_t xfil = (int64_t)posX + wl;
     int64_t ycol = (int64_t)posY + wl;
-    int64_t rem_fwd = ((int64_t)lenX - xfil < (int64_t)lenY - ycol) ? ((int64_t)lenX - xfil) : ((int64_t)lenY - ycol);
+    int64_t rem_fwd = ((int64_t)seqX.len - xfil < (int64_t)dy.len - ycol)
+                          ? ((int64_t)seqX.len - xfil)
+                          : ((int64_t)dy.len - ycol);
     int64_t lim_fwd = (rem_fwd < GECKO_SHORT_CAP) ? rem_fwd : GECKO_SHORT_CAP;
 
     int64_t xfilmax = (int64_t)posX + wl - 1;
@@ -52,27 +85,94 @@ static __global__ void extend_short_kernel(
     int nIdent = wl, maxIdent = wl;
 
     bool fwd_terminated = false;
-    for (int64_t step = 0; step < lim_fwd; step++) {
-        uint8_t rx = seqX[xfil + step];
-        uint8_t ry = dy[ycol + step];
-        if (is_sep_byte(rx) || is_sep_byte(ry)) { fwd_terminated = true; break; }
-        uint8_t cx = rx & 0xDF;
-        uint8_t cy = ry & 0xDF;
-        if (cx == 'N' || cy == 'N') {
-            fscore -= n_penalty;
-        } else if (cx == cy) {
-            fscore += match_score;
-            nIdent++;
+    for (int64_t off = 0; off < lim_fwd && !fwd_terminated; off += 32) {
+        int chunk = (int)((lim_fwd - off < 32) ? (lim_fwd - off) : 32);
+        uint32_t px0 = (uint32_t)(xfil + off);
+        uint32_t py0 = (uint32_t)(ycol + off);
+        uint64_t wx = load_32_2bit(seqX.bits, px0);
+        uint64_t wy = load_32_2bit(dy.bits, py0);
+        uint32_t spx = load_32_1bit(seqX.special_bm, px0);
+        uint32_t spy = load_32_1bit(dy.special_bm, py0);
+        uint32_t sp_any = spx | spy;
+
+        if (chunk == 32 && sp_any == 0U && wx == wy) {
+            fscore += 32 * match_score;
+            nIdent += 32;
             if (fscoreMax < fscore) {
                 fscoreMax = fscore;
-                xfilmax = xfil + step;
-                ycolmax = ycol + step;
+                xfilmax = xfil + off + 31;
+                ycolmax = ycol + off + 31;
                 maxIdent = nIdent;
             }
-        } else {
-            fscore -= mismatch_penalty;
+            continue;
         }
-        if (fscore < 0) { fwd_terminated = true; break; }
+
+        if (sp_any == 0U) {
+            for (int k = 0; k < chunk; k++) {
+                if ((wx & 3ULL) == (wy & 3ULL)) {
+                    fscore += match_score;
+                    nIdent++;
+                    if (fscoreMax < fscore) {
+                        fscoreMax = fscore;
+                        xfilmax = xfil + off + k;
+                        ycolmax = ycol + off + k;
+                        maxIdent = nIdent;
+                    }
+                } else {
+                    fscore -= mismatch_penalty;
+                    if (fscore < 0) {
+                        fwd_terminated = true;
+                        break;
+                    }
+                }
+                wx >>= 2;
+                wy >>= 2;
+            }
+        } else {
+            for (int k = 0; k < chunk; k++) {
+                if (((sp_any >> k) & 1U) == 0U) {
+                    if ((wx & 3ULL) == (wy & 3ULL)) {
+                        fscore += match_score;
+                        nIdent++;
+                        if (fscoreMax < fscore) {
+                            fscoreMax = fscore;
+                            xfilmax = xfil + off + k;
+                            ycolmax = ycol + off + k;
+                            maxIdent = nIdent;
+                        }
+                    } else {
+                        fscore -= mismatch_penalty;
+                    }
+                } else {
+                    bool is_sep = false;
+                    int is_match = 0;
+                    int delta = score_special_pair(
+                        seqX, px0 + (uint32_t)k, ((spx >> k) & 1U) != 0U,
+                        dy, py0 + (uint32_t)k, ((spy >> k) & 1U) != 0U,
+                        match_score, mismatch_penalty, n_penalty, is_sep, is_match);
+                    if (is_sep) {
+                        fwd_terminated = true;
+                        break;
+                    }
+                    fscore += delta;
+                    if (is_match) {
+                        nIdent++;
+                        if (fscoreMax < fscore) {
+                            fscoreMax = fscore;
+                            xfilmax = xfil + off + k;
+                            ycolmax = ycol + off + k;
+                            maxIdent = nIdent;
+                        }
+                    }
+                }
+                if (fscore < 0) {
+                    fwd_terminated = true;
+                    break;
+                }
+                wx >>= 2;
+                wy >>= 2;
+            }
+        }
     }
     if (!fwd_terminated && rem_fwd > GECKO_SHORT_CAP) {
         uint32_t slot = atomicAdd(long_count, 1U);
@@ -91,27 +191,142 @@ static __global__ void extend_short_kernel(
     nIdent = maxIdent;
 
     bool bwd_terminated = false;
-    for (int64_t step = 0; step < lim_bwd; step++) {
-        uint8_t rx = seqX[xfil2 - step];
-        uint8_t ry = dy[ycol2 - step];
-        if (is_sep_byte(rx) || is_sep_byte(ry)) { bwd_terminated = true; break; }
-        uint8_t cx = rx & 0xDF;
-        uint8_t cy = ry & 0xDF;
-        if (cx == 'N' || cy == 'N') {
-            fscore -= n_penalty;
-        } else if (cx == cy) {
-            fscore += match_score;
-            nIdent++;
-            if (fscoreMax < fscore) {
-                fscoreMax = fscore;
-                xfilmax2 = xfil2 - step;
-                ycolmax2 = ycol2 - step;
-                maxIdent = nIdent;
+    for (int64_t off = 0; off < lim_bwd && !bwd_terminated; off += 32) {
+        int64_t rem_chunk = lim_bwd - off;
+        if (rem_chunk >= 32) {
+            uint32_t bx0 = (uint32_t)(xfil2 - off - 31);
+            uint32_t by0 = (uint32_t)(ycol2 - off - 31);
+            uint64_t wx = reverse_32_2bit_dev(load_32_2bit(seqX.bits, bx0));
+            uint64_t wy = reverse_32_2bit_dev(load_32_2bit(dy.bits, by0));
+            uint32_t spx = __brev(load_32_1bit(seqX.special_bm, bx0));
+            uint32_t spy = __brev(load_32_1bit(dy.special_bm, by0));
+            uint32_t sp_any = spx | spy;
+
+            if (sp_any == 0U && wx == wy) {
+                fscore += 32 * match_score;
+                nIdent += 32;
+                if (fscoreMax < fscore) {
+                    fscoreMax = fscore;
+                    xfilmax2 = xfil2 - off - 31;
+                    ycolmax2 = ycol2 - off - 31;
+                    maxIdent = nIdent;
+                }
+                continue;
+            }
+
+            if (sp_any == 0U) {
+                for (int k = 0; k < 32; k++) {
+                    if ((wx & 3ULL) == (wy & 3ULL)) {
+                        fscore += match_score;
+                        nIdent++;
+                        if (fscoreMax < fscore) {
+                            fscoreMax = fscore;
+                            xfilmax2 = xfil2 - off - k;
+                            ycolmax2 = ycol2 - off - k;
+                            maxIdent = nIdent;
+                        }
+                    } else {
+                        fscore -= mismatch_penalty;
+                        if (fscore < 0) {
+                            bwd_terminated = true;
+                            break;
+                        }
+                    }
+                    wx >>= 2;
+                    wy >>= 2;
+                }
+            } else {
+                for (int k = 0; k < 32; k++) {
+                    if (((sp_any >> k) & 1U) == 0U) {
+                        if ((wx & 3ULL) == (wy & 3ULL)) {
+                            fscore += match_score;
+                            nIdent++;
+                            if (fscoreMax < fscore) {
+                                fscoreMax = fscore;
+                                xfilmax2 = xfil2 - off - k;
+                                ycolmax2 = ycol2 - off - k;
+                                maxIdent = nIdent;
+                            }
+                        } else {
+                            fscore -= mismatch_penalty;
+                        }
+                    } else {
+                        bool is_sep = false;
+                        int is_match = 0;
+                        int delta = score_special_pair(
+                            seqX, (uint32_t)(xfil2 - off - k), ((spx >> k) & 1U) != 0U,
+                            dy, (uint32_t)(ycol2 - off - k), ((spy >> k) & 1U) != 0U,
+                            match_score, mismatch_penalty, n_penalty, is_sep, is_match);
+                        if (is_sep) {
+                            bwd_terminated = true;
+                            break;
+                        }
+                        fscore += delta;
+                        if (is_match) {
+                            nIdent++;
+                            if (fscoreMax < fscore) {
+                                fscoreMax = fscore;
+                                xfilmax2 = xfil2 - off - k;
+                                ycolmax2 = ycol2 - off - k;
+                                maxIdent = nIdent;
+                            }
+                        }
+                    }
+                    if (fscore < 0) {
+                        bwd_terminated = true;
+                        break;
+                    }
+                    wx >>= 2;
+                    wy >>= 2;
+                }
             }
         } else {
-            fscore -= mismatch_penalty;
+            int chunk = (int)rem_chunk;
+            for (int k = 0; k < chunk; k++) {
+                uint32_t px = (uint32_t)(xfil2 - off - k);
+                uint32_t py = (uint32_t)(ycol2 - off - k);
+                bool sp_x = is_bit_set(seqX.special_bm, px);
+                bool sp_y = is_bit_set(dy.special_bm, py);
+                if (!sp_x && !sp_y) {
+                    if (base_2bit_dev(seqX.bits, px) == base_2bit_dev(dy.bits, py)) {
+                        fscore += match_score;
+                        nIdent++;
+                        if (fscoreMax < fscore) {
+                            fscoreMax = fscore;
+                            xfilmax2 = px;
+                            ycolmax2 = py;
+                            maxIdent = nIdent;
+                        }
+                    } else {
+                        fscore -= mismatch_penalty;
+                    }
+                } else {
+                    bool is_sep = false;
+                    int is_match = 0;
+                    int delta = score_special_pair(
+                        seqX, px, sp_x, dy, py, sp_y,
+                        match_score, mismatch_penalty, n_penalty, is_sep, is_match);
+                    if (is_sep) {
+                        bwd_terminated = true;
+                        break;
+                    }
+                    fscore += delta;
+                    if (is_match) {
+                        nIdent++;
+                        if (fscoreMax < fscore) {
+                            fscoreMax = fscore;
+                            xfilmax2 = px;
+                            ycolmax2 = py;
+                            maxIdent = nIdent;
+                        }
+                    }
+                }
+                if (fscore < 0) {
+                    bwd_terminated = true;
+                    break;
+                }
+            }
         }
-        if (fscore < 0) { bwd_terminated = true; break; }
     }
     if (!bwd_terminated && rem_bwd > GECKO_SHORT_CAP) {
         uint32_t slot = atomicAdd(long_count, 1U);
@@ -157,11 +372,9 @@ static __device__ __forceinline__ int warp_max(int val) {
 static __global__ void extend_long_warp_kernel(
     const uint64_t * __restrict__ long_seeds,
     uint32_t n_long,
-    const uint8_t * __restrict__ seqX,
-    uint64_t lenX,
-    const uint8_t * __restrict__ seqY,
-    const uint8_t * __restrict__ seqY_rc,
-    uint64_t lenY,
+    GpuSeqView seqX,
+    GpuSeqView seqY,
+    GpuSeqView seqY_rc,
     int wl,
     uint32_t min_len,
     float sim_th,
@@ -181,11 +394,13 @@ static __global__ void extend_long_warp_kernel(
     int64_t diag;
     unpack_hit_key(key, is_rev, posX, posY, diag);
 
-    const uint8_t *dy = is_rev ? seqY_rc : seqY;
+    const GpuSeqView &dy = is_rev ? seqY_rc : seqY;
 
     int64_t xfil = (int64_t)posX + wl;
     int64_t ycol = (int64_t)posY + wl;
-    int64_t rem_fwd = ((int64_t)lenX - xfil < (int64_t)lenY - ycol) ? ((int64_t)lenX - xfil) : ((int64_t)lenY - ycol);
+    int64_t rem_fwd = ((int64_t)seqX.len - xfil < (int64_t)dy.len - ycol)
+                          ? ((int64_t)seqX.len - xfil)
+                          : ((int64_t)dy.len - ycol);
 
     int64_t xfilmax = (int64_t)posX + wl - 1;
     int64_t ycolmax = (int64_t)posY + wl - 1;
@@ -194,21 +409,51 @@ static __global__ void extend_long_warp_kernel(
     int nIdent = wl, maxIdent = wl;
 
     for (int64_t off = 0; off < rem_fwd; off += 32) {
-        bool in_bounds = (off + lane < rem_fwd);
+        int64_t rem_chunk = rem_fwd - off;
+        uint64_t wx = 0ULL, wy = 0ULL;
+        uint32_t spx = 0U, spy = 0U;
+        if (lane == 0) {
+            uint32_t px0 = (uint32_t)(xfil + off);
+            uint32_t py0 = (uint32_t)(ycol + off);
+            wx = load_32_2bit(seqX.bits, px0);
+            wy = load_32_2bit(dy.bits, py0);
+            spx = load_32_1bit(seqX.special_bm, px0);
+            spy = load_32_1bit(dy.special_bm, py0);
+        }
+        wx = __shfl_sync(0xFFFFFFFFU, wx, 0);
+        wy = __shfl_sync(0xFFFFFFFFU, wy, 0);
+        spx = __shfl_sync(0xFFFFFFFFU, spx, 0);
+        spy = __shfl_sync(0xFFFFFFFFU, spy, 0);
+        uint32_t sp_any = spx | spy;
+
+        /* 1-cycle fast path when all 32 bases are clean and identical */
+        if (rem_chunk >= 32 && sp_any == 0U && wx == wy) {
+            fscore += 32 * match_score;
+            nIdent += 32;
+            if (fscore > fscoreMax) {
+                fscoreMax = fscore;
+                xfilmax = xfil + off + 31;
+                ycolmax = ycol + off + 31;
+                maxIdent = nIdent;
+            }
+            continue;
+        }
+
+        bool in_bounds = (lane < rem_chunk);
         int delta = 0, is_match = 0;
         bool is_sep = !in_bounds;
 
         if (in_bounds) {
-            uint8_t rx = seqX[xfil + off + lane];
-            uint8_t ry = dy[ycol + off + lane];
-            if (is_sep_byte(rx) || is_sep_byte(ry)) {
-                is_sep = true;
+            if (((sp_any >> lane) & 1U) == 0U) {
+                uint32_t bx = (uint32_t)((wx >> (lane << 1)) & 3ULL);
+                uint32_t by = (uint32_t)((wy >> (lane << 1)) & 3ULL);
+                if (bx == by) { delta = match_score; is_match = 1; }
+                else { delta = -mismatch_penalty; }
             } else {
-                uint8_t cx = rx & 0xDF;
-                uint8_t cy = ry & 0xDF;
-                if (cx == 'N' || cy == 'N') delta = -n_penalty;
-                else if (cx == cy) { delta = match_score; is_match = 1; }
-                else delta = -mismatch_penalty;
+                delta = score_special_pair(
+                    seqX, (uint32_t)(xfil + off + lane), ((spx >> lane) & 1U) != 0U,
+                    dy, (uint32_t)(ycol + off + lane), ((spy >> lane) & 1U) != 0U,
+                    match_score, mismatch_penalty, n_penalty, is_sep, is_match);
             }
         }
 
@@ -251,21 +496,70 @@ static __global__ void extend_long_warp_kernel(
     nIdent = maxIdent;
 
     for (int64_t off = 0; off < rem_bwd; off += 32) {
-        bool in_bounds = (off + lane < rem_bwd);
+        int64_t rem_chunk = rem_bwd - off;
         int delta = 0, is_match = 0;
-        bool is_sep = !in_bounds;
+        bool is_sep = false;
 
-        if (in_bounds) {
-            uint8_t rx = seqX[xfil2 - off - lane];
-            uint8_t ry = dy[ycol2 - off - lane];
-            if (is_sep_byte(rx) || is_sep_byte(ry)) {
-                is_sep = true;
+        if (rem_chunk >= 32) {
+            uint64_t wx = 0ULL, wy = 0ULL;
+            uint32_t spx = 0U, spy = 0U;
+            if (lane == 0) {
+                uint32_t bx0 = (uint32_t)(xfil2 - off - 31);
+                uint32_t by0 = (uint32_t)(ycol2 - off - 31);
+                wx = reverse_32_2bit_dev(load_32_2bit(seqX.bits, bx0));
+                wy = reverse_32_2bit_dev(load_32_2bit(dy.bits, by0));
+                spx = __brev(load_32_1bit(seqX.special_bm, bx0));
+                spy = __brev(load_32_1bit(dy.special_bm, by0));
+            }
+            wx = __shfl_sync(0xFFFFFFFFU, wx, 0);
+            wy = __shfl_sync(0xFFFFFFFFU, wy, 0);
+            spx = __shfl_sync(0xFFFFFFFFU, spx, 0);
+            spy = __shfl_sync(0xFFFFFFFFU, spy, 0);
+            uint32_t sp_any = spx | spy;
+
+            if (sp_any == 0U && wx == wy) {
+                fscore += 32 * match_score;
+                nIdent += 32;
+                if (fscore > fscoreMax) {
+                    fscoreMax = fscore;
+                    xfilmax2 = xfil2 - off - 31;
+                    ycolmax2 = ycol2 - off - 31;
+                    maxIdent = nIdent;
+                }
+                continue;
+            }
+
+            if (((sp_any >> lane) & 1U) == 0U) {
+                uint32_t bx = (uint32_t)((wx >> (lane << 1)) & 3ULL);
+                uint32_t by = (uint32_t)((wy >> (lane << 1)) & 3ULL);
+                if (bx == by) { delta = match_score; is_match = 1; }
+                else { delta = -mismatch_penalty; }
             } else {
-                uint8_t cx = rx & 0xDF;
-                uint8_t cy = ry & 0xDF;
-                if (cx == 'N' || cy == 'N') delta = -n_penalty;
-                else if (cx == cy) { delta = match_score; is_match = 1; }
-                else delta = -mismatch_penalty;
+                delta = score_special_pair(
+                    seqX, (uint32_t)(xfil2 - off - lane), ((spx >> lane) & 1U) != 0U,
+                    dy, (uint32_t)(ycol2 - off - lane), ((spy >> lane) & 1U) != 0U,
+                    match_score, mismatch_penalty, n_penalty, is_sep, is_match);
+            }
+        } else {
+            bool in_bounds = (lane < rem_chunk);
+            is_sep = !in_bounds;
+            if (in_bounds) {
+                uint32_t px = (uint32_t)(xfil2 - off - lane);
+                uint32_t py = (uint32_t)(ycol2 - off - lane);
+                bool sp_x = is_bit_set(seqX.special_bm, px);
+                bool sp_y = is_bit_set(dy.special_bm, py);
+                if (!sp_x && !sp_y) {
+                    if (base_2bit_dev(seqX.bits, px) == base_2bit_dev(dy.bits, py)) {
+                        delta = match_score;
+                        is_match = 1;
+                    } else {
+                        delta = -mismatch_penalty;
+                    }
+                } else {
+                    delta = score_special_pair(
+                        seqX, px, sp_x, dy, py, sp_y,
+                        match_score, mismatch_penalty, n_penalty, is_sep, is_match);
+                }
             }
         }
 
@@ -321,11 +615,9 @@ static __global__ void extend_long_warp_kernel(
 uint32_t gpu_extend_tile_two_tier(
     const uint64_t *d_filtered_hits,
     uint32_t n_hits,
-    const uint8_t *d_seqX,
-    uint64_t lenX,
-    const uint8_t *d_seqY,
-    const uint8_t *d_seqY_rc,
-    uint64_t lenY,
+    const GpuSeqView &seqX,
+    const GpuSeqView &seqY,
+    const GpuSeqView &seqY_rc,
     int wl,
     uint32_t min_len,
     float sim_th,
@@ -345,7 +637,7 @@ uint32_t gpu_extend_tile_two_tier(
     if (n_hits == 0) return 0;
 
     extend_short_kernel<<<(n_hits + 255) / 256, 256>>>(
-        d_filtered_hits, n_hits, d_seqX, lenX, d_seqY, d_seqY_rc, lenY,
+        d_filtered_hits, n_hits, seqX, seqY, seqY_rc,
         wl, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
         d_long_seeds, d_long_count, d_out_frags, d_frag_count, max_frags);
     CUDA_CHECK_VOID(cudaGetLastError());
@@ -356,7 +648,7 @@ uint32_t gpu_extend_tile_two_tier(
         const uint32_t warps_per_block = 8;
         uint32_t grid = (h_nlong + warps_per_block - 1) / warps_per_block;
         extend_long_warp_kernel<<<grid, warps_per_block * 32>>>(
-            d_long_seeds, h_nlong, d_seqX, lenX, d_seqY, d_seqY_rc, lenY,
+            d_long_seeds, h_nlong, seqX, seqY, seqY_rc,
             wl, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
             d_out_frags, d_frag_count, max_frags);
         CUDA_CHECK_VOID(cudaGetLastError());

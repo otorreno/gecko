@@ -1,26 +1,23 @@
 /*
  * cuda_query.cu
  *
- * Stage 2: Tiled GPU Query + Lock-Free Left/Right-Maximal Seed Filtering +
- * CUB RadixSort & Diagonal Proximity Compaction.
+ * Stage 2: Tiled 2-bit GPU Query + Lock-Free Left/Right-Maximal Seed Filtering
+ * (with 1-bit freq_limit dropped-position bitmap) + CUB RadixSort & Diagonal
+ * Proximity Compaction.
  */
 
 #include <cub/cub.cuh>
 #include "cuda_common.cuh"
 
 static __global__ void query_left_maximal_kernel(
-    const uint8_t * __restrict__ seqX,
-    uint64_t lenX,
-    const uint8_t * __restrict__ seqY,
-    const uint8_t * __restrict__ seqY_rc,
-    uint64_t lenY,
+    GpuSeqView seqX,
+    GpuSeqView seqY,
     const uint32_t * __restrict__ bucket_off,
     const uint64_t * __restrict__ idx_keys,
     const uint32_t * __restrict__ idx_vals,
     const uint32_t * __restrict__ dropped_bitmap,
     int shift_bits,
     int wl,
-    bool soft_mask,
     bool compare_reverse,
     uint64_t tile_start,
     uint64_t tile_end,
@@ -37,94 +34,119 @@ static __global__ void query_left_maximal_kernel(
 
     uint64_t mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
     int rc_shift = 2 * (wl - 1);
-    uint64_t scan_from = (t_start >= (uint64_t)(wl - 1)) ? (t_start - (uint64_t)(wl - 1)) : 0;
+    uint64_t scan_from = (t_start >= (uint64_t)(wl - 1)) ? (t_start - (uint64_t)(wl - 1)) : 0ULL;
 
     uint64_t kf = 0, kr = 0;
     int valid = 0;
 
-    for (uint64_t i = scan_from; i < t_end; i++) {
-        uint8_t b = base_to_2bit(seqX[i], soft_mask);
-        if (b < 4) {
-            kf = ((kf << 2) | b) & mask;
-            kr = (kr >> 2) | ((uint64_t)(b ^ 3) << rc_shift);
-            if (++valid >= wl && i >= t_start) {
-                uint32_t posX = (uint32_t)(i + 1 - (uint64_t)wl);
-                uint32_t x_strand = (kf <= kr) ? 0U : 1U;
-                uint64_t canon = x_strand ? kr : kf;
-                bool is_pal = (kf == kr);
-
-                uint64_t h = fmix64(canon);
-                uint32_t bkt = (uint32_t)(h >> shift_bits);
-                uint32_t st = __ldg(&bucket_off[bkt]);
-                uint32_t en = __ldg(&bucket_off[bkt + 1]);
-                if (st == en) continue;
-
-                uint32_t j = st;
-                if (en - st <= 16U) {
-                    while (j < en && __ldg(&idx_keys[j]) < h) j++;
-                } else {
-                    uint32_t lo = st, hi = en;
-                    while (lo < hi) {
-                        uint32_t mid = lo + ((hi - lo) >> 1);
-                        if (__ldg(&idx_keys[mid]) < h) lo = mid + 1;
-                        else hi = mid;
-                    }
-                    j = lo;
-                }
-
-                uint8_t prev_x = (posX > 0) ? norm_seed_byte(seqX[posX - 1], soft_mask) : 0;
-                bool prev_x_valid = (posX > 0) && (base_to_2bit(prev_x, true) < 4);
-                uint8_t next_x = ((uint64_t)posX + (uint64_t)wl < lenX)
-                                     ? norm_seed_byte(seqX[(uint64_t)posX + (uint64_t)wl], soft_mask)
-                                     : 0;
-                bool next_x_valid = ((uint64_t)posX + (uint64_t)wl < lenX) && (base_to_2bit(next_x, true) < 4);
-
-                while (j < en && __ldg(&idx_keys[j]) == h) {
-                    uint32_t ps = __ldg(&idx_vals[j]);
-                    uint32_t posY_orig = ps >> 1;
-                    uint32_t y_strand = ps & 1U;
-
-                    if (is_pal || (x_strand == y_strand)) {
-                        bool left_ext = prev_x_valid && (posY_orig > 0) &&
-                                        (norm_seed_byte(seqY[posY_orig - 1], soft_mask) == prev_x) &&
-                                        !is_dropped_pos(dropped_bitmap, posY_orig - 1);
-                        bool right_ext = next_x_valid && ((uint64_t)posY_orig + (uint64_t)wl < lenY) &&
-                                         (norm_seed_byte(seqY[(uint64_t)posY_orig + (uint64_t)wl], soft_mask) == next_x) &&
-                                         !is_dropped_pos(dropped_bitmap, posY_orig + 1);
-                        if (!left_ext || !right_ext) {
-                            if (*hit_count <= max_hits) {
-                                uint32_t slot = atomicAdd(hit_count, 1U);
-                                if (slot < max_hits) {
-                                    out_hits[slot] = pack_hit_key(0U, posX, posY_orig);
-                                }
-                            }
-                        }
-                    }
-                    if (compare_reverse && (is_pal || (x_strand != y_strand))) {
-                        uint32_t posY_rc = (uint32_t)(lenY - (uint64_t)posY_orig - (uint64_t)wl);
-                        bool left_ext = prev_x_valid && (posY_rc > 0) &&
-                                        (norm_seed_byte(seqY_rc[posY_rc - 1], soft_mask) == prev_x) &&
-                                        !is_dropped_pos(dropped_bitmap, posY_orig + 1);
-                        bool right_ext = next_x_valid && ((uint64_t)posY_rc + (uint64_t)wl < lenY) &&
-                                         (norm_seed_byte(seqY_rc[(uint64_t)posY_rc + (uint64_t)wl], soft_mask) == next_x) &&
-                                         !is_dropped_pos(dropped_bitmap, posY_orig - 1);
-                        if (!left_ext || !right_ext) {
-                            if (*hit_count <= max_hits) {
-                                uint32_t slot = atomicAdd(hit_count, 1U);
-                                if (slot < max_hits) {
-                                    out_hits[slot] = pack_hit_key(1U, posX, posY_rc);
-                                }
-                            }
-                        }
-                    }
-                    j++;
-                }
-            }
-        } else {
+    uint64_t i = scan_from;
+    while (i < t_end) {
+        uint32_t w_idx = (uint32_t)(i >> 5);
+        uint32_t lane = (uint32_t)(i & 31ULL);
+        uint32_t avail = (uint32_t)((32U - lane < t_end - i) ? (32U - lane) : (t_end - i));
+        uint32_t inv_word = seqX.invalid_bm ? (__ldg(&seqX.invalid_bm[w_idx]) >> lane) : 0U;
+        uint32_t avail_mask = (avail == 32U) ? 0xFFFFFFFFU : ((1U << avail) - 1U);
+        if ((inv_word & avail_mask) == avail_mask) {
             valid = 0;
             kf = 0;
             kr = 0;
+            i += avail;
+            continue;
         }
+        uint64_t bword = __ldg(&seqX.bits[w_idx]) >> (lane << 1);
+        for (uint32_t k = 0; k < avail; k++) {
+            uint64_t b = bword & 3ULL;
+            bword >>= 2;
+            if (((inv_word >> k) & 1U) == 0U) {
+                kf = ((kf << 2) | b) & mask;
+                kr = (kr >> 2) | ((b ^ 3ULL) << rc_shift);
+                uint64_t cur_i = i + k;
+                if (++valid >= wl && cur_i >= t_start) {
+                    uint32_t posX = (uint32_t)(cur_i + 1ULL - (uint64_t)wl);
+                    uint32_t x_strand = (kf <= kr) ? 0U : 1U;
+                    uint64_t canon = x_strand ? kr : kf;
+                    bool is_pal = (kf == kr);
+
+                    uint64_t h = fmix64(canon);
+                    uint32_t bkt = (uint32_t)(h >> shift_bits);
+                    uint32_t st = __ldg(&bucket_off[bkt]);
+                    uint32_t en = __ldg(&bucket_off[bkt + 1]);
+                    if (st == en) continue;
+
+                    uint32_t j = st;
+                    if (en - st <= 16U) {
+                        while (j < en && __ldg(&idx_keys[j]) < h) j++;
+                    } else {
+                        uint32_t lo = st, hi = en;
+                        while (lo < hi) {
+                            uint32_t mid = lo + ((hi - lo) >> 1);
+                            if (__ldg(&idx_keys[mid]) < h) lo = mid + 1;
+                            else hi = mid;
+                        }
+                        j = lo;
+                    }
+
+                    bool prev_x_valid = (posX > 0U) && !is_bit_set(seqX.invalid_bm, posX - 1U);
+                    uint32_t prev_x_2bit = prev_x_valid ? base_2bit_dev(seqX.bits, posX - 1U) : 4U;
+                    bool next_x_valid = ((uint64_t)posX + (uint64_t)wl < seqX.len) &&
+                                        !is_bit_set(seqX.invalid_bm, posX + (uint32_t)wl);
+                    uint32_t next_x_2bit = next_x_valid ? base_2bit_dev(seqX.bits, posX + (uint32_t)wl) : 4U;
+
+                    while (j < en && __ldg(&idx_keys[j]) == h) {
+                        uint32_t ps = __ldg(&idx_vals[j]);
+                        uint32_t posY_orig = ps >> 1;
+                        uint32_t y_strand = ps & 1U;
+
+                        if (is_pal || (x_strand == y_strand)) {
+                            bool left_ext = prev_x_valid && (posY_orig > 0U) &&
+                                            !is_bit_set(seqY.invalid_bm, posY_orig - 1U) &&
+                                            (base_2bit_dev(seqY.bits, posY_orig - 1U) == prev_x_2bit) &&
+                                            !is_bit_set(dropped_bitmap, posY_orig - 1U);
+                            bool right_ext = next_x_valid && ((uint64_t)posY_orig + (uint64_t)wl < seqY.len) &&
+                                             !is_bit_set(seqY.invalid_bm, posY_orig + (uint32_t)wl) &&
+                                             (base_2bit_dev(seqY.bits, posY_orig + (uint32_t)wl) == next_x_2bit) &&
+                                             !is_bit_set(dropped_bitmap, posY_orig + 1U);
+                            if (!left_ext || !right_ext) {
+                                if (*hit_count <= max_hits) {
+                                    uint32_t slot = atomicAdd(hit_count, 1U);
+                                    if (slot < max_hits) {
+                                        out_hits[slot] = pack_hit_key(0U, posX, posY_orig);
+                                    }
+                                }
+                            }
+                        }
+                        if (compare_reverse && (is_pal || (x_strand != y_strand))) {
+                            /* Check mirrored neighbors directly in seqY (avoids storing/reading seqY_rc.invalid_bm):
+                             * Y_rc[posY_rc - 1]  == comp(Y[posY_orig + wl])
+                             * Y_rc[posY_rc + wl] == comp(Y[posY_orig - 1]) */
+                            uint32_t posY_rc = (uint32_t)(seqY.len - (uint64_t)posY_orig - (uint64_t)wl);
+                            bool left_ext = prev_x_valid && (posY_rc > 0U) &&
+                                            !is_bit_set(seqY.invalid_bm, posY_orig + (uint32_t)wl) &&
+                                            ((base_2bit_dev(seqY.bits, posY_orig + (uint32_t)wl) ^ 3U) == prev_x_2bit) &&
+                                            !is_bit_set(dropped_bitmap, posY_orig + 1U);
+                            bool right_ext = next_x_valid && (posY_orig > 0U) &&
+                                             !is_bit_set(seqY.invalid_bm, posY_orig - 1U) &&
+                                             ((base_2bit_dev(seqY.bits, posY_orig - 1U) ^ 3U) == next_x_2bit) &&
+                                             !is_bit_set(dropped_bitmap, posY_orig - 1U);
+                            if (!left_ext || !right_ext) {
+                                if (*hit_count <= max_hits) {
+                                    uint32_t slot = atomicAdd(hit_count, 1U);
+                                    if (slot < max_hits) {
+                                        out_hits[slot] = pack_hit_key(1U, posX, posY_rc);
+                                    }
+                                }
+                            }
+                        }
+                        j++;
+                    }
+                }
+            } else {
+                valid = 0;
+                kf = 0;
+                kr = 0;
+            }
+        }
+        i += avail;
     }
 }
 
@@ -152,14 +174,10 @@ static __global__ void filter_sorted_hits_kernel(
 }
 
 uint32_t gpu_query_tile_left_maximal(
-    const uint8_t *d_seqX,
-    uint64_t lenX,
-    const uint8_t *d_seqY,
-    const uint8_t *d_seqY_rc,
-    uint64_t lenY,
+    const GpuSeqView &seqX,
+    const GpuSeqView &seqY,
     const GpuRefIndex &idx,
     int wl,
-    bool soft_mask,
     bool compare_reverse,
     uint64_t tile_start,
     uint64_t tile_end,
@@ -179,9 +197,9 @@ uint32_t gpu_query_tile_left_maximal(
     uint64_t n_threads = ((tile_end - tile_start) + 15) / 16;
     uint32_t grid = (uint32_t)((n_threads + 255) / 256);
     query_left_maximal_kernel<<<grid, 256>>>(
-        d_seqX, lenX, d_seqY, d_seqY_rc, lenY,
+        seqX, seqY,
         idx.d_bucket_off, idx.d_keys, idx.d_vals, idx.d_dropped_bitmap, idx.shift_bits, wl,
-        soft_mask, compare_reverse,
+        compare_reverse,
         tile_start, tile_end, d_hits, d_hit_count, max_hits);
     CUDA_CHECK_VOID(cudaGetLastError());
 

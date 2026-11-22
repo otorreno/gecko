@@ -1,6 +1,7 @@
 // query.wgsl
-// Tiled WGSL compute shader for canonical k-mer lookup against a Hash-CSR index
-// with bit-exact 64-bit MurmurHash3 fmix64 emulation (vec2<u32>) and lock-free
+// Tiled 2-bit PackedSeq WGSL compute shader for canonical k-mer lookup against
+// a Hash-CSR index with bit-exact 64-bit MurmurHash3 fmix64 emulation (vec2<u32>),
+// 1-bit invalid-seed and freq_limit dropped-position bitmaps, and lock-free
 // Left/Right-Maximal Seed Filtering.
 
 struct QueryParams {
@@ -12,10 +13,10 @@ struct QueryParams {
     tile_end: u32,
     max_hits: u32,
     stride: u32,
-    flags: u32,        // bit 0: soft_mask, bit 1: compare_reverse, bit 2: has_dropped
+    flags: u32,        // bit 0: compare_reverse, bit 1: has_dropped, bit 2: has_inv_x, bit 3: has_inv_y
+    inv_y_word_off: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 };
 
 struct KeyPair {
@@ -31,9 +32,9 @@ struct HitRec {
 };
 
 @group(0) @binding(0) var<uniform> params: QueryParams;
-@group(0) @binding(1) var<storage, read> seq_x: array<u32>;
-@group(0) @binding(2) var<storage, read> seq_y: array<u32>;
-@group(0) @binding(3) var<storage, read> seq_y_rc: array<u32>;
+@group(0) @binding(1) var<storage, read> seq_x_bits: array<u32>;
+@group(0) @binding(2) var<storage, read> seq_y_bits: array<u32>;
+@group(0) @binding(3) var<storage, read> invalid_bm: array<u32>;
 @group(0) @binding(4) var<storage, read> bucket_off: array<u32>;
 @group(0) @binding(5) var<storage, read> idx_keys: array<KeyPair>;
 @group(0) @binding(6) var<storage, read> idx_vals: array<u32>;
@@ -41,16 +42,26 @@ struct HitRec {
 @group(0) @binding(8) var<storage, read_write> hit_count: atomic<u32>;
 @group(0) @binding(9) var<storage, read> dropped_bitmap: array<u32>;
 
-fn read_byte_x(idx: u32) -> u32 {
-    return (seq_x[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xFFu;
+fn base_2bit_x(pos: u32) -> u32 {
+    return (seq_x_bits[pos >> 4u] >> ((pos & 15u) * 2u)) & 3u;
 }
 
-fn read_byte_y(idx: u32) -> u32 {
-    return (seq_y[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xFFu;
+fn base_2bit_y(pos: u32) -> u32 {
+    return (seq_y_bits[pos >> 4u] >> ((pos & 15u) * 2u)) & 3u;
 }
 
-fn read_byte_y_rc(idx: u32) -> u32 {
-    return (seq_y_rc[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xFFu;
+fn is_invalid_x(pos: u32, has_inv_x: bool) -> bool {
+    if (!has_inv_x) {
+        return false;
+    }
+    return ((invalid_bm[pos >> 5u] >> (pos & 31u)) & 1u) != 0u;
+}
+
+fn is_invalid_y(pos: u32, has_inv_y: bool) -> bool {
+    if (!has_inv_y) {
+        return false;
+    }
+    return ((invalid_bm[params.inv_y_word_off + (pos >> 5u)] >> (pos & 31u)) & 1u) != 0u;
 }
 
 fn is_dropped_pos(pos: u32, has_dropped: bool) -> bool {
@@ -58,22 +69,6 @@ fn is_dropped_pos(pos: u32, has_dropped: bool) -> bool {
         return false;
     }
     return ((dropped_bitmap[pos >> 5u] >> (pos & 31u)) & 1u) != 0u;
-}
-
-fn norm_seed_byte(c: u32, soft_mask: bool) -> u32 {
-    if (soft_mask) {
-        return c;
-    }
-    return c & 0xDFu;
-}
-
-fn base_to_2bit(c: u32, soft_mask: bool) -> u32 {
-    let u = norm_seed_byte(c, soft_mask);
-    if (u == 65u) { return 0u; } // 'A'
-    if (u == 67u) { return 1u; } // 'C'
-    if (u == 71u) { return 2u; } // 'G'
-    if (u == 84u || u == 85u) { return 3u; } // 'T' | 'U'
-    return 4u;
 }
 
 // Exact 64-bit wrapping multiplication returning (lo, hi)
@@ -144,9 +139,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t_end = min(t_start + params.stride, params.tile_end);
 
     let wl = params.wl;
-    let soft_mask = (params.flags & 1u) != 0u;
-    let compare_rev = (params.flags & 2u) != 0u;
-    let has_dropped = (params.flags & 4u) != 0u;
+    let compare_rev = (params.flags & 1u) != 0u;
+    let has_dropped = (params.flags & 2u) != 0u;
+    let has_inv_x = (params.flags & 4u) != 0u;
+    let has_inv_y = (params.flags & 8u) != 0u;
     let bits = 2u * wl;
     var mask_lo: u32 = 0xFFFFFFFFu;
     var mask_hi: u32 = 0xFFFFFFFFu;
@@ -173,8 +169,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var valid: u32 = 0u;
 
     for (var i = scan_from; i < t_end; i = i + 1u) {
-        let b = base_to_2bit(read_byte_x(i), soft_mask);
-        if (b < 4u) {
+        if (!is_invalid_x(i, has_inv_x)) {
+            let b = base_2bit_x(i);
             kf = shl2_mask(kf, b, mask_lo, mask_hi);
             kr = shr2_insert(kr, b ^ 3u, rc_shift);
             valid = valid + 1u;
@@ -217,17 +213,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     j = lo;
                 }
 
-                var prev_x: u32 = 0u;
+                var prev_x_2bit: u32 = 4u;
                 var prev_x_valid = false;
-                if (pos_x > 0u) {
-                    prev_x = norm_seed_byte(read_byte_x(pos_x - 1u), soft_mask);
-                    prev_x_valid = (base_to_2bit(prev_x, true) < 4u);
+                if (pos_x > 0u && !is_invalid_x(pos_x - 1u, has_inv_x)) {
+                    prev_x_valid = true;
+                    prev_x_2bit = base_2bit_x(pos_x - 1u);
                 }
-                var next_x: u32 = 0u;
+                var next_x_2bit: u32 = 4u;
                 var next_x_valid = false;
-                if (pos_x + wl < params.len_x) {
-                    next_x = norm_seed_byte(read_byte_x(pos_x + wl), soft_mask);
-                    next_x_valid = (base_to_2bit(next_x, true) < 4u);
+                if (pos_x + wl < params.len_x && !is_invalid_x(pos_x + wl, has_inv_x)) {
+                    next_x_valid = true;
+                    next_x_2bit = base_2bit_x(pos_x + wl);
                 }
 
                 loop {
@@ -242,12 +238,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (is_pal || x_strand == y_strand) {
                         var left_ext = false;
                         if (prev_x_valid && pos_y_orig > 0u) {
-                            left_ext = (norm_seed_byte(read_byte_y(pos_y_orig - 1u), soft_mask) == prev_x)
+                            left_ext = !is_invalid_y(pos_y_orig - 1u, has_inv_y)
+                                && (base_2bit_y(pos_y_orig - 1u) == prev_x_2bit)
                                 && !is_dropped_pos(pos_y_orig - 1u, has_dropped);
                         }
                         var right_ext = false;
                         if (next_x_valid && pos_y_orig + wl < params.len_y) {
-                            right_ext = (norm_seed_byte(read_byte_y(pos_y_orig + wl), soft_mask) == next_x)
+                            right_ext = !is_invalid_y(pos_y_orig + wl, has_inv_y)
+                                && (base_2bit_y(pos_y_orig + wl) == next_x_2bit)
                                 && !is_dropped_pos(pos_y_orig + 1u, has_dropped);
                         }
                         if (!left_ext || !right_ext) {
@@ -261,12 +259,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let pos_y_rc = params.len_y - pos_y_orig - wl;
                         var left_ext = false;
                         if (prev_x_valid && pos_y_rc > 0u) {
-                            left_ext = (norm_seed_byte(read_byte_y_rc(pos_y_rc - 1u), soft_mask) == prev_x)
+                            left_ext = !is_invalid_y(pos_y_orig + wl, has_inv_y)
+                                && ((base_2bit_y(pos_y_orig + wl) ^ 3u) == prev_x_2bit)
                                 && !is_dropped_pos(pos_y_orig + 1u, has_dropped);
                         }
                         var right_ext = false;
-                        if (next_x_valid && pos_y_rc + wl < params.len_y) {
-                            right_ext = (norm_seed_byte(read_byte_y_rc(pos_y_rc + wl), soft_mask) == next_x)
+                        if (next_x_valid && pos_y_orig > 0u) {
+                            right_ext = !is_invalid_y(pos_y_orig - 1u, has_inv_y)
+                                && ((base_2bit_y(pos_y_orig - 1u) ^ 3u) == next_x_2bit)
                                 && !is_dropped_pos(pos_y_orig - 1u, has_dropped);
                         }
                         if (!left_ext || !right_ext) {

@@ -1,9 +1,9 @@
 /*
  * cuda_index.cu
  *
- * Stage 1: GPU reverse-complement generation, canonical k-mer extraction,
- * CUB DeviceRadixSort::SortPairs, exact per-strand freq_limit compaction,
- * and 2-pass reverse-suffix-min bucket offset table construction.
+ * Stage 1: Word-level 2-bit GPU reverse-complement generation, 2-bit canonical
+ * k-mer extraction, CUB DeviceRadixSort::SortPairs, exact per-strand freq_limit
+ * compaction + 1-bit dropped-position bitmap, and 2-pass suffix-min bucket table.
  */
 
 #include <utility>
@@ -12,18 +12,56 @@
 
 #include "cuda_common.cuh"
 
-static __global__ void revcomp_kernel(const uint8_t * __restrict__ src, uint8_t * __restrict__ dst, uint64_t len) {
-    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < len) {
-        dst[i] = comp_base_dev(src[len - 1 - i]);
+static __global__ void revcomp_2bit_kernel(
+    const uint64_t * __restrict__ src_bits,
+    uint64_t * __restrict__ dst_bits,
+    uint64_t len,
+    uint32_t n_words
+) {
+    uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= n_words) return;
+
+    uint64_t out_end = (uint64_t)(w + 1U) * 32ULL;
+    if (out_end <= len) {
+        uint32_t src_start = (uint32_t)(len - out_end);
+        uint64_t fwd = load_32_2bit(src_bits, src_start);
+        dst_bits[w] = ~reverse_32_2bit_dev(fwd);
+    } else {
+        uint32_t rem = (uint32_t)(len & 31ULL);
+        uint64_t last = 0ULL;
+        for (uint32_t k = 0; k < rem; k++) {
+            uint32_t src_pos = rem - 1U - k;
+            uint64_t comp = (uint64_t)(base_2bit_dev(src_bits, src_pos) ^ 3U);
+            last |= comp << (2U * k);
+        }
+        dst_bits[w] = last;
+    }
+}
+
+static __global__ void rev_bitmap_kernel(
+    const uint32_t * __restrict__ src_bm,
+    uint32_t * __restrict__ dst_bm,
+    uint64_t len,
+    uint32_t n_words
+) {
+    uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= n_words) return;
+
+    uint64_t out_end = (uint64_t)(w + 1U) * 32ULL;
+    if (out_end <= len) {
+        uint32_t src_start = (uint32_t)(len - out_end);
+        uint32_t fwd = load_32_1bit(src_bm, src_start);
+        dst_bm[w] = __brev(fwd);
+    } else {
+        uint32_t rem = (uint32_t)(len & 31ULL);
+        uint32_t fwd = __ldg(&src_bm[0]);
+        dst_bm[w] = __brev(fwd) >> (32U - rem);
     }
 }
 
 static __global__ void count_valid_kmers_kernel(
-    const uint8_t * __restrict__ seq,
-    uint64_t len,
+    GpuSeqView seq,
     int wl,
-    bool soft_mask,
     uint32_t num_chunks,
     uint32_t * __restrict__ chunk_counts
 ) {
@@ -32,26 +70,60 @@ static __global__ void count_valid_kmers_kernel(
 
     uint64_t c_start = (uint64_t)cid * GECKO_EXTRACT_CHUNK_BP;
     uint64_t c_end = c_start + GECKO_EXTRACT_CHUNK_BP;
-    if (c_end > len) c_end = len;
+    if (c_end > seq.len) c_end = seq.len;
 
-    uint64_t scan_from = (c_start >= (uint64_t)(wl - 1)) ? (c_start - (uint64_t)(wl - 1)) : 0;
+    uint64_t scan_from = (c_start >= (uint64_t)(wl - 1)) ? (c_start - (uint64_t)(wl - 1)) : 0ULL;
+    if (!seq.invalid_bm) {
+        /* Fast path: every base is valid */
+        uint64_t first_emit = (c_start >= (uint64_t)(wl - 1)) ? c_start : (uint64_t)(wl - 1);
+        chunk_counts[cid] = (c_end > first_emit) ? (uint32_t)(c_end - first_emit) : 0U;
+        return;
+    }
+
     int valid = 0;
     uint32_t cnt = 0;
-    for (uint64_t i = scan_from; i < c_end; i++) {
-        if (base_to_2bit(seq[i], soft_mask) < 4) {
-            if (++valid >= wl && i >= c_start) cnt++;
-        } else {
+    uint64_t i = scan_from;
+    while (i < c_end) {
+        uint32_t w_idx = (uint32_t)(i >> 5);
+        uint32_t lane = (uint32_t)(i & 31ULL);
+        uint32_t avail = (uint32_t)((32U - lane < c_end - i) ? (32U - lane) : (c_end - i));
+        uint32_t inv_word = __ldg(&seq.invalid_bm[w_idx]) >> lane;
+        uint32_t avail_mask = (avail == 32U) ? 0xFFFFFFFFU : ((1U << avail) - 1U);
+        uint32_t inv_masked = inv_word & avail_mask;
+        if (inv_masked == avail_mask) {
+            /* Entire slice is invalid (N gap or soft-masked repeat) */
             valid = 0;
+            i += avail;
+            continue;
         }
+        if (inv_masked == 0U) {
+            /* Entire slice is valid */
+            int prev_valid = valid;
+            valid += (int)avail;
+            if (valid >= wl) {
+                uint64_t reach = (prev_valid >= wl - 1) ? i : (i + (uint64_t)(wl - 1 - prev_valid));
+                uint64_t emit_lo = (reach > c_start) ? reach : c_start;
+                uint64_t slice_end = i + avail;
+                if (slice_end > emit_lo) cnt += (uint32_t)(slice_end - emit_lo);
+            }
+            i += avail;
+            continue;
+        }
+        for (uint32_t k = 0; k < avail; k++) {
+            if (((inv_word >> k) & 1U) == 0U) {
+                if (++valid >= wl && (i + k) >= c_start) cnt++;
+            } else {
+                valid = 0;
+            }
+        }
+        i += avail;
     }
     chunk_counts[cid] = cnt;
 }
 
 static __global__ void extract_kmers_kernel(
-    const uint8_t * __restrict__ seq,
-    uint64_t len,
+    GpuSeqView seq,
     int wl,
-    bool soft_mask,
     uint32_t num_chunks,
     const uint32_t * __restrict__ chunk_offsets,
     uint64_t * __restrict__ out_keys,
@@ -62,34 +134,52 @@ static __global__ void extract_kmers_kernel(
 
     uint64_t c_start = (uint64_t)cid * GECKO_EXTRACT_CHUNK_BP;
     uint64_t c_end = c_start + GECKO_EXTRACT_CHUNK_BP;
-    if (c_end > len) c_end = len;
+    if (c_end > seq.len) c_end = seq.len;
 
     uint64_t mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
     int rc_shift = 2 * (wl - 1);
-    uint64_t scan_from = (c_start >= (uint64_t)(wl - 1)) ? (c_start - (uint64_t)(wl - 1)) : 0;
+    uint64_t scan_from = (c_start >= (uint64_t)(wl - 1)) ? (c_start - (uint64_t)(wl - 1)) : 0ULL;
 
     uint64_t kf = 0, kr = 0;
     int valid = 0;
     uint32_t dst = chunk_offsets[cid];
 
-    for (uint64_t i = scan_from; i < c_end; i++) {
-        uint8_t b = base_to_2bit(seq[i], soft_mask);
-        if (b < 4) {
-            kf = ((kf << 2) | b) & mask;
-            kr = (kr >> 2) | ((uint64_t)(b ^ 3) << rc_shift);
-            if (++valid >= wl && i >= c_start) {
-                uint32_t strand = (kf <= kr) ? 0U : 1U;
-                uint64_t key = strand ? kr : kf;
-                uint32_t start_pos = (uint32_t)(i + 1 - (uint64_t)wl);
-                out_keys[dst] = fmix64(key);
-                out_vals[dst] = (start_pos << 1) | strand;
-                dst++;
-            }
-        } else {
+    uint64_t i = scan_from;
+    while (i < c_end) {
+        uint32_t w_idx = (uint32_t)(i >> 5);
+        uint32_t lane = (uint32_t)(i & 31ULL);
+        uint32_t avail = (uint32_t)((32U - lane < c_end - i) ? (32U - lane) : (c_end - i));
+        uint32_t inv_word = seq.invalid_bm ? (__ldg(&seq.invalid_bm[w_idx]) >> lane) : 0U;
+        uint32_t avail_mask = (avail == 32U) ? 0xFFFFFFFFU : ((1U << avail) - 1U);
+        if ((inv_word & avail_mask) == avail_mask) {
             valid = 0;
             kf = 0;
             kr = 0;
+            i += avail;
+            continue;
         }
+        uint64_t bword = __ldg(&seq.bits[w_idx]) >> (lane << 1);
+        for (uint32_t k = 0; k < avail; k++) {
+            uint64_t b = bword & 3ULL;
+            bword >>= 2;
+            if (((inv_word >> k) & 1U) == 0U) {
+                kf = ((kf << 2) | b) & mask;
+                kr = (kr >> 2) | ((b ^ 3ULL) << rc_shift);
+                if (++valid >= wl && (i + k) >= c_start) {
+                    uint32_t strand = (kf <= kr) ? 0U : 1U;
+                    uint64_t key = strand ? kr : kf;
+                    uint32_t start_pos = (uint32_t)((i + k) + 1ULL - (uint64_t)wl);
+                    out_keys[dst] = fmix64(key);
+                    out_vals[dst] = (start_pos << 1) | strand;
+                    dst++;
+                }
+            } else {
+                valid = 0;
+                kf = 0;
+                kr = 0;
+            }
+        }
+        i += avail;
     }
 }
 
@@ -206,21 +296,31 @@ static __global__ void suffix_min_apply_kernel(
     if (next_min < arr[idx]) arr[idx] = next_min;
 }
 
-void gpu_build_revcomp(const uint8_t *d_src, uint8_t *d_dst, uint64_t len) {
+void gpu_build_revcomp_2bit(
+    const uint64_t *d_src_bits,
+    uint64_t *d_dst_bits,
+    const uint32_t *d_src_special_bm,
+    uint32_t *d_dst_special_bm,
+    uint64_t len
+) {
     if (len == 0) return;
-    uint32_t grid = (uint32_t)((len + 255) / 256);
-    revcomp_kernel<<<grid, 256>>>(d_src, d_dst, len);
+    uint32_t n_words = (uint32_t)((len + 31ULL) / 32ULL);
+    uint32_t grid = (n_words + 255U) / 256U;
+    revcomp_2bit_kernel<<<grid, 256>>>(d_src_bits, d_dst_bits, len, n_words);
     CUDA_CHECK_VOID(cudaGetLastError());
+    if (d_src_special_bm && d_dst_special_bm) {
+        rev_bitmap_kernel<<<grid, 256>>>(d_src_special_bm, d_dst_special_bm, len, n_words);
+        CUDA_CHECK_VOID(cudaGetLastError());
+    }
 }
 
 GpuRefIndex gpu_build_ref_index(
-    const uint8_t *d_seqY,
-    uint64_t lenY,
+    const GpuSeqView &seqY,
     int wl,
-    uint32_t freq_limit,
-    bool soft_mask
+    uint32_t freq_limit
 ) {
     GpuRefIndex idx{};
+    uint64_t lenY = seqY.len;
     uint32_t num_chunks = (uint32_t)((lenY + GECKO_EXTRACT_CHUNK_BP - 1) / GECKO_EXTRACT_CHUNK_BP);
     uint32_t *d_chunk_counts = nullptr, *d_chunk_offsets = nullptr;
     CUDA_CHECK_VOID(cudaMalloc(&d_chunk_counts, (size_t)(num_chunks > 0 ? num_chunks : 1) * sizeof(uint32_t)));
@@ -228,7 +328,9 @@ GpuRefIndex gpu_build_ref_index(
 
     if (num_chunks > 0) {
         count_valid_kmers_kernel<<<(num_chunks + 255) / 256, 256>>>(
-            d_seqY, lenY, wl, soft_mask, num_chunks, d_chunk_counts);
+            seqY, wl, num_chunks, d_chunk_counts);
+        CUDA_CHECK_VOID(cudaGetLastError());
+
         void *d_temp = nullptr;
         size_t temp_bytes = 0;
         cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes, d_chunk_counts, d_chunk_offsets, num_chunks);
@@ -251,7 +353,7 @@ GpuRefIndex gpu_build_ref_index(
 
     if (idx.n_valid > 0) {
         extract_kmers_kernel<<<(num_chunks + 255) / 256, 256>>>(
-            d_seqY, lenY, wl, soft_mask, num_chunks, d_chunk_offsets, d_keys_a, d_vals_a);
+            seqY, wl, num_chunks, d_chunk_offsets, d_keys_a, d_vals_a);
         CUDA_CHECK_VOID(cudaGetLastError());
     }
     CUDA_CHECK_VOID(cudaFree(d_chunk_offsets));

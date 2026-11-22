@@ -56,15 +56,66 @@ pub fn write_inf_path(path: impl AsRef<Path>, meta: &ComparisonMetadata) -> Resu
     Ok(())
 }
 
+#[inline]
+fn push_u64(buf: &mut Vec<u8>, mut v: u64) {
+    let mut tmp = [0u8; 20];
+    let mut n = 0usize;
+    loop {
+        tmp[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+        if v == 0 {
+            break;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        buf.push(tmp[n]);
+    }
+}
+
+#[inline]
+fn push_i64(buf: &mut Vec<u8>, v: i64) {
+    if v < 0 {
+        buf.push(b'-');
+        push_u64(buf, v.unsigned_abs());
+    } else {
+        push_u64(buf, v as u64);
+    }
+}
+
+#[inline]
+fn push_fixed2(buf: &mut Vec<u8>, mut val: f64) {
+    if val < 0.0 {
+        buf.push(b'-');
+        val = -val;
+    }
+    let scaled = (val * 100.0 + 0.5) as u64;
+    push_u64(buf, scaled / 100);
+    buf.push(b'.');
+    let frac = scaled % 100;
+    buf.push(b'0' + (frac / 10) as u8);
+    buf.push(b'0' + (frac % 10) as u8);
+}
+
 /// Write the 1000 x 100 coverage matrix `.MAT` file.
 pub fn write_mat_path(path: impl AsRef<Path>, mat: &CoverageMatrix) -> Result<()> {
     let file = File::create(path)?;
-    let mut w = BufWriter::with_capacity(1 << 20, file);
+    let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
+    let mut buf = Vec::with_capacity(256 * 1024);
     for row in &mat.bins {
-        for &val in row {
-            write!(w, "{val}\t")?;
+        if buf.len() + 2048 > buf.capacity() {
+            w.write_all(&buf)?;
+            buf.clear();
         }
-        writeln!(w)?;
+        for &val in row {
+            push_u64(&mut buf, val);
+            buf.push(b'\t');
+        }
+        buf.push(b'\n');
+    }
+    if !buf.is_empty() {
+        w.write_all(&buf)?;
     }
     w.flush()?;
     Ok(())
@@ -77,7 +128,7 @@ pub fn write_csv_path(
     fragments: &[Fragment],
 ) -> Result<()> {
     let file = File::create(path)?;
-    let mut w = BufWriter::with_capacity(1 << 20, file);
+    let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
     write_csv(&mut w, meta, fragments)?;
     w.flush()?;
     Ok(())
@@ -90,18 +141,21 @@ pub fn write_csv<W: Write>(
     fragments: &[Fragment],
 ) -> Result<()> {
     write_inf(w, meta)?;
-    writeln!(w, "Total CSB: 0")?;
-    writeln!(
-        w,
-        "========================================================"
-    )?;
-    writeln!(
-        w,
-        "Type,xStart,yStart,xEnd,yEnd,strand(f/r),block,length,score,ident,similarity,%ident,SeqX,SeqY"
+    w.write_all(
+        b"Total CSB: 0\n\
+          ========================================================\n\
+          Type,xStart,yStart,xEnd,yEnd,strand(f/r),block,length,score,ident,similarity,%ident,SeqX,SeqY\n",
     )?;
 
+    const FLUSH_CAP: usize = 4 * 1024 * 1024;
+    let mut buf = Vec::with_capacity(FLUSH_CAP.min(fragments.len().saturating_mul(96).max(4096)));
     let y_total = meta.seq_y_len;
+
     for f in fragments {
+        if buf.len() + 256 > buf.capacity() && buf.len() >= 1024 * 1024 {
+            w.write_all(&buf)?;
+            buf.clear();
+        }
         let (y_start, y_end) = if f.strand == 'r' {
             (
                 y_total.saturating_sub(f.y_start + 1),
@@ -110,23 +164,36 @@ pub fn write_csv<W: Write>(
         } else {
             (f.y_start, f.y_end)
         };
-        writeln!(
-            w,
-            "Frag,{},{},{},{},{},{},{},{},{},{:.2},{:.2},{},{}",
-            f.x_start,
-            y_start,
-            f.x_end,
-            y_end,
-            f.strand,
-            f.block,
-            f.length,
-            f.score,
-            f.ident,
-            f.similarity,
-            f.pct_identity(),
-            f.seq_x,
-            f.seq_y
-        )?;
+        buf.extend_from_slice(b"Frag,");
+        push_u64(&mut buf, f.x_start);
+        buf.push(b',');
+        push_u64(&mut buf, y_start);
+        buf.push(b',');
+        push_u64(&mut buf, f.x_end);
+        buf.push(b',');
+        push_u64(&mut buf, y_end);
+        buf.push(b',');
+        buf.push(f.strand as u8);
+        buf.push(b',');
+        push_i64(&mut buf, f.block);
+        buf.push(b',');
+        push_u64(&mut buf, f.length);
+        buf.push(b',');
+        push_u64(&mut buf, f.score);
+        buf.push(b',');
+        push_u64(&mut buf, f.ident);
+        buf.push(b',');
+        push_fixed2(&mut buf, f.similarity as f64);
+        buf.push(b',');
+        push_fixed2(&mut buf, f.pct_identity());
+        buf.push(b',');
+        push_u64(&mut buf, f.seq_x);
+        buf.push(b',');
+        push_u64(&mut buf, f.seq_y);
+        buf.push(b'\n');
+    }
+    if !buf.is_empty() {
+        w.write_all(&buf)?;
     }
     Ok(())
 }

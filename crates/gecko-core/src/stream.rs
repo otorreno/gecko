@@ -649,7 +649,7 @@ fn process_hit_rev(
 
 /// Sort merged fragments and remove any fragment fully contained within a preceding fragment
 /// on the same `(strand, diag, seq_x, seq_y)`.
-fn dedup_fragments(fragments: &mut Vec<Fragment>) {
+pub fn dedup_fragments(fragments: &mut Vec<Fragment>) {
     if fragments.len() <= 1 {
         return;
     }

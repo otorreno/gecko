@@ -1,0 +1,15 @@
+[package]
+name = "gecko-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Optional native NVIDIA CUDA + CUB GPU backend for GECKO"
+
+[features]
+default = []
+cuda-native = []
+
+[dependencies]
+gecko-core = { path = "../gecko-core" }

@@ -31,7 +31,7 @@ const fn make_base_lut(soft_mask: bool) -> [u8; 256] {
 
 /// Return the 2-bit base encoding lookup table for the given `soft_mask` setting.
 #[inline(always)]
-pub(crate) fn base_lut(soft_mask: bool) -> &'static [u8; 256] {
+pub fn base_lut(soft_mask: bool) -> &'static [u8; 256] {
     if soft_mask {
         &BASE_LUT_SOFT_MASK
     } else {
@@ -41,7 +41,7 @@ pub(crate) fn base_lut(soft_mask: bool) -> &'static [u8; 256] {
 
 /// Invertible MurmurHash3 64-bit finalizer (`fmix64`) used for uniform bucket assignment.
 #[inline(always)]
-pub(crate) fn fmix64(mut k: u64) -> u64 {
+pub fn fmix64(mut k: u64) -> u64 {
     k ^= k >> 33;
     k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
     k ^= k >> 33;

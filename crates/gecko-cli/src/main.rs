@@ -1,8 +1,11 @@
+mod backend;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use backend::BackendArg;
 use clap::{Parser, Subcommand, ValueEnum};
 use gecko_core::formats::align::{write_alignments_path, write_borders_path};
 use gecko_core::formats::csv::{
@@ -40,6 +43,9 @@ enum Commands {
     /// Compare a query FASTA (or .fa.gz) against a reference FASTA (or .fa.gz).
     Compare(CompareArgs),
 
+    /// List available compute backends (CUDA, WGPU, AVX2 CPU).
+    Backends(BackendsArgs),
+
     /// Precompute a reusable binary k-mer dictionary (.gidx) for a FASTA file.
     Index(IndexArgs),
 
@@ -60,6 +66,13 @@ enum Commands {
 
     /// Print summary statistics for a .frags, .csv, or .gidx file.
     Stats(StatsArgs),
+}
+
+#[derive(Parser)]
+struct BackendsArgs {
+    /// Include software WGPU adapters (e.g. Mesa Lavapipe) when probing.
+    #[arg(long)]
+    allow_software_gpu: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -214,6 +227,14 @@ struct CompareArgs {
     /// Ambiguous 'N' base penalty (positive value subtracted on 'N').
     #[arg(long, default_value_t = 1)]
     n_penalty: i64,
+
+    /// Compute backend (`auto` prefers CUDA -> hardware WGPU -> fast AVX2 CPU).
+    #[arg(long, env = "GECKO_BACKEND", default_value = "auto")]
+    backend: BackendArg,
+
+    /// Allow software WGPU adapters (e.g. Mesa Lavapipe) when using `--backend wgpu|auto`.
+    #[arg(long)]
+    allow_software_gpu: bool,
 
     /// Print run statistics as JSON to stdout.
     #[arg(long)]
@@ -447,6 +468,10 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Compare(args) => cmd_compare(args),
+        Commands::Backends(args) => {
+            backend::print_backends(args.allow_software_gpu);
+            Ok(())
+        }
         Commands::Index(args) => cmd_index(args),
         Commands::Align(args) => cmd_align(args),
         Commands::Borders(args) => cmd_borders(args),
@@ -459,11 +484,6 @@ fn main() -> Result<()> {
 
 fn cmd_compare(args: CompareArgs) -> Result<()> {
     let t0 = Instant::now();
-    let query = Genome::from_fasta_path(&args.query)
-        .with_context(|| format!("failed to load query {}", args.query.display()))?;
-    let reference = Genome::from_fasta_path(&args.reference)
-        .with_context(|| format!("failed to load reference {}", args.reference.display()))?;
-
     let config = CompareConfig {
         min_length: args.min_length,
         min_similarity: args.min_similarity,
@@ -481,7 +501,19 @@ fn cmd_compare(args: CompareArgs) -> Result<()> {
         },
     };
 
-    let res = compare_genomes(&query, &reference, &config, args.cache_dir.as_deref())?;
+    let run = backend::run_compare_from_paths(
+        &args.query,
+        &args.reference,
+        &config,
+        args.cache_dir.as_deref(),
+        args.backend,
+        args.allow_software_gpu,
+    )?;
+    let query = run.query;
+    let reference = run.reference;
+    let res = run.result;
+
+    let t_write_start = Instant::now();
     let formats = OutputFormat::expand(&args.formats);
     let prefix = args
         .prefix
@@ -510,10 +542,12 @@ fn cmd_compare(args: CompareArgs) -> Result<()> {
         &res.fragments,
         Some(&res.coverage),
     )?;
+    let write_secs = t_write_start.elapsed().as_secs_f64();
 
     let elapsed = t0.elapsed().as_secs_f64();
     if args.json_stats {
         let summary = serde_json::json!({
+            "backend": run.backend_label,
             "query": query.name,
             "reference": reference.name,
             "query_bases": query.total_bases,
@@ -526,13 +560,20 @@ fn cmd_compare(args: CompareArgs) -> Result<()> {
             "filtered_hits": res.stats.filtered_hits,
             "hits_used": res.stats.hits_used,
             "spilled_runs": res.stats.spilled_runs,
+            "load_secs": run.load_secs,
+            "compute_secs": run.compute_secs,
+            "write_secs": write_secs,
             "elapsed_secs": elapsed,
         });
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
         eprintln!(
-            "GECKO done in {:.3}s | frags={} (fwd={}, rev={}) | raw_hits={} filtered={} used={} spilled_runs={}",
+            "GECKO [{}] done in {:.3}s (load={:.3}s compute={:.3}s write={:.3}s) | frags={} (fwd={}, rev={}) | raw_hits={} filtered={} used={} spilled_runs={}",
+            run.backend_label,
             elapsed,
+            run.load_secs,
+            run.compute_secs,
+            write_secs,
             res.fragments.len(),
             res.stats.forward_fragments,
             res.stats.reverse_fragments,

@@ -111,7 +111,7 @@ pub fn write_frags_path(
     fragments: &[Fragment],
 ) -> Result<()> {
     let file = File::create(path)?;
-    let mut w = BufWriter::with_capacity(1 << 20, file);
+    let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
     write_frags(&mut w, x_total, y_total, fragments)?;
     w.flush()?;
     Ok(())

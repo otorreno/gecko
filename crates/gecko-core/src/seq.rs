@@ -42,13 +42,62 @@ pub struct Genome {
     pub total_bases: u64,
 }
 
+const COMP_LUT: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = i as u8;
+        i += 1;
+    }
+    t[b'A' as usize] = b'T';
+    t[b'C' as usize] = b'G';
+    t[b'G' as usize] = b'C';
+    t[b'T' as usize] = b'A';
+    t[b'U' as usize] = b'A';
+    t[b'a' as usize] = b't';
+    t[b'c' as usize] = b'g';
+    t[b'g' as usize] = b'c';
+    t[b't' as usize] = b'a';
+    t[b'u' as usize] = b'a';
+    t
+};
+
+#[inline]
+fn line_is_pure_alpha(line: &[u8]) -> bool {
+    let mut bad = 0u8;
+    for &b in line {
+        bad |= (((b & 0xDF).wrapping_sub(b'A')) >= 26) as u8;
+    }
+    bad == 0
+}
+
+#[inline]
+fn append_seq_line(line: &[u8], data: &mut Vec<u8>, rec_len: &mut u64, total_bases: &mut u64) {
+    if line_is_pure_alpha(line) {
+        data.extend_from_slice(line);
+        let n = line.len() as u64;
+        *rec_len += n;
+        *total_bases += n;
+    } else {
+        for &b in line {
+            if (b & 0xDF).wrapping_sub(b'A') < 26 {
+                data.push(b);
+                *rec_len += 1;
+                *total_bases += 1;
+            } else if b == b'*' || b == SEQ_SEP {
+                data.push(SEQ_SEP);
+            }
+        }
+    }
+}
+
 impl Genome {
-    /// Load a plain or gzip-compressed FASTA file.
+    /// Load a plain or gzip-compressed FASTA file using a 4 MB chunked stride-predicted parser.
     pub fn from_fasta_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
         let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-        let mut reader = BufReader::with_capacity(1 << 20, file);
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
 
         // Auto-detect gzip via magic bytes 0x1f 0x8b
         let is_gz = {
@@ -59,88 +108,166 @@ impl Genome {
         let name = file_stem_name(path);
         if is_gz {
             let gz = MultiGzDecoder::new(reader);
-            Self::from_fasta_reader_with_hint(
-                BufReader::with_capacity(1 << 20, gz),
-                name,
-                path,
-                file_len.saturating_mul(3),
-            )
+            Self::from_raw_reader(gz, name, path, file_len.saturating_mul(3))
         } else {
-            Self::from_fasta_reader_with_hint(reader, name, path, file_len)
+            Self::from_raw_reader(reader, name, path, file_len)
         }
+    }
+
+    /// Load query and reference FASTAs concurrently across two threads.
+    pub fn load_pair_parallel(
+        query_path: impl AsRef<Path>,
+        ref_path: impl AsRef<Path>,
+    ) -> Result<(Self, Self)> {
+        let qp = query_path.as_ref();
+        let rp = ref_path.as_ref();
+        std::thread::scope(|s| {
+            let hq = s.spawn(|| Self::from_fasta_path(qp));
+            let r = Self::from_fasta_path(rp);
+            let q = hq.join().expect("FASTA loader thread panicked");
+            Ok((q?, r?))
+        })
     }
 
     /// Parse FASTA records from any [`BufRead`] source.
     pub fn from_fasta_reader<R: BufRead>(reader: R, name: String, path: &Path) -> Result<Self> {
-        Self::from_fasta_reader_with_hint(reader, name, path, 0)
+        Self::from_raw_reader(reader, name, path, 0)
     }
 
-    fn from_fasta_reader_with_hint<R: BufRead>(
+    /// High-speed 4 MB chunked + constant-line-width stride-predicted FASTA parser.
+    fn from_raw_reader<R: Read>(
         mut reader: R,
         name: String,
         path: &Path,
         capacity_hint: usize,
     ) -> Result<Self> {
-        let mut data = Vec::with_capacity(capacity_hint);
+        const CHUNK_CAP: usize = 4 * 1024 * 1024;
+        let mut buf = vec![0u8; CHUNK_CAP];
+        let mut data = Vec::with_capacity(capacity_hint.saturating_add(64));
         let mut records: Vec<SeqRecord> = Vec::new();
         let mut total_bases: u64 = 0;
-        let mut line = Vec::with_capacity(256);
         let mut in_record = false;
+        let mut carry = 0usize;
+        let mut pred_w = 0usize;
 
         loop {
-            line.clear();
-            let n = reader.read_until(b'\n', &mut line)?;
-            if n == 0 {
+            let nr = reader.read(&mut buf[carry..])?;
+            if nr == 0 {
                 break;
             }
-            let mut end = line.len();
-            while end > 0 && (line[end - 1] == b'\n' || line[end - 1] == b'\r') {
-                end -= 1;
-            }
-            if end == 0 {
-                continue;
-            }
-            let trimmed = &line[..end];
-            if trimmed[0] == b'>' {
-                if in_record {
-                    data.push(SEQ_SEP);
+            let tot = carry + nr;
+            let mut pos = 0usize;
+
+            while pos < tot {
+                // Ultra-fast path: constant FASTA line width with pure alphabetic bytes.
+                if in_record
+                    && pred_w > 0
+                    && pos + pred_w < tot
+                    && buf[pos + pred_w] == b'\n'
+                    && line_is_pure_alpha(&buf[pos..pos + pred_w])
+                {
+                    data.extend_from_slice(&buf[pos..pos + pred_w]);
+                    let n = pred_w as u64;
+                    records.last_mut().unwrap().len += n;
+                    total_bases += n;
+                    pos += pred_w + 1;
+                    continue;
                 }
-                let header_str = String::from_utf8_lossy(&trimmed[1..]);
-                let header = header_str.trim_start().to_string();
-                let id = header.split_whitespace().next().unwrap_or("").to_string();
-                let start_with_sep = data.len() as u64;
-                records.push(SeqRecord {
-                    id,
-                    header,
-                    start_with_sep,
-                    start_no_sep: total_bases,
-                    len: 0,
-                });
-                in_record = true;
-            } else {
-                if !in_record {
-                    return Err(GeckoError::InvalidFasta {
-                        path: path.to_path_buf(),
-                        message: "sequence data encountered before first '>' header".into(),
-                    });
-                }
-                let rec = records.last_mut().unwrap();
-                // Fast path: most FASTA lines consist purely of ASCII letters.
-                if trimmed.iter().all(|b| b.is_ascii_alphabetic()) {
-                    data.extend_from_slice(trimmed);
-                    let len = trimmed.len() as u64;
-                    rec.len += len;
-                    total_bases += len;
-                } else {
-                    for &b in trimmed {
-                        if b.is_ascii_alphabetic() {
-                            data.push(b);
-                            rec.len += 1;
-                            total_bases += 1;
-                        } else if b == b'*' || b == SEQ_SEP {
+
+                let Some(rel_nl) = buf[pos..tot].iter().position(|&b| b == b'\n') else {
+                    break;
+                };
+                let nl = pos + rel_nl;
+                let has_cr = nl > pos && buf[nl - 1] == b'\r';
+                let line_end = if has_cr { nl - 1 } else { nl };
+                let line = &buf[pos..line_end];
+
+                if !line.is_empty() {
+                    if line[0] == b'>' {
+                        if in_record {
                             data.push(SEQ_SEP);
                         }
+                        let rest = &line[1..];
+                        let header = String::from_utf8_lossy(rest).trim_start().to_string();
+                        let id = header.split_whitespace().next().unwrap_or("").to_string();
+                        let start_with_sep = data.len() as u64;
+                        records.push(SeqRecord {
+                            id,
+                            header,
+                            start_with_sep,
+                            start_no_sep: total_bases,
+                            len: 0,
+                        });
+                        in_record = true;
+                    } else {
+                        if !in_record {
+                            return Err(GeckoError::InvalidFasta {
+                                path: path.to_path_buf(),
+                                message: "sequence data encountered before first '>' header".into(),
+                            });
+                        }
+                        if !has_cr && line.len() >= 16 {
+                            pred_w = line.len();
+                        }
+                        let rec = records.last_mut().unwrap();
+                        append_seq_line(line, &mut data, &mut rec.len, &mut total_bases);
                     }
+                }
+                pos = nl + 1;
+            }
+
+            carry = tot - pos;
+            if carry > 0 {
+                if carry == CHUNK_CAP {
+                    if !in_record {
+                        return Err(GeckoError::InvalidFasta {
+                            path: path.to_path_buf(),
+                            message: "sequence data encountered before first '>' header".into(),
+                        });
+                    }
+                    if buf[0] != b'>' {
+                        let rec = records.last_mut().unwrap();
+                        append_seq_line(&buf[..carry], &mut data, &mut rec.len, &mut total_bases);
+                    }
+                    carry = 0;
+                } else {
+                    buf.copy_within(pos..tot, 0);
+                }
+            }
+        }
+
+        if carry > 0 {
+            let line_end = if buf[carry - 1] == b'\r' {
+                carry - 1
+            } else {
+                carry
+            };
+            let line = &buf[..line_end];
+            if !line.is_empty() {
+                if line[0] == b'>' {
+                    if in_record {
+                        data.push(SEQ_SEP);
+                    }
+                    let rest = &line[1..];
+                    let header = String::from_utf8_lossy(rest).trim_start().to_string();
+                    let id = header.split_whitespace().next().unwrap_or("").to_string();
+                    let start_with_sep = data.len() as u64;
+                    records.push(SeqRecord {
+                        id,
+                        header,
+                        start_with_sep,
+                        start_no_sep: total_bases,
+                        len: 0,
+                    });
+                } else {
+                    if !in_record {
+                        return Err(GeckoError::InvalidFasta {
+                            path: path.to_path_buf(),
+                            message: "sequence data encountered before first '>' header".into(),
+                        });
+                    }
+                    let rec = records.last_mut().unwrap();
+                    append_seq_line(line, &mut data, &mut rec.len, &mut total_bases);
                 }
             }
         }
@@ -211,9 +338,7 @@ impl Genome {
             let start_with_sep = data.len() as u64;
             let s = rec.start_with_sep as usize;
             let e = s + rec.len as usize;
-            for &b in self.data[s..e].iter().rev() {
-                data.push(complement_base(b));
-            }
+            data.extend(self.data[s..e].iter().rev().map(|&b| COMP_LUT[b as usize]));
             records.push(SeqRecord {
                 id: rec.id.clone(),
                 header: rec.header.clone(),

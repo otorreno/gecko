@@ -1,0 +1,15 @@
+[package]
+name = "gecko-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Cross-vendor WGPU (Vulkan/Metal/DX12) GPU backend for GECKO"
+
+[dependencies]
+bytemuck = { version = "1.21", features = ["derive"] }
+gecko-core = { path = "../gecko-core" }
+pollster = "0.4"
+rayon = "1"
+wgpu = "24"

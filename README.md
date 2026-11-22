@@ -134,6 +134,32 @@ Measured across all **24 homologous chromosome pairs** (`chr1`–`chr22`, `chrX`
 
 </details>
 
+## MetaGECKO (Metagenomics — Rust + GPU)
+
+MetaGECKO (Pérez-Wohlfeil et al., *BMC Genomics* 2016) is now integrated directly on top of GECKO v2's 2-bit `PackedSeq`, canonical `RefIndex`, AVX2/BMI2 CPU, WGPU, and native CUDA backends as both **`gecko meta`** and a standalone **`metagecko`** binary:
+
+- **Prepare-once, query-many across CPU, CUDA, and WGPU**: indexes an entire reference genome database (single multi-FASTA, multiple FASTAs, or a directory of genomes) **once** (`PreparedRefSession` / `CudaRefSession` / `WgpuRefSession`), then streams unlimited metagenomic read batches and multiple samples through it with zero reference re-indexing.
+- **Native FASTA, FASTQ, and `.gz` streaming (`ReadBatchReader`)**: bounds RAM and stays cleanly inside GPU `u32` limits on multi-gigabyte metagenomes via configurable `--batch-size` (default `64M`).
+- **Spurious-match filtering & multi-mapping resolution**: filters by `--min-read-cov` and `--min-identity`, and resolves multi-mapped reads via `--multi-map fractional|best|all` (with configurable `--tie-margin`).
+- **Fine-grained taxonomic abundance & low-abundance evidence**: computes exact base-level `covered_bases`, `breadth_pct`, `mean_depth`, **Lander-Waterman `evenness_ratio`** (distinguishing genuine low-abundance microbes from localized conserved-gene/16S pileups), `unique_reads`, `multi_reads`, length-normalized `rel_abundance_pct`, and `rpkm`.
+- **Multi-sample differential abundance**: when given 2+ metagenomic samples (or a directory), automatically outputs combined `abundance_matrix.rel.tsv` and `abundance_matrix.reads.tsv` matrices.
+
+```bash
+# Build standalone metagecko (CPU + WGPU, or add --features cuda for NVIDIA GPU)
+cargo build --release --bin metagecko
+
+# Profile a single FASTQ.gz metagenome against a directory of bacterial genomes
+metagecko sample1.fastq.gz --refs genomes_dir/ -k 16 -l 60 -s 75 --min-read-cov 50 -o meta_out/
+
+# Compare multiple metagenomic samples on CUDA GPU (indexes reference DB once!)
+metagecko samples_dir/ --refs genomes_dir/ -k 16 -l 60 -s 75 --backend cuda -f all -o meta_out/
+
+# Or invoke as a subcommand of gecko
+gecko meta sample1.fastq.gz sample2.fastq.gz --refs refs.fa.gz --split-records -o meta_out/
+```
+
+**Reproducible Paper Benchmark (Google Colab T4):** [`notebooks/metagecko_rust_gpu_benchmark.ipynb`](notebooks/metagecko_rust_gpu_benchmark.ipynb) benchmarks Original Legacy MetaGECKO (C, `otorreno/meta-gecko`) against MetaGECKO v2 (`cpu`, `wgpu`, `cuda`) on the **Turnbaugh et al. (2009) Lean & Obese Twin gut microbiome dataset (`SRP000319`)** from Pérez-Wohlfeil et al. (2016).
+
 ## Development & Testing
 
 ```bash
@@ -148,3 +174,8 @@ If you use GECKO, please cite:
 
 > Torreno, Oscar, and Oswaldo Trelles. "Breaking the computational barriers of pairwise genome comparison." *BMC Bioinformatics* 16, no. 1 (2015): 250.
 > https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-015-0679-9
+
+If you use MetaGECKO, please also cite:
+
+> Pérez-Wohlfeil, Esteban, José A. Arjona-Medina, Óscar Torreño, Eugenia Ulzurrun, and Oswaldo Trelles. "Computational workflow for the fine-grained analysis of metagenomic samples." *BMC Genomics* 17, Suppl 8 (2016): 802.
+> https://doi.org/10.1186/s12864-016-3063-x

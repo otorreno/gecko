@@ -11,6 +11,10 @@ description = "CLI for GECKO pairwise genome comparison"
 name = "gecko"
 path = "src/main.rs"
 
+[[bin]]
+name = "metagecko"
+path = "src/metagecko.rs"
+
 [features]
 default = ["wgpu"]
 wgpu = ["dep:gecko-wgpu"]

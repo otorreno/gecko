@@ -577,6 +577,11 @@ impl PackedSeqBuilder {
     }
 
     #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
     pub fn push_sep(&mut self) {
         let pos = self.len as u64;
         self.sep_pos.push(pos);
@@ -852,6 +857,41 @@ pub struct Genome {
 }
 
 impl Genome {
+    /// Load a plain or gzip-compressed FASTA or FASTQ file directly into 2-bit/bp storage.
+    ///
+    /// Auto-detects gzip (`0x1f 0x8b`) and format (`>` = FASTA, `@` = FASTQ) using the same
+    /// AVX2/SSE2/BMI2 vectorized 2-bit packer as [`Genome::from_fasta_path`].
+    pub fn from_seq_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = File::open(path)?;
+        let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+        let mut reader = BufReader::with_capacity(4 << 20, file);
+
+        let is_gz = {
+            let buf = reader.fill_buf()?;
+            buf.len() >= 2 && buf[0] == 0x1f && buf[1] == 0x8b
+        };
+
+        let name = file_stem_name(path);
+        if is_gz {
+            let gz = MultiGzDecoder::new(reader);
+            let mut gz_buf = BufReader::with_capacity(4 << 20, gz);
+            let first = peek_first_non_ws(&mut gz_buf)?;
+            if first == Some(b'@') {
+                Self::from_fastq_reader_with_hint(gz_buf, name, path, file_len.saturating_mul(2))
+            } else {
+                Self::from_fasta_reader_with_hint(gz_buf, name, path, file_len.saturating_mul(3))
+            }
+        } else {
+            let first = peek_first_non_ws(&mut reader)?;
+            if first == Some(b'@') {
+                Self::from_fastq_reader_with_hint(reader, name, path, file_len / 2)
+            } else {
+                Self::from_fasta_reader_with_hint(reader, name, path, file_len)
+            }
+        }
+    }
+
     /// Load a plain or gzip-compressed FASTA file directly into 2-bit/bp storage using 4 MB I/O.
     pub fn from_fasta_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -891,6 +931,94 @@ impl Genome {
             let r = Self::from_fasta_path(rp);
             let q = hq.join().expect("FASTA loader thread panicked");
             Ok((q?, r?))
+        })
+    }
+
+    /// Parse FASTQ (`@header / seq / + / qual`) records from any [`BufRead`] source.
+    pub fn from_fastq_reader<R: BufRead>(reader: R, name: String, path: &Path) -> Result<Self> {
+        Self::from_fastq_reader_with_hint(reader, name, path, 0)
+    }
+
+    fn from_fastq_reader_with_hint<R: BufRead>(
+        mut reader: R,
+        name: String,
+        path: &Path,
+        capacity_hint: usize,
+    ) -> Result<Self> {
+        let mut builder = PackedSeqBuilder::with_capacity_bases(capacity_hint);
+        let mut records: Vec<SeqRecord> = Vec::new();
+        let mut total_bases: u64 = 0;
+
+        let mut header_line = Vec::with_capacity(256);
+        let mut seq_line = Vec::with_capacity(512);
+        let mut plus_line = Vec::with_capacity(64);
+        let mut qual_line = Vec::with_capacity(512);
+
+        loop {
+            header_line.clear();
+            let n = reader.read_until(b'\n', &mut header_line)?;
+            if n == 0 {
+                break;
+            }
+            trim_eol(&mut header_line);
+            if header_line.is_empty() {
+                continue;
+            }
+            if header_line[0] != b'@' {
+                return Err(GeckoError::InvalidFasta {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "expected '@' at start of FASTQ record, found '{}'",
+                        header_line[0] as char
+                    ),
+                });
+            }
+
+            seq_line.clear();
+            if reader.read_until(b'\n', &mut seq_line)? == 0 {
+                return Err(GeckoError::InvalidFasta {
+                    path: path.to_path_buf(),
+                    message: "truncated FASTQ record (missing sequence line)".into(),
+                });
+            }
+            trim_eol(&mut seq_line);
+
+            plus_line.clear();
+            let _ = reader.read_until(b'\n', &mut plus_line)?;
+            qual_line.clear();
+            let _ = reader.read_until(b'\n', &mut qual_line)?;
+
+            if !records.is_empty() {
+                builder.push_sep();
+            }
+            let header = String::from_utf8_lossy(&header_line[1..])
+                .trim_start()
+                .to_string();
+            let id = header.split_whitespace().next().unwrap_or("").to_string();
+            let start_with_sep = builder.len as u64;
+            let added = builder.push_fasta_bytes(&seq_line);
+            records.push(SeqRecord {
+                id,
+                header,
+                start_with_sep,
+                start_no_sep: total_bases,
+                len: added,
+            });
+            total_bases += added;
+        }
+
+        if records.is_empty() {
+            return Err(GeckoError::InvalidFasta {
+                path: path.to_path_buf(),
+                message: "no FASTQ records found".into(),
+            });
+        }
+
+        Ok(Self {
+            name,
+            seq: builder.finish(),
+            records,
+            total_bases,
         })
     }
 
@@ -1210,6 +1338,297 @@ pub fn open_maybe_gz(path: &Path) -> Result<Box<dyn Read>> {
         Ok(Box::new(MultiGzDecoder::new(reader)))
     } else {
         Ok(Box::new(reader))
+    }
+}
+
+fn peek_first_non_ws<R: BufRead>(reader: &mut R) -> std::io::Result<Option<u8>> {
+    let buf = reader.fill_buf()?;
+    Ok(buf
+        .iter()
+        .copied()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n')))
+}
+
+#[inline]
+fn trim_eol(line: &mut Vec<u8>) {
+    while line.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
+        line.pop();
+    }
+}
+
+/// A single bounded-memory batch of metagenomic reads ready for CPU/CUDA/WGPU querying.
+#[derive(Debug, Clone)]
+pub struct ReadBatch {
+    /// 0-based global index of the first kept read in this batch (across the entire sample).
+    pub first_read_id: u64,
+    /// Number of raw reads consumed from the input stream while constructing this batch
+    /// (including reads filtered out by `min_read_len`).
+    pub raw_reads_in_batch: u64,
+    /// Number of reads skipped because they were shorter than `min_read_len`.
+    pub short_reads_skipped: u64,
+    /// Packed 2-bit `Genome` containing the reads in this batch.
+    pub genome: Genome,
+}
+
+/// Streaming FASTA / FASTQ / `.gz` metagenome reader yielding bounded-memory [`ReadBatch`] chunks.
+///
+/// Guarantees every batch stays under `max_batch_bases` (e.g. 64–256 Mbp), keeping host RAM
+/// bounded on multi-gigabyte metagenomes and ensuring every batch fits comfortably inside
+/// GPU `u32` coordinate limits (`< 2.14 Gbp`) on CUDA and WGPU backends.
+pub struct ReadBatchReader {
+    reader: BufReader<Box<dyn Read>>,
+    sample_name: String,
+    path: std::path::PathBuf,
+    is_fastq: bool,
+    max_batch_bases: usize,
+    min_read_len: u64,
+    next_read_id: u64,
+    pending_fasta_header: Option<Vec<u8>>,
+    eof: bool,
+}
+
+impl ReadBatchReader {
+    /// Open a plain or gzipped FASTA/FASTQ metagenome file for chunked batch streaming.
+    pub fn open(path: impl AsRef<Path>, max_batch_bases: usize, min_read_len: u64) -> Result<Self> {
+        let path_ref = path.as_ref();
+        let raw = open_maybe_gz(path_ref)?;
+        let mut reader = BufReader::with_capacity(4 << 20, raw);
+        let first = peek_first_non_ws(&mut reader)?;
+        let is_fastq = first == Some(b'@');
+        Ok(Self {
+            reader,
+            sample_name: file_stem_name(path_ref),
+            path: path_ref.to_path_buf(),
+            is_fastq,
+            max_batch_bases: max_batch_bases.max(1024),
+            min_read_len,
+            next_read_id: 0,
+            pending_fasta_header: None,
+            eof: first.is_none(),
+        })
+    }
+
+    /// Read the next bounded-memory batch of reads, returning `Ok(None)` at EOF.
+    pub fn next_batch(&mut self) -> Result<Option<ReadBatch>> {
+        if self.eof {
+            return Ok(None);
+        }
+        if self.is_fastq {
+            self.next_fastq_batch()
+        } else {
+            self.next_fasta_batch()
+        }
+    }
+
+    fn next_fastq_batch(&mut self) -> Result<Option<ReadBatch>> {
+        let mut builder = PackedSeqBuilder::with_capacity_bases(self.max_batch_bases.min(8 << 20));
+        let mut records: Vec<SeqRecord> = Vec::new();
+        let mut total_bases = 0u64;
+        let first_read_id = self.next_read_id;
+        let mut raw_reads = 0u64;
+        let mut short_skipped = 0u64;
+
+        let mut header_line = Vec::with_capacity(256);
+        let mut seq_line = Vec::with_capacity(512);
+        let mut plus_line = Vec::with_capacity(64);
+        let mut qual_line = Vec::with_capacity(512);
+
+        loop {
+            header_line.clear();
+            let n = self.reader.read_until(b'\n', &mut header_line)?;
+            if n == 0 {
+                self.eof = true;
+                break;
+            }
+            trim_eol(&mut header_line);
+            if header_line.is_empty() {
+                continue;
+            }
+            if header_line[0] != b'@' {
+                return Err(GeckoError::InvalidFasta {
+                    path: self.path.clone(),
+                    message: format!(
+                        "expected '@' at start of FASTQ record, found '{}'",
+                        header_line[0] as char
+                    ),
+                });
+            }
+
+            seq_line.clear();
+            if self.reader.read_until(b'\n', &mut seq_line)? == 0 {
+                self.eof = true;
+                return Err(GeckoError::InvalidFasta {
+                    path: self.path.clone(),
+                    message: "truncated FASTQ record (missing sequence line)".into(),
+                });
+            }
+            trim_eol(&mut seq_line);
+
+            plus_line.clear();
+            let _ = self.reader.read_until(b'\n', &mut plus_line)?;
+            qual_line.clear();
+            let _ = self.reader.read_until(b'\n', &mut qual_line)?;
+
+            raw_reads += 1;
+            if (seq_line.len() as u64) < self.min_read_len {
+                short_skipped += 1;
+                continue;
+            }
+
+            if !records.is_empty() {
+                builder.push_sep();
+            }
+            let header = String::from_utf8_lossy(&header_line[1..])
+                .trim_start()
+                .to_string();
+            let id = header.split_whitespace().next().unwrap_or("").to_string();
+            let start_with_sep = builder.len as u64;
+            let added = builder.push_fasta_bytes(&seq_line);
+            records.push(SeqRecord {
+                id,
+                header,
+                start_with_sep,
+                start_no_sep: total_bases,
+                len: added,
+            });
+            total_bases += added;
+
+            if builder.len >= self.max_batch_bases {
+                break;
+            }
+        }
+
+        self.next_read_id += records.len() as u64;
+        if records.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(ReadBatch {
+            first_read_id,
+            raw_reads_in_batch: raw_reads,
+            short_reads_skipped: short_skipped,
+            genome: Genome {
+                name: self.sample_name.clone(),
+                seq: builder.finish(),
+                records,
+                total_bases,
+            },
+        }))
+    }
+
+    fn next_fasta_batch(&mut self) -> Result<Option<ReadBatch>> {
+        let mut builder = PackedSeqBuilder::with_capacity_bases(self.max_batch_bases.min(8 << 20));
+        let mut records: Vec<SeqRecord> = Vec::new();
+        let mut total_bases = 0u64;
+        let first_read_id = self.next_read_id;
+        let mut raw_reads = 0u64;
+        let mut short_skipped = 0u64;
+
+        let mut line = Vec::with_capacity(512);
+        let mut cur_header: Option<Vec<u8>> = self.pending_fasta_header.take();
+        let mut cur_seq: Vec<u8> = Vec::with_capacity(512);
+
+        let flush_record = |header_bytes: &[u8],
+                            seq_bytes: &[u8],
+                            min_read_len: u64,
+                            builder: &mut PackedSeqBuilder,
+                            records: &mut Vec<SeqRecord>,
+                            total_bases: &mut u64,
+                            raw_reads: &mut u64,
+                            short_skipped: &mut u64| {
+            *raw_reads += 1;
+            if (seq_bytes.len() as u64) < min_read_len {
+                *short_skipped += 1;
+                return;
+            }
+            if !records.is_empty() {
+                builder.push_sep();
+            }
+            let header = String::from_utf8_lossy(header_bytes)
+                .trim_start()
+                .to_string();
+            let id = header.split_whitespace().next().unwrap_or("").to_string();
+            let start_with_sep = builder.len as u64;
+            let added = builder.push_fasta_bytes(seq_bytes);
+            records.push(SeqRecord {
+                id,
+                header,
+                start_with_sep,
+                start_no_sep: *total_bases,
+                len: added,
+            });
+            *total_bases += added;
+        };
+
+        loop {
+            line.clear();
+            let n = self.reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
+                self.eof = true;
+                if let Some(hdr) = cur_header.take() {
+                    flush_record(
+                        &hdr,
+                        &cur_seq,
+                        self.min_read_len,
+                        &mut builder,
+                        &mut records,
+                        &mut total_bases,
+                        &mut raw_reads,
+                        &mut short_skipped,
+                    );
+                }
+                break;
+            }
+            trim_eol(&mut line);
+            if line.is_empty() {
+                continue;
+            }
+            if line[0] == b'>' {
+                if let Some(hdr) = cur_header.take() {
+                    flush_record(
+                        &hdr,
+                        &cur_seq,
+                        self.min_read_len,
+                        &mut builder,
+                        &mut records,
+                        &mut total_bases,
+                        &mut raw_reads,
+                        &mut short_skipped,
+                    );
+                    cur_seq.clear();
+                    if builder.len >= self.max_batch_bases {
+                        self.pending_fasta_header = Some(line[1..].to_vec());
+                        break;
+                    }
+                }
+                cur_header = Some(line[1..].to_vec());
+            } else {
+                if cur_header.is_none() {
+                    return Err(GeckoError::InvalidFasta {
+                        path: self.path.clone(),
+                        message: "sequence data encountered before first '>' header".into(),
+                    });
+                }
+                cur_seq.extend_from_slice(&line);
+            }
+        }
+
+        self.next_read_id += records.len() as u64;
+        if records.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(ReadBatch {
+            first_read_id,
+            raw_reads_in_batch: raw_reads,
+            short_reads_skipped: short_skipped,
+            genome: Genome {
+                name: self.sample_name.clone(),
+                seq: builder.finish(),
+                records,
+                total_bases,
+            },
+        }))
     }
 }
 

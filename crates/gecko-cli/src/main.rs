@@ -1,4 +1,5 @@
 mod backend;
+mod meta_cmd;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,9 @@ struct Cli {
 enum Commands {
     /// Compare a query FASTA (or .fa.gz) against a reference FASTA (or .fa.gz).
     Compare(CompareArgs),
+
+    /// MetaGECKO: profile metagenomic reads (FASTA/FASTQ/.gz) against reference genomes on CPU/CUDA/WGPU.
+    Meta(meta_cmd::MetaArgs),
 
     /// List available compute backends (CUDA, WGPU, AVX2 CPU).
     Backends(BackendsArgs),
@@ -468,6 +472,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Compare(args) => cmd_compare(args),
+        Commands::Meta(args) => meta_cmd::run_meta(args),
         Commands::Backends(args) => {
             backend::print_backends(args.allow_software_gpu);
             Ok(())

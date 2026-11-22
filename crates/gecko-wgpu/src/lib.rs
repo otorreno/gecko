@@ -10,7 +10,7 @@ use gecko_core::pipeline::{CompareConfig, CompareResult, CompareStats};
 use gecko_core::seq::Genome;
 use gecko_core::stream::dedup_fragments;
 
-use self::gpu::WgpuContext;
+use self::gpu::{WgpuContext, WgpuPreparedRef};
 use self::index::WgpuRefIndex;
 
 /// Summary of an available WGPU adapter.
@@ -31,6 +31,194 @@ pub fn probe_wgpu(allow_software: bool) -> std::result::Result<WgpuAdapterInfo, 
     })
 }
 
+/// Reusable WGPU reference session (prepares `WgpuContext`, uploads the reference Hash-CSR
+/// index + 2-bit sequences to GPU VRAM, and compiles WGSL pipelines once, then queries
+/// unlimited metagenomic read batches or samples without re-indexing or re-uploading).
+pub struct WgpuRefSession<'a> {
+    ctx: WgpuContext,
+    info: WgpuAdapterInfo,
+    reference: &'a Genome,
+    ref_rc: Option<Genome>,
+    prep: WgpuPreparedRef,
+    word_length: usize,
+    soft_mask: bool,
+    compare_reverse: bool,
+}
+
+impl<'a> WgpuRefSession<'a> {
+    /// Initialize WGPU adapter, build the canonical Hash-CSR reference index, and upload
+    /// persistent GPU buffers + compiled WGSL compute pipelines once.
+    pub fn prepare(
+        reference: &'a Genome,
+        config: &CompareConfig,
+        allow_software: bool,
+    ) -> Result<Self> {
+        config.validate()?;
+        if !(8..=32).contains(&config.word_length) {
+            return Err(GeckoError::InvalidParameter(format!(
+                "WGPU backend requires word_length in 8..=32 (got {})",
+                config.word_length
+            )));
+        }
+        if reference.seq.len >= (1usize << 31) {
+            return Err(GeckoError::InvalidParameter(
+                "WGPU backend requires reference < 2.14 Gb".into(),
+            ));
+        }
+
+        let ctx = WgpuContext::init(allow_software).map_err(GeckoError::InvalidParameter)?;
+        let info = WgpuAdapterInfo {
+            name: ctx.adapter_name.clone(),
+            backend: ctx.adapter_backend.clone(),
+            is_software: ctx.is_software,
+        };
+
+        let (idx, ref_rc) = if config.compare_reverse {
+            rayon::join(
+                || {
+                    WgpuRefIndex::build(
+                        reference,
+                        config.word_length,
+                        config.freq_limit as u32,
+                        config.soft_mask,
+                    )
+                },
+                || Some(reference.reverse_complement()),
+            )
+        } else {
+            (
+                WgpuRefIndex::build(
+                    reference,
+                    config.word_length,
+                    config.freq_limit as u32,
+                    config.soft_mask,
+                ),
+                None,
+            )
+        };
+
+        let prep = ctx
+            .prepare_ref(reference, ref_rc.as_ref(), &idx, config.soft_mask)
+            .map_err(GeckoError::InvalidParameter)?;
+
+        Ok(Self {
+            ctx,
+            info,
+            reference,
+            ref_rc,
+            prep,
+            word_length: config.word_length,
+            soft_mask: config.soft_mask,
+            compare_reverse: config.compare_reverse,
+        })
+    }
+
+    pub fn info(&self) -> &WgpuAdapterInfo {
+        &self.info
+    }
+
+    /// Query a single genome or metagenomic read batch against the GPU-resident reference.
+    pub fn query(&self, query: &Genome, config: &CompareConfig) -> Result<CompareResult> {
+        if query.seq.len >= (1usize << 31) {
+            return Err(GeckoError::InvalidParameter(
+                "WGPU backend requires query batch < 2.14 Gb".into(),
+            ));
+        }
+
+        let min_len = if config.fixed_length {
+            config.min_length
+        } else {
+            let shorter = query.total_bases.min(self.reference.total_bases);
+            ((shorter as f64) * (config.min_length as f64 / 100.0)) as u64
+        };
+
+        let gpu_stats = self
+            .ctx
+            .query_prepared_ref(
+                query,
+                &self.prep,
+                self.word_length as u32,
+                min_len as u32,
+                config.min_similarity,
+                self.soft_mask,
+                self.compare_reverse,
+                config.scoring,
+            )
+            .map_err(GeckoError::InvalidParameter)?;
+
+        let mut frags_f = Vec::new();
+        let mut frags_r = Vec::new();
+        let mut coverage = CoverageMatrix::new();
+        let n_seqs_y = self.reference.num_records() as u64;
+        let match_sc = config.scoring.match_score as f64;
+
+        for gf in &gpu_stats.raw_frags {
+            let is_rev = gf.strand != 0;
+            let seq_x = query.seq_index_for_data_pos(gf.x_start as u64) as u64;
+            let seq_y_buf = if is_rev {
+                self.ref_rc
+                    .as_ref()
+                    .map_or(0, |rc| rc.seq_index_for_data_pos(gf.y_start as u64) as u64)
+            } else {
+                self.reference.seq_index_for_data_pos(gf.y_start as u64) as u64
+            };
+            let length = (gf.x_end - gf.x_start + 1) as u64;
+            let sim = ((gf.score as f64) * 100.0 / ((length as f64) * match_sc)) as f32;
+
+            coverage.record(length, sim);
+
+            let frag = Fragment {
+                diag: (gf.x_start as i64) - (gf.y_start as i64),
+                x_start: (gf.x_start as u64) - seq_x,
+                y_start: (gf.y_start as u64) - seq_y_buf,
+                x_end: (gf.x_end as u64) - seq_x,
+                y_end: (gf.y_end as u64) - seq_y_buf,
+                length,
+                ident: gf.ident as u64,
+                score: gf.score as u64,
+                similarity: sim,
+                seq_x,
+                seq_y: if is_rev {
+                    n_seqs_y - seq_y_buf - 1
+                } else {
+                    seq_y_buf
+                },
+                block: 0,
+                strand: if is_rev { 'r' } else { 'f' },
+            };
+            if is_rev {
+                frags_r.push(frag);
+            } else {
+                frags_f.push(frag);
+            }
+        }
+
+        dedup_fragments(&mut frags_f);
+        dedup_fragments(&mut frags_r);
+
+        let forward_fragments = frags_f.len() as u64;
+        let reverse_fragments = frags_r.len() as u64;
+        let mut fragments = frags_f;
+        fragments.extend(frags_r);
+
+        let stats = CompareStats {
+            word_matches: gpu_stats.leftmax_hits,
+            raw_hits: gpu_stats.leftmax_hits,
+            filtered_hits: gpu_stats.leftmax_hits,
+            hits_used: gpu_stats.extended_hits,
+            forward_fragments,
+            reverse_fragments,
+            spilled_runs: 0,
+        };
+
+        Ok(CompareResult {
+            fragments,
+            coverage,
+            stats,
+        })
+    }
+}
+
 /// Run a full pairwise genome comparison on the WGPU compute backend.
 pub fn compare_wgpu(
     query: &Genome,
@@ -38,146 +226,10 @@ pub fn compare_wgpu(
     config: &CompareConfig,
     allow_software: bool,
 ) -> Result<(CompareResult, WgpuAdapterInfo)> {
-    config.validate()?;
-    if !(8..=32).contains(&config.word_length) {
-        return Err(GeckoError::InvalidParameter(format!(
-            "WGPU backend requires word_length in 8..=32 (got {})",
-            config.word_length
-        )));
-    }
-    if query.seq.len >= (1usize << 31) || reference.seq.len >= (1usize << 31) {
-        return Err(GeckoError::InvalidParameter(
-            "WGPU backend requires sequences < 2.14 Gb".into(),
-        ));
-    }
-
-    let ctx = WgpuContext::init(allow_software).map_err(GeckoError::InvalidParameter)?;
-    let info = WgpuAdapterInfo {
-        name: ctx.adapter_name.clone(),
-        backend: ctx.adapter_backend.clone(),
-        is_software: ctx.is_software,
-    };
-
-    let min_len = if config.fixed_length {
-        config.min_length
-    } else {
-        let shorter = query.total_bases.min(reference.total_bases);
-        ((shorter as f64) * (config.min_length as f64 / 100.0)) as u64
-    };
-
-    // Build canonical Hash-CSR index and reverse complement concurrently
-    let (idx, ref_rc) = if config.compare_reverse {
-        rayon::join(
-            || {
-                WgpuRefIndex::build(
-                    reference,
-                    config.word_length,
-                    config.freq_limit as u32,
-                    config.soft_mask,
-                )
-            },
-            || Some(reference.reverse_complement()),
-        )
-    } else {
-        (
-            WgpuRefIndex::build(
-                reference,
-                config.word_length,
-                config.freq_limit as u32,
-                config.soft_mask,
-            ),
-            None,
-        )
-    };
-
-    let gpu_stats = ctx
-        .run_query_and_extend(
-            query,
-            reference,
-            ref_rc.as_ref(),
-            &idx,
-            config.word_length as u32,
-            min_len as u32,
-            config.min_similarity,
-            config.soft_mask,
-            config.compare_reverse,
-            config.scoring,
-        )
-        .map_err(GeckoError::InvalidParameter)?;
-
-    let mut frags_f = Vec::new();
-    let mut frags_r = Vec::new();
-    let mut coverage = CoverageMatrix::new();
-    let n_seqs_y = reference.num_records() as u64;
-    let match_sc = config.scoring.match_score as f64;
-
-    for gf in &gpu_stats.raw_frags {
-        let is_rev = gf.strand != 0;
-        let seq_x = query.seq_index_for_data_pos(gf.x_start as u64) as u64;
-        let seq_y_buf = if is_rev {
-            ref_rc
-                .as_ref()
-                .map_or(0, |rc| rc.seq_index_for_data_pos(gf.y_start as u64) as u64)
-        } else {
-            reference.seq_index_for_data_pos(gf.y_start as u64) as u64
-        };
-        let length = (gf.x_end - gf.x_start + 1) as u64;
-        let sim = ((gf.score as f64) * 100.0 / ((length as f64) * match_sc)) as f32;
-
-        coverage.record(length, sim);
-
-        let frag = Fragment {
-            diag: (gf.x_start as i64) - (gf.y_start as i64),
-            x_start: (gf.x_start as u64) - seq_x,
-            y_start: (gf.y_start as u64) - seq_y_buf,
-            x_end: (gf.x_end as u64) - seq_x,
-            y_end: (gf.y_end as u64) - seq_y_buf,
-            length,
-            ident: gf.ident as u64,
-            score: gf.score as u64,
-            similarity: sim,
-            seq_x,
-            seq_y: if is_rev {
-                n_seqs_y - seq_y_buf - 1
-            } else {
-                seq_y_buf
-            },
-            block: 0,
-            strand: if is_rev { 'r' } else { 'f' },
-        };
-        if is_rev {
-            frags_r.push(frag);
-        } else {
-            frags_f.push(frag);
-        }
-    }
-
-    dedup_fragments(&mut frags_f);
-    dedup_fragments(&mut frags_r);
-
-    let forward_fragments = frags_f.len() as u64;
-    let reverse_fragments = frags_r.len() as u64;
-    let mut fragments = frags_f;
-    fragments.extend(frags_r);
-
-    let stats = CompareStats {
-        word_matches: gpu_stats.leftmax_hits,
-        raw_hits: gpu_stats.leftmax_hits,
-        filtered_hits: gpu_stats.leftmax_hits,
-        hits_used: gpu_stats.extended_hits,
-        forward_fragments,
-        reverse_fragments,
-        spilled_runs: 0,
-    };
-
-    Ok((
-        CompareResult {
-            fragments,
-            coverage,
-            stats,
-        },
-        info,
-    ))
+    let session = WgpuRefSession::prepare(reference, config, allow_software)?;
+    let info = session.info().clone();
+    let result = session.query(query, config)?;
+    Ok((result, info))
 }
 
 #[cfg(test)]

@@ -205,21 +205,48 @@ impl WgpuContext {
         let data = slice.get_mapped_range();
         bytemuck::cast_slice(&data).to_vec()
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_query_and_extend(
+/// Persistent GPU-resident reference buffers, compiled WGSL compute pipelines, and reusable
+/// scratch buffers for prepare-once, query-many execution (e.g. MetaGECKO read batches).
+pub struct WgpuPreparedRef {
+    len_y: u32,
+    shift_bits: u32,
+    has_dropped: bool,
+    buf_y: wgpu::Buffer,
+    buf_y_rc: wgpu::Buffer,
+    buf_bucket_off: wgpu::Buffer,
+    buf_keys: wgpu::Buffer,
+    buf_vals: wgpu::Buffer,
+    buf_dropped_bitmap: wgpu::Buffer,
+    inv_y: Option<Vec<u32>>,
+    sp_y: Option<Vec<u32>>,
+    sp_yrc: Option<Vec<u32>>,
+    sep_y: Vec<u32>,
+    sep_yrc: Vec<u32>,
+    iupac_y: Vec<u32>,
+    iupac_yrc: Vec<u32>,
+    query_pipeline: wgpu::ComputePipeline,
+    extend_pipeline: wgpu::ComputePipeline,
+    max_hits: u32,
+    max_frags: u32,
+    buf_hits: wgpu::Buffer,
+    buf_hit_count: wgpu::Buffer,
+    buf_out_frags: wgpu::Buffer,
+    buf_frag_count: wgpu::Buffer,
+    buf_q_params: wgpu::Buffer,
+    buf_e_params: wgpu::Buffer,
+}
+
+impl WgpuContext {
+    /// Upload reference sequences + Hash-CSR index and compile WGSL pipelines once on the GPU.
+    pub fn prepare_ref(
         &self,
-        seq_x: &Genome,
         seq_y: &Genome,
         seq_y_rc: Option<&Genome>,
         idx: &WgpuRefIndex,
-        wl: u32,
-        min_len: u32,
-        min_similarity: f32,
         soft_mask: bool,
-        compare_reverse: bool,
-        scoring: Scoring,
-    ) -> Result<GpuRunStats, String> {
+    ) -> Result<WgpuPreparedRef, String> {
         let keys_bytes = (idx.keys.len() * std::mem::size_of::<crate::index::KeyU64Pair>()) as u64;
         if keys_bytes > self.max_storage_binding {
             return Err(format!(
@@ -229,16 +256,6 @@ impl WgpuContext {
             ));
         }
 
-        const NONE_OFF: u32 = u32::MAX;
-
-        // Zero-copy 2-bit/bp sequence buffers (0.25 bytes/bp — 4x smaller than ASCII).
-        let buf_x = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("seq_x_bits"),
-                contents: bytemuck::cast_slice(&seq_x.seq.bits),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
         let buf_y = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -255,106 +272,6 @@ impl WgpuContext {
                     Some(rc) => rc.seq.bits.as_slice(),
                     None => &dummy_bits,
                 }),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-        // Pack invalid-seed bitmaps (X then Y) into a single storage buffer for query.wgsl.
-        let inv_x = seq_x.seq.invalid_seed_bitmap(soft_mask);
-        let inv_y = seq_y.seq.invalid_seed_bitmap(soft_mask);
-        let has_inv_x = inv_x.is_some();
-        let has_inv_y = inv_y.is_some();
-        let mut invalid_bm_data: Vec<u32> = Vec::new();
-        if let Some(bm) = inv_x {
-            invalid_bm_data.extend_from_slice(&bm);
-        }
-        let inv_y_word_off = invalid_bm_data.len() as u32;
-        if let Some(bm) = inv_y {
-            invalid_bm_data.extend_from_slice(&bm);
-        }
-        if invalid_bm_data.is_empty() {
-            invalid_bm_data.push(0);
-        }
-        let buf_invalid_bm = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("invalid_bm"),
-                contents: bytemuck::cast_slice(&invalid_bm_data),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-        // Pack special bitmaps (X, Y, Y_rc) into a single storage buffer for extend.wgsl.
-        let mut special_bm_data: Vec<u32> = Vec::new();
-        let sp_x_off = if let Some(bm) = seq_x.seq.special_bitmap() {
-            let off = special_bm_data.len() as u32;
-            special_bm_data.extend_from_slice(&bm);
-            off
-        } else {
-            NONE_OFF
-        };
-        let sp_y_off = if let Some(bm) = seq_y.seq.special_bitmap() {
-            let off = special_bm_data.len() as u32;
-            special_bm_data.extend_from_slice(&bm);
-            off
-        } else {
-            NONE_OFF
-        };
-        let sp_yrc_off = if let Some(rc) = seq_y_rc {
-            if let Some(bm) = rc.seq.special_bitmap() {
-                let off = special_bm_data.len() as u32;
-                special_bm_data.extend_from_slice(&bm);
-                off
-            } else {
-                NONE_OFF
-            }
-        } else {
-            NONE_OFF
-        };
-        if special_bm_data.is_empty() {
-            special_bm_data.push(0);
-        }
-        let buf_special_bm = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("special_bm"),
-                contents: bytemuck::cast_slice(&special_bm_data),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-        // Pack sparse SEQ_SEP and rare IUPAC metadata (X, Y, Y_rc) into one tiny buffer.
-        let mut meta_data: Vec<u32> = Vec::new();
-        let push_seps = |buf: &mut Vec<u32>, seps: &[u64]| -> (u32, u32) {
-            let off = buf.len() as u32;
-            buf.extend(seps.iter().map(|&p| p as u32));
-            (off, seps.len() as u32)
-        };
-        let push_iupac = |buf: &mut Vec<u32>, iupac: &[(u64, u8)]| -> (u32, u32) {
-            let off = buf.len() as u32;
-            for &(p, b) in iupac {
-                buf.push(p as u32);
-                buf.push(b as u32);
-            }
-            (off, iupac.len() as u32)
-        };
-        let (sep_x_off, sep_x_len) = push_seps(&mut meta_data, &seq_x.seq.sep_pos);
-        let (sep_y_off, sep_y_len) = push_seps(&mut meta_data, &seq_y.seq.sep_pos);
-        let (sep_yrc_off, sep_yrc_len) = match seq_y_rc {
-            Some(rc) => push_seps(&mut meta_data, &rc.seq.sep_pos),
-            None => (0, 0),
-        };
-        let (iupac_x_off, iupac_x_len) = push_iupac(&mut meta_data, &seq_x.seq.iupac);
-        let (iupac_y_off, iupac_y_len) = push_iupac(&mut meta_data, &seq_y.seq.iupac);
-        let (iupac_yrc_off, iupac_yrc_len) = match seq_y_rc {
-            Some(rc) => push_iupac(&mut meta_data, &rc.seq.iupac),
-            None => (0, 0),
-        };
-        if meta_data.is_empty() {
-            meta_data.push(0);
-        }
-        let buf_meta = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("meta_buf"),
-                contents: bytemuck::cast_slice(&meta_data),
                 usage: wgpu::BufferUsages::STORAGE,
             });
 
@@ -465,13 +382,186 @@ impl WgpuContext {
             mapped_at_creation: false,
         });
 
+        let inv_y = seq_y.seq.invalid_seed_bitmap(soft_mask);
+        let sp_y = seq_y.seq.special_bitmap();
+        let sp_yrc = seq_y_rc.and_then(|rc| rc.seq.special_bitmap());
+        let sep_y: Vec<u32> = seq_y.seq.sep_pos.iter().map(|&p| p as u32).collect();
+        let sep_yrc: Vec<u32> = match seq_y_rc {
+            Some(rc) => rc.seq.sep_pos.iter().map(|&p| p as u32).collect(),
+            None => Vec::new(),
+        };
+        let encode_iupac = |iupac: &[(u64, u8)]| -> Vec<u32> {
+            let mut out = Vec::with_capacity(iupac.len() * 2);
+            for &(p, b) in iupac {
+                out.push(p as u32);
+                out.push(b as u32);
+            }
+            out
+        };
+        let iupac_y = encode_iupac(&seq_y.seq.iupac);
+        let iupac_yrc = match seq_y_rc {
+            Some(rc) => encode_iupac(&rc.seq.iupac),
+            None => Vec::new(),
+        };
+
+        Ok(WgpuPreparedRef {
+            len_y: seq_y.seq.len as u32,
+            shift_bits: idx.shift_bits,
+            has_dropped: idx.has_dropped,
+            buf_y,
+            buf_y_rc,
+            buf_bucket_off,
+            buf_keys,
+            buf_vals,
+            buf_dropped_bitmap,
+            inv_y,
+            sp_y,
+            sp_yrc,
+            sep_y,
+            sep_yrc,
+            iupac_y,
+            iupac_yrc,
+            query_pipeline,
+            extend_pipeline,
+            max_hits,
+            max_frags,
+            buf_hits,
+            buf_hit_count,
+            buf_out_frags,
+            buf_frag_count,
+            buf_q_params,
+            buf_e_params,
+        })
+    }
+
+    /// Query a genome or metagenomic read batch against a persistent GPU-resident `WgpuPreparedRef`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_prepared_ref(
+        &self,
+        seq_x: &Genome,
+        prep: &WgpuPreparedRef,
+        wl: u32,
+        min_len: u32,
+        min_similarity: f32,
+        soft_mask: bool,
+        compare_reverse: bool,
+        scoring: Scoring,
+    ) -> Result<GpuRunStats, String> {
+        const NONE_OFF: u32 = u32::MAX;
+
+        // Upload only the query batch (0.25 bytes/bp — 4x smaller than ASCII).
+        let buf_x = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("seq_x_bits"),
+                contents: bytemuck::cast_slice(&seq_x.seq.bits),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        // Pack invalid-seed bitmaps (X then cached Y) into a single storage buffer for query.wgsl.
+        let inv_x = seq_x.seq.invalid_seed_bitmap(soft_mask);
+        let has_inv_x = inv_x.is_some();
+        let has_inv_y = prep.inv_y.is_some();
+        let mut invalid_bm_data: Vec<u32> = Vec::new();
+        if let Some(bm) = inv_x {
+            invalid_bm_data.extend_from_slice(&bm);
+        }
+        let inv_y_word_off = invalid_bm_data.len() as u32;
+        if let Some(ref bm) = prep.inv_y {
+            invalid_bm_data.extend_from_slice(bm);
+        }
+        if invalid_bm_data.is_empty() {
+            invalid_bm_data.push(0);
+        }
+        let buf_invalid_bm = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("invalid_bm"),
+                contents: bytemuck::cast_slice(&invalid_bm_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        // Pack special bitmaps (X, cached Y, cached Y_rc) into a single storage buffer for extend.wgsl.
+        let mut special_bm_data: Vec<u32> = Vec::new();
+        let sp_x_off = if let Some(bm) = seq_x.seq.special_bitmap() {
+            let off = special_bm_data.len() as u32;
+            special_bm_data.extend_from_slice(&bm);
+            off
+        } else {
+            NONE_OFF
+        };
+        let sp_y_off = if let Some(ref bm) = prep.sp_y {
+            let off = special_bm_data.len() as u32;
+            special_bm_data.extend_from_slice(bm);
+            off
+        } else {
+            NONE_OFF
+        };
+        let sp_yrc_off = if let Some(ref bm) = prep.sp_yrc {
+            let off = special_bm_data.len() as u32;
+            special_bm_data.extend_from_slice(bm);
+            off
+        } else {
+            NONE_OFF
+        };
+        if special_bm_data.is_empty() {
+            special_bm_data.push(0);
+        }
+        let buf_special_bm = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("special_bm"),
+                contents: bytemuck::cast_slice(&special_bm_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        // Pack sparse SEQ_SEP and rare IUPAC metadata (X, cached Y, cached Y_rc).
+        let mut meta_data: Vec<u32> = Vec::new();
+        let sep_x_off = meta_data.len() as u32;
+        meta_data.extend(seq_x.seq.sep_pos.iter().map(|&p| p as u32));
+        let sep_x_len = seq_x.seq.sep_pos.len() as u32;
+
+        let sep_y_off = meta_data.len() as u32;
+        meta_data.extend_from_slice(&prep.sep_y);
+        let sep_y_len = prep.sep_y.len() as u32;
+
+        let sep_yrc_off = meta_data.len() as u32;
+        meta_data.extend_from_slice(&prep.sep_yrc);
+        let sep_yrc_len = prep.sep_yrc.len() as u32;
+
+        let iupac_x_off = meta_data.len() as u32;
+        for &(p, b) in &seq_x.seq.iupac {
+            meta_data.push(p as u32);
+            meta_data.push(b as u32);
+        }
+        let iupac_x_len = seq_x.seq.iupac.len() as u32;
+
+        let iupac_y_off = meta_data.len() as u32;
+        meta_data.extend_from_slice(&prep.iupac_y);
+        let iupac_y_len = (prep.iupac_y.len() / 2) as u32;
+
+        let iupac_yrc_off = meta_data.len() as u32;
+        meta_data.extend_from_slice(&prep.iupac_yrc);
+        let iupac_yrc_len = (prep.iupac_yrc.len() / 2) as u32;
+
+        if meta_data.is_empty() {
+            meta_data.push(0);
+        }
+        let buf_meta = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("meta_buf"),
+                contents: bytemuck::cast_slice(&meta_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
         let query_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("query_bg"),
-            layout: &query_pipeline.get_bind_group_layout(0),
+            layout: &prep.query_pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: buf_q_params.as_entire_binding(),
+                    resource: prep.buf_q_params.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -479,7 +569,7 @@ impl WgpuContext {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: buf_y.as_entire_binding(),
+                    resource: prep.buf_y.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -487,38 +577,38 @@ impl WgpuContext {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: buf_bucket_off.as_entire_binding(),
+                    resource: prep.buf_bucket_off.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: buf_keys.as_entire_binding(),
+                    resource: prep.buf_keys.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: buf_vals.as_entire_binding(),
+                    resource: prep.buf_vals.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: buf_hits.as_entire_binding(),
+                    resource: prep.buf_hits.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: buf_hit_count.as_entire_binding(),
+                    resource: prep.buf_hit_count.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
-                    resource: buf_dropped_bitmap.as_entire_binding(),
+                    resource: prep.buf_dropped_bitmap.as_entire_binding(),
                 },
             ],
         });
 
         let extend_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("extend_bg"),
-            layout: &extend_pipeline.get_bind_group_layout(0),
+            layout: &prep.extend_pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: buf_e_params.as_entire_binding(),
+                    resource: prep.buf_e_params.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -526,11 +616,11 @@ impl WgpuContext {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: buf_y.as_entire_binding(),
+                    resource: prep.buf_y.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: buf_y_rc.as_entire_binding(),
+                    resource: prep.buf_y_rc.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -542,15 +632,15 @@ impl WgpuContext {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: buf_hits.as_entire_binding(),
+                    resource: prep.buf_hits.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: buf_out_frags.as_entire_binding(),
+                    resource: prep.buf_out_frags.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: buf_frag_count.as_entire_binding(),
+                    resource: prep.buf_frag_count.as_entire_binding(),
                 },
             ],
         });
@@ -567,9 +657,11 @@ impl WgpuContext {
         }
         let stride: u32 = 16;
         let len_x = seq_x.seq.len as u32;
-        let len_y = seq_y.seq.len as u32;
+        let len_y = prep.len_y;
+        let max_hits = prep.max_hits;
+        let max_frags = prep.max_frags;
         let flags = u32::from(compare_reverse)
-            | (u32::from(idx.has_dropped) << 1)
+            | (u32::from(prep.has_dropped) << 1)
             | (u32::from(has_inv_x) << 2)
             | (u32::from(has_inv_y) << 3);
         let sim_th_x100 = (min_similarity * 100.0).round().max(0.0) as u32;
@@ -592,7 +684,7 @@ impl WgpuContext {
                 len_x,
                 len_y,
                 wl,
-                shift_bits: idx.shift_bits,
+                shift_bits: prep.shift_bits,
                 tile_start,
                 tile_end,
                 max_hits,
@@ -603,8 +695,8 @@ impl WgpuContext {
                 _pad1: 0,
             };
             self.queue
-                .write_buffer(&buf_q_params, 0, bytemuck::bytes_of(&q_params));
-            self.queue.write_buffer(&buf_hit_count, 0, &[0u8; 4]);
+                .write_buffer(&prep.buf_q_params, 0, bytemuck::bytes_of(&q_params));
+            self.queue.write_buffer(&prep.buf_hit_count, 0, &[0u8; 4]);
 
             let n_threads = (tile_end - tile_start).div_ceil(stride);
             let n_wg = n_threads.div_ceil(128).min(self.max_workgroups);
@@ -612,13 +704,13 @@ impl WgpuContext {
             let mut enc = self.device.create_command_encoder(&Default::default());
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&query_pipeline);
+                pass.set_pipeline(&prep.query_pipeline);
                 pass.set_bind_group(0, &query_bg, &[]);
                 pass.dispatch_workgroups(n_wg, 1, 1);
             }
             self.queue.submit(Some(enc.finish()));
 
-            let n_hits = self.read_u32_buffer(&buf_hit_count);
+            let n_hits = self.read_u32_buffer(&prep.buf_hit_count);
             if n_hits > max_hits && (tile_end - tile_start) > 1 {
                 let mid = tile_start + (tile_end - tile_start) / 2;
                 tile_stack.push((mid, tile_end));
@@ -659,20 +751,20 @@ impl WgpuContext {
                     _pad2: 0,
                 };
                 self.queue
-                    .write_buffer(&buf_e_params, 0, bytemuck::bytes_of(&e_params));
-                self.queue.write_buffer(&buf_frag_count, 0, &[0u8; 4]);
+                    .write_buffer(&prep.buf_e_params, 0, bytemuck::bytes_of(&e_params));
+                self.queue.write_buffer(&prep.buf_frag_count, 0, &[0u8; 4]);
 
                 let ext_wg = n_hits.div_ceil(128).min(self.max_workgroups);
                 let mut enc = self.device.create_command_encoder(&Default::default());
                 {
                     let mut pass = enc.begin_compute_pass(&Default::default());
-                    pass.set_pipeline(&extend_pipeline);
+                    pass.set_pipeline(&prep.extend_pipeline);
                     pass.set_bind_group(0, &extend_bg, &[]);
                     pass.dispatch_workgroups(ext_wg, 1, 1);
                 }
                 self.queue.submit(Some(enc.finish()));
 
-                let n_frags_raw = self.read_u32_buffer(&buf_frag_count);
+                let n_frags_raw = self.read_u32_buffer(&prep.buf_frag_count);
                 if n_frags_raw > max_frags && (tile_end - tile_start) > 1 {
                     let mid = tile_start + (tile_end - tile_start) / 2;
                     tile_stack.push((mid, tile_end));
@@ -681,7 +773,8 @@ impl WgpuContext {
                 }
                 let n_frags = n_frags_raw.min(max_frags) as usize;
                 if n_frags > 0 {
-                    let tile_frags: Vec<FragOut> = self.read_vec_buffer(&buf_out_frags, n_frags);
+                    let tile_frags: Vec<FragOut> =
+                        self.read_vec_buffer(&prep.buf_out_frags, n_frags);
                     raw_frags.extend_from_slice(&tile_frags);
                 }
             }
@@ -695,5 +788,32 @@ impl WgpuContext {
             extended_hits: tot_extended,
             raw_frags,
         })
+    }
+
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub fn run_query_and_extend(
+        &self,
+        seq_x: &Genome,
+        seq_y: &Genome,
+        seq_y_rc: Option<&Genome>,
+        idx: &WgpuRefIndex,
+        wl: u32,
+        min_len: u32,
+        min_similarity: f32,
+        soft_mask: bool,
+        compare_reverse: bool,
+        scoring: Scoring,
+    ) -> Result<GpuRunStats, String> {
+        let prep = self.prepare_ref(seq_y, seq_y_rc, idx, soft_mask)?;
+        self.query_prepared_ref(
+            seq_x,
+            &prep,
+            wl,
+            min_len,
+            min_similarity,
+            soft_mask,
+            compare_reverse,
+            scoring,
+        )
     }
 }

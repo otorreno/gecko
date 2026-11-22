@@ -252,3 +252,161 @@ pub fn run_compare_from_paths(
         }
     }
 }
+
+/// Prepare-once, query-many reference session spanning CUDA, WGPU, and CPU backends.
+///
+/// Used by MetaGECKO so a multi-genome reference database is indexed **once** (on GPU or CPU)
+/// and reused across every streaming read batch and every metagenomic sample.
+pub enum PreparedRefSession<'a> {
+    #[cfg(feature = "cuda")]
+    Cuda {
+        session: Box<gecko_cuda::CudaRefSession<'a>>,
+        label: String,
+    },
+    #[cfg(feature = "wgpu")]
+    Wgpu {
+        session: Box<gecko_wgpu::WgpuRefSession<'a>>,
+        label: String,
+    },
+    CpuInMem {
+        reference: &'a Genome,
+        ref_index: Box<gecko_core::ref_index::RefIndex>,
+        rev_ref: Option<Box<Genome>>,
+        label: String,
+    },
+    CpuSlabFallback {
+        reference: &'a Genome,
+        label: String,
+    },
+}
+
+impl<'a> PreparedRefSession<'a> {
+    /// Prepare and index `reference` once on the selected backend (`auto | cuda | wgpu | cpu`).
+    pub fn prepare(
+        reference: &'a Genome,
+        config: &CompareConfig,
+        requested: BackendArg,
+        allow_software_gpu: bool,
+    ) -> Result<Self> {
+        let selected = resolve_backend(requested, allow_software_gpu, config, None)?;
+        match selected {
+            SelectedBackend::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    let session = gecko_cuda::CudaRefSession::prepare(reference, config)?;
+                    let info = session.info();
+                    let label = format!(
+                        "cuda ({}, SM {}.{})",
+                        info.name, info.sm_major, info.sm_minor
+                    );
+                    Ok(Self::Cuda {
+                        session: Box::new(session),
+                        label,
+                    })
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    bail!("CUDA backend not compiled in (rebuild with `--features cuda`)");
+                }
+            }
+            SelectedBackend::Wgpu => {
+                #[cfg(feature = "wgpu")]
+                {
+                    let session =
+                        gecko_wgpu::WgpuRefSession::prepare(reference, config, allow_software_gpu)?;
+                    let info = session.info();
+                    let label = format!("wgpu ({}, {})", info.name, info.backend);
+                    Ok(Self::Wgpu {
+                        session: Box::new(session),
+                        label,
+                    })
+                }
+                #[cfg(not(feature = "wgpu"))]
+                {
+                    let _ = allow_software_gpu;
+                    bail!("WGPU backend not compiled in (rebuild with `--features wgpu`)");
+                }
+            }
+            SelectedBackend::Cpu => {
+                if gecko_core::ref_index::RefIndex::fits_in_budget(
+                    reference,
+                    config.word_length,
+                    config.soft_mask,
+                    config.compare_reverse,
+                    config.memory_budget,
+                ) {
+                    let (ref_index, rev_ref) = if config.compare_reverse {
+                        let (idx_res, rev) = rayon::join(
+                            || {
+                                gecko_core::ref_index::RefIndex::build(
+                                    reference,
+                                    config.word_length,
+                                    config.freq_limit,
+                                    config.soft_mask,
+                                )
+                            },
+                            || Some(Box::new(reference.reverse_complement())),
+                        );
+                        (idx_res?, rev)
+                    } else {
+                        (
+                            gecko_core::ref_index::RefIndex::build(
+                                reference,
+                                config.word_length,
+                                config.freq_limit,
+                                config.soft_mask,
+                            )?,
+                            None,
+                        )
+                    };
+                    Ok(Self::CpuInMem {
+                        reference,
+                        ref_index: Box::new(ref_index),
+                        rev_ref,
+                        label: cpu_label(),
+                    })
+                } else {
+                    Ok(Self::CpuSlabFallback {
+                        reference,
+                        label: format!("{} [slab-streaming]", cpu_label()),
+                    })
+                }
+            }
+        }
+    }
+
+    pub fn backend_label(&self) -> &str {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda { label, .. } => label,
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu { label, .. } => label,
+            Self::CpuInMem { label, .. } | Self::CpuSlabFallback { label, .. } => label,
+        }
+    }
+
+    /// Query a metagenomic read batch against the prepared reference session.
+    pub fn query_batch(&self, batch: &Genome, config: &CompareConfig) -> Result<CompareResult> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda { session, .. } => Ok(session.query(batch, config)?),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu { session, .. } => Ok(session.query(batch, config)?),
+            Self::CpuInMem {
+                reference,
+                ref_index,
+                rev_ref,
+                ..
+            } => Ok(gecko_core::pipeline::compare_with_ref_index(
+                batch,
+                reference,
+                ref_index,
+                rev_ref.as_deref(),
+                config,
+            )?),
+            Self::CpuSlabFallback { reference, .. } => {
+                Ok(compare_genomes(batch, reference, config, None)?)
+            }
+        }
+    }
+}

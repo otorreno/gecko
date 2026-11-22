@@ -3,6 +3,7 @@ pub mod extend;
 pub mod formats;
 pub mod hits;
 pub mod kmer;
+pub mod meta;
 pub mod pipeline;
 pub mod radix;
 pub mod ref_index;
@@ -14,9 +15,13 @@ pub use extend::{CoverageMatrix, ExtendOptions, Scoring};
 pub use formats::Fragment;
 pub use hits::{Hit, HitOptions, HitStats};
 pub use kmer::{DictOptions, DictStats, DiskKmerIndex, INDEX_WORD_SIZE, KmerDict, KmerIndex};
+pub use meta::{
+    GenomeProfile, MetaConfig, MetaReference, MetaSampleAccumulator, MetaSampleResult,
+    MultiMappingMode, ReadAssignment, RefGenomeInfo,
+};
 pub use pipeline::{
     CompareConfig, CompareResult, CompareStats, compare_genomes, compare_with_dicts,
     compare_with_ref_index,
 };
 pub use ref_index::{PosStrandVec, RefIndex};
-pub use seq::{Genome, PackedSeq, SeqRecord};
+pub use seq::{Genome, PackedSeq, ReadBatch, ReadBatchReader, SeqRecord};

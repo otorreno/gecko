@@ -1,3 +1,5 @@
+use std::mem::MaybeUninit;
+
 use rayon::prelude::*;
 
 use crate::error::{GeckoError, Result};
@@ -50,12 +52,13 @@ pub fn fmix64(mut k: u64) -> u64 {
     k
 }
 
-/// Software prefetch into L1 cache (`_MM_HINT_T0` on x86_64, no-op elsewhere).
+/// Software prefetch into L3/L2 cache (`_MM_HINT_T2` on x86_64, matching C `__builtin_prefetch(..., 0, 1)`
+/// so 64-wide random index prefetches do not evict hot diagonal-cache lines from L1d/L2).
 #[inline(always)]
-pub(crate) fn prefetch_t0<T>(ptr: *const T) {
+pub(crate) fn prefetch_t2<T>(ptr: *const T) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T2);
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -95,22 +98,6 @@ impl PosStrandVec {
             Self::U64(v) => {
                 let raw = v[index];
                 (raw >> 1, (raw & 1) as u8)
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn prefetch_at(&self, index: usize) {
-        match self {
-            Self::U32(v) => {
-                if index < v.len() {
-                    prefetch_t0(unsafe { v.as_ptr().add(index) });
-                }
-            }
-            Self::U64(v) => {
-                if index < v.len() {
-                    prefetch_t0(unsafe { v.as_ptr().add(index) });
-                }
             }
         }
     }
@@ -486,16 +473,6 @@ impl RefIndex {
         }
     }
 
-    /// Stage 1 prefetch: prefetch `offsets[b_idx]`.
-    #[inline(always)]
-    pub(crate) fn prefetch_offset(&self, b_idx: usize) {
-        let offsets = match &self.kind {
-            RefIndexKind::DirectCsr { offsets, .. } => offsets,
-            RefIndexKind::HashCsr { offsets, .. } => offsets,
-        };
-        prefetch_t0(unsafe { offsets.as_ptr().add(b_idx) });
-    }
-
     /// Stage 2 load: return `[start, end)` bucket range for `b_idx`.
     #[inline(always)]
     pub(crate) fn bucket_range(&self, b_idx: usize) -> (usize, usize) {
@@ -509,21 +486,6 @@ impl RefIndex {
                 *offsets.get_unchecked(b_idx) as usize,
                 *offsets.get_unchecked(b_idx + 1) as usize,
             )
-        }
-    }
-
-    /// Stage 2 prefetch: prefetch `keys[start]` (Hash-CSR) or `pos_strand[start]` (Direct CSR).
-    #[inline(always)]
-    pub(crate) fn prefetch_bucket_data(&self, start: usize) {
-        match &self.kind {
-            RefIndexKind::DirectCsr { pos_strand, .. } => {
-                pos_strand.prefetch_at(start);
-            }
-            RefIndexKind::HashCsr { keys, .. } => {
-                if start < keys.len() {
-                    prefetch_t0(unsafe { keys.as_ptr().add(start) });
-                }
-            }
         }
     }
 
@@ -566,7 +528,7 @@ impl RefIndex {
 
 /// Probe a sorted bucket `keys[start..end]` for exact occurrences of `key`.
 #[inline(always)]
-fn probe_sorted_keys(
+pub(crate) fn probe_sorted_keys(
     keys: &[u64],
     start: usize,
     end: usize,
@@ -587,31 +549,38 @@ fn probe_sorted_keys(
         return probe_bucket_linear(keys, start, end, key);
     }
 
-    // Binary search for larger buckets (> 16 entries).
-    let slice = &keys[start..end];
-    let rel_lo = slice.partition_point(|&k| k < key);
-    if rel_lo >= slice.len() || slice[rel_lo] != key {
-        return (start, start);
+    probe_bucket_binary(keys, start, end, key)
+}
+
+/// Scalar sorted-bucket probe (`<= 16` linear with early-exit, `> 16` binary search).
+#[inline(always)]
+pub(crate) fn probe_sorted_keys_scalar(
+    keys: &[u64],
+    start: usize,
+    end: usize,
+    key: u64,
+) -> (usize, usize) {
+    let len = end - start;
+    if len <= 16 {
+        probe_bucket_linear(keys, start, end, key)
+    } else {
+        probe_bucket_binary(keys, start, end, key)
     }
-    let mut rel_hi = rel_lo + 1;
-    if rel_hi < slice.len() && slice[rel_hi] == key {
-        rel_hi = rel_lo + slice[rel_lo..].partition_point(|&k| k == key);
-    }
-    (start + rel_lo, start + rel_hi)
 }
 
 #[inline(always)]
 fn probe_bucket_linear(keys: &[u64], start: usize, end: usize, key: u64) -> (usize, usize) {
+    let ptr = keys.as_ptr();
     let mut i = start;
     while i < end {
-        let k = unsafe { *keys.get_unchecked(i) };
+        let k = unsafe { *ptr.add(i) };
         if k >= key {
             if k > key {
                 return (start, start);
             }
             let lo = i;
             i += 1;
-            while i < end && unsafe { *keys.get_unchecked(i) } == key {
+            while i < end && unsafe { *ptr.add(i) } == key {
                 i += 1;
             }
             return (lo, i);
@@ -621,40 +590,104 @@ fn probe_bucket_linear(keys: &[u64], start: usize, end: usize, key: u64) -> (usi
     (start, start)
 }
 
+#[inline(always)]
+pub(crate) fn probe_bucket_binary(
+    keys: &[u64],
+    start: usize,
+    end: usize,
+    key: u64,
+) -> (usize, usize) {
+    let ptr = keys.as_ptr();
+    let mut lo = start;
+    let mut hi = end;
+    while lo < hi {
+        let mid = lo + ((hi - lo) >> 1);
+        if unsafe { *ptr.add(mid) } < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo >= end || unsafe { *ptr.add(lo) } != key {
+        return (start, start);
+    }
+    let mut r_hi = lo + 1;
+    while r_hi < end && unsafe { *ptr.add(r_hi) } == key {
+        r_hi += 1;
+    }
+    (lo, r_hi)
+}
+
+/// Inlineable AVX2 sorted-bucket probe with early-exit on first match or key overshoot.
+///
+/// # Safety
+/// Caller must run in a `#[target_feature(enable = "avx2")]` context and guarantee
+/// `start <= end <= keys.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(crate) unsafe fn probe_sorted_keys_avx2_inline(
+    keys: &[u64],
+    start: usize,
+    end: usize,
+    key: u64,
+) -> (usize, usize) {
+    use core::arch::x86_64::*;
+
+    let len = end - start;
+    if len <= 16 {
+        let ptr = keys.as_ptr();
+        let mut j = start;
+        if len >= 4 {
+            let vkey = _mm256_set1_epi64x(key as i64);
+            while j + 4 <= end {
+                let vcand = unsafe { _mm256_loadu_si256(ptr.add(j) as *const __m256i) };
+                let cmp = _mm256_cmpeq_epi64(vcand, vkey);
+                let mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp)) as u32;
+                if mask != 0 {
+                    let lo = j + mask.trailing_zeros() as usize;
+                    if (mask & 8) == 0 {
+                        let hi = j + (32 - mask.leading_zeros()) as usize;
+                        return (lo, hi);
+                    }
+                    let mut hi = j + 4;
+                    while hi < end && unsafe { *ptr.add(hi) } == key {
+                        hi += 1;
+                    }
+                    return (lo, hi);
+                }
+                if unsafe { *ptr.add(j + 3) } > key {
+                    return (start, start);
+                }
+                j += 4;
+            }
+        }
+        // Remaining `< 4` keys in bucket: simple sorted linear scan.
+        while j < end {
+            let k = unsafe { *ptr.add(j) };
+            if k >= key {
+                if k > key {
+                    return (start, start);
+                }
+                let lo = j;
+                let mut hi = j + 1;
+                while hi < end && unsafe { *ptr.add(hi) } == key {
+                    hi += 1;
+                }
+                return (lo, hi);
+            }
+            j += 1;
+        }
+        return (start, start);
+    }
+
+    probe_bucket_binary(keys, start, end, key)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn probe_bucket_avx2(keys: &[u64], start: usize, end: usize, key: u64) -> (usize, usize) {
-    use core::arch::x86_64::*;
-
-    let target = _mm256_set1_epi64x(key as i64);
-    let mut i = start;
-    let mut shift = 0u32;
-    let mut mask = 0u32;
-
-    while i + 4 <= end {
-        let v = unsafe { _mm256_loadu_si256(keys.as_ptr().add(i) as *const __m256i) };
-        let cmp = _mm256_cmpeq_epi64(v, target);
-        let m = _mm256_movemask_pd(_mm256_castsi256_pd(cmp)) as u32;
-        mask |= m << shift;
-        i += 4;
-        shift += 4;
-    }
-
-    while i < end {
-        if unsafe { *keys.get_unchecked(i) } == key {
-            mask |= 1u32 << shift;
-        }
-        i += 1;
-        shift += 1;
-    }
-
-    if mask == 0 {
-        (start, start)
-    } else {
-        let lo = start + mask.trailing_zeros() as usize;
-        let hi = start + (32 - mask.leading_zeros()) as usize;
-        (lo, hi)
-    }
+    unsafe { probe_sorted_keys_avx2_inline(keys, start, end, key) }
 }
 
 // ---------------------------------------------------------------------------
@@ -757,12 +790,30 @@ fn for_each_canonical_kmer_2bit<F>(
     end: usize,
     wl: usize,
     soft_mask: bool,
+    f: F,
+) where
+    F: FnMut(u64, u64, u64),
+{
+    if wl == 32 {
+        for_each_canonical_kmer_2bit_impl::<true, F>(seq, start, end, 32, soft_mask, f);
+    } else {
+        for_each_canonical_kmer_2bit_impl::<false, F>(seq, start, end, wl, soft_mask, f);
+    }
+}
+
+#[inline(always)]
+fn for_each_canonical_kmer_2bit_impl<const WL32: bool, F>(
+    seq: &PackedSeq,
+    start: usize,
+    end: usize,
+    wl: usize,
+    soft_mask: bool,
     mut f: F,
 ) where
     F: FnMut(u64, u64, u64),
 {
-    let mask = kmer_mask(wl);
-    let rc_shift = (2 * (wl - 1)) as u32;
+    let mask = if WL32 { u64::MAX } else { kmer_mask(wl) };
+    let rc_shift = if WL32 { 62u32 } else { (2 * (wl - 1)) as u32 };
     let scan_end = (end + wl - 1).min(seq.len);
 
     seq.for_each_valid_run(start, scan_end, soft_mask, |rs, re| {
@@ -782,7 +833,11 @@ fn for_each_canonical_kmer_2bit<F>(
             for _ in 0..avail {
                 let b = word & 3;
                 word >>= 2;
-                kf = ((kf << 2) | b) & mask;
+                kf = if WL32 {
+                    (kf << 2) | b
+                } else {
+                    ((kf << 2) | b) & mask
+                };
                 kr = (kr >> 2) | ((b ^ 3) << rc_shift);
             }
             idx += avail;
@@ -798,7 +853,11 @@ fn for_each_canonical_kmer_2bit<F>(
             for pos in start_pos..start_pos + avail as u64 {
                 let b = word & 3;
                 word >>= 2;
-                kf = ((kf << 2) | b) & mask;
+                kf = if WL32 {
+                    (kf << 2) | b
+                } else {
+                    ((kf << 2) | b) & mask
+                };
                 kr = (kr >> 2) | ((b ^ 3) << rc_shift);
                 if kr < kf {
                     f(kr, pos, 1);
@@ -924,29 +983,31 @@ fn build_direct_csr<P: PackedPs>(
         ));
     }
 
-    // Pass 1b: parallel scatter with L1/L2-resident per-partition staging buffers.
-    let mut coarse_keys = vec![0u32; total_kmers];
-    let mut pos_strand = vec![P::default(); total_kmers];
+    // Pass 1b: parallel scatter with L1/L2-resident per-thread staging buffers.
+    // Allocate without single-threaded zero-fill so threads fault pages in parallel.
+    let mut coarse_keys: Vec<u32> = Vec::with_capacity(total_kmers);
+    let mut pos_strand: Vec<P> = Vec::with_capacity(total_kmers);
     let keys_ptr = SendMutPtr(coarse_keys.as_mut_ptr());
     let ps_ptr = SendMutPtr(pos_strand.as_mut_ptr());
 
-    ranges
-        .par_iter()
-        .zip(chunk_write.par_iter())
-        .for_each(|(&(start, end), &init_write)| {
-            let kptr = keys_ptr;
-            let pptr = ps_ptr;
-            let mut write_pos = init_write;
-            let mut buf_k: Box<[[u32; STAGE_CAP]; NUM_PARTITIONS]> =
+    ranges.par_iter().zip(chunk_write.par_iter()).for_each_init(
+        || {
+            let buf_k: Box<[[u32; STAGE_CAP]; NUM_PARTITIONS]> =
                 vec![[0u32; STAGE_CAP]; NUM_PARTITIONS]
                     .into_boxed_slice()
                     .try_into()
                     .unwrap();
-            let mut buf_p: Box<[[P; STAGE_CAP]; NUM_PARTITIONS]> =
+            let buf_p: Box<[[P; STAGE_CAP]; NUM_PARTITIONS]> =
                 vec![[P::default(); STAGE_CAP]; NUM_PARTITIONS]
                     .into_boxed_slice()
                     .try_into()
                     .unwrap();
+            (buf_k, buf_p)
+        },
+        |(buf_k, buf_p), (&(start, end), &init_write)| {
+            let kptr = keys_ptr;
+            let pptr = ps_ptr;
+            let mut write_pos = init_write;
             let mut buf_len = [0u8; NUM_PARTITIONS];
 
             for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, pos, strand| {
@@ -986,13 +1047,23 @@ fn build_direct_csr<P: PackedPs>(
                     }
                 }
             }
-        });
+        },
+    );
+
+    // Safety: Pass 1b wrote every element in `0..total_kmers` across disjoint partition chunks.
+    unsafe {
+        coarse_keys.set_len(total_kmers);
+        pos_strand.set_len(total_kmers);
+    }
 
     // Pass 2: Rayon-parallel fine-bucketing + per-strand freq_limit filtering + in-place compaction.
-    let mut offsets = vec![0u32; NUM_PARTITIONS * (sub_keys + 1)];
+    let off_len = NUM_PARTITIONS * (sub_keys + 1);
+    let mut offsets: Vec<u32> = Vec::with_capacity(off_len);
     let part_k_slices = split_by_offsets_mut(&mut coarse_keys, &part_offsets);
     let part_p_slices = split_by_offsets_mut(&mut pos_strand, &part_offsets);
-    let part_off_slices: Vec<&mut [u32]> = offsets.chunks_exact_mut(sub_keys + 1).collect();
+    let part_off_slices: Vec<&mut [MaybeUninit<u32>]> = offsets.spare_capacity_mut()[..off_len]
+        .chunks_exact_mut(sub_keys + 1)
+        .collect();
 
     let kept_entries: usize = (0..NUM_PARTITIONS)
         .into_par_iter()
@@ -1006,72 +1077,89 @@ fn build_direct_csr<P: PackedPs>(
                 let n = pk.len();
                 if n == 0 {
                     for slot in poff.iter_mut() {
-                        *slot = part_start as u32;
+                        slot.write(part_start as u32);
                     }
                     return 0usize;
                 }
 
                 sub_counts.fill(0);
                 for &sub in pk.iter() {
-                    sub_counts[sub as usize] += 1;
+                    unsafe {
+                        *sub_counts.get_unchecked_mut(sub as usize) += 1;
+                    }
                 }
 
                 let mut acc = 0u32;
                 for s in 0..sub_keys {
-                    sub_write[s] = acc;
-                    acc += sub_counts[s];
+                    unsafe {
+                        *sub_write.get_unchecked_mut(s) = acc;
+                        acc += *sub_counts.get_unchecked(s);
+                    }
                 }
 
-                scratch_ps.resize(n, P::default());
+                if scratch_ps.len() < n {
+                    scratch_ps.resize(n, P::default());
+                }
                 for i in 0..n {
-                    let sub = pk[i] as usize;
-                    let dst = sub_write[sub] as usize;
-                    scratch_ps[dst] = pp[i];
-                    sub_write[sub] += 1;
+                    unsafe {
+                        let sub = *pk.get_unchecked(i) as usize;
+                        let dst = *sub_write.get_unchecked(sub) as usize;
+                        *scratch_ps.get_unchecked_mut(dst) = *pp.get_unchecked(i);
+                        *sub_write.get_unchecked_mut(sub) = (dst + 1) as u32;
+                    }
                 }
 
                 // Entries within each sub-bucket are already in ascending `pos` order because
                 // Pass 1 preserved chunk order and within-chunk scan order.
                 let mut write_idx = 0usize;
                 let mut sub_start = 0usize;
-                for s in 0..sub_keys {
-                    poff[s] = (part_start + write_idx) as u32;
-                    let cnt = sub_counts[s] as usize;
+                for (slot, &cnt_u32) in poff.iter_mut().zip(sub_counts.iter()) {
+                    slot.write((part_start + write_idx) as u32);
+                    let cnt = cnt_u32 as usize;
                     if cnt == 0 {
                         continue;
                     }
                     let sub_end = sub_start + cnt;
-                    let mut cnt0 = 0u64;
-                    let mut cnt1 = 0u64;
-                    for &ps in &scratch_ps[sub_start..sub_end] {
-                        if ps.strand_bit() == 0 {
-                            cnt0 += 1;
-                        } else {
-                            cnt1 += 1;
-                        }
-                    }
-                    let keep0 = cnt0 <= freq_limit;
-                    let keep1 = cnt1 <= freq_limit;
-                    if keep0 && keep1 {
+                    if (cnt as u64) <= freq_limit {
                         pp[write_idx..write_idx + cnt]
                             .copy_from_slice(&scratch_ps[sub_start..sub_end]);
                         write_idx += cnt;
-                    } else if keep0 || keep1 {
+                    } else {
+                        let mut cnt0 = 0u64;
+                        let mut cnt1 = 0u64;
                         for &ps in &scratch_ps[sub_start..sub_end] {
-                            let is_keep = if ps.strand_bit() == 0 { keep0 } else { keep1 };
-                            if is_keep {
-                                pp[write_idx] = ps;
-                                write_idx += 1;
+                            if ps.strand_bit() == 0 {
+                                cnt0 += 1;
+                            } else {
+                                cnt1 += 1;
+                            }
+                        }
+                        let keep0 = cnt0 <= freq_limit;
+                        let keep1 = cnt1 <= freq_limit;
+                        if keep0 && keep1 {
+                            pp[write_idx..write_idx + cnt]
+                                .copy_from_slice(&scratch_ps[sub_start..sub_end]);
+                            write_idx += cnt;
+                        } else if keep0 || keep1 {
+                            for &ps in &scratch_ps[sub_start..sub_end] {
+                                let is_keep = if ps.strand_bit() == 0 { keep0 } else { keep1 };
+                                if is_keep {
+                                    pp[write_idx] = ps;
+                                    write_idx += 1;
+                                }
                             }
                         }
                     }
                     sub_start = sub_end;
                 }
-                poff[sub_keys] = (part_start + write_idx) as u32;
+                poff[sub_keys].write((part_start + write_idx) as u32);
                 write_idx
             },
         )
         .sum();
+
+    // Safety: every partition wrote all `sub_keys + 1` elements of its `poff` slice.
+    unsafe { offsets.set_len(off_len) };
 
     drop(coarse_keys);
 
@@ -1174,29 +1262,31 @@ fn build_hash_csr<P: PackedPs>(
     let sub_mask = sub_buckets - 1;
     let hash_shift = 64 - bucket_bits;
 
-    // Pass 1b: parallel scatter into coarse partitions using 64-entry staging buffers.
-    let mut keys = vec![0u64; total_kmers];
-    let mut pos_strand = vec![P::default(); total_kmers];
+    // Pass 1b: parallel scatter into coarse partitions using per-thread 64-entry staging buffers.
+    // Allocate without single-threaded zero-fill so threads fault pages in parallel.
+    let mut keys: Vec<u64> = Vec::with_capacity(total_kmers);
+    let mut pos_strand: Vec<P> = Vec::with_capacity(total_kmers);
     let keys_ptr = SendMutPtr(keys.as_mut_ptr());
     let ps_ptr = SendMutPtr(pos_strand.as_mut_ptr());
 
-    ranges
-        .par_iter()
-        .zip(chunk_write.par_iter())
-        .for_each(|(&(start, end), &init_write)| {
-            let kptr = keys_ptr;
-            let pptr = ps_ptr;
-            let mut write_pos = init_write;
-            let mut buf_k: Box<[[u64; STAGE_CAP]; NUM_PARTITIONS]> =
+    ranges.par_iter().zip(chunk_write.par_iter()).for_each_init(
+        || {
+            let buf_k: Box<[[u64; STAGE_CAP]; NUM_PARTITIONS]> =
                 vec![[0u64; STAGE_CAP]; NUM_PARTITIONS]
                     .into_boxed_slice()
                     .try_into()
                     .unwrap();
-            let mut buf_p: Box<[[P; STAGE_CAP]; NUM_PARTITIONS]> =
+            let buf_p: Box<[[P; STAGE_CAP]; NUM_PARTITIONS]> =
                 vec![[P::default(); STAGE_CAP]; NUM_PARTITIONS]
                     .into_boxed_slice()
                     .try_into()
                     .unwrap();
+            (buf_k, buf_p)
+        },
+        |(buf_k, buf_p), (&(start, end), &init_write)| {
+            let kptr = keys_ptr;
+            let pptr = ps_ptr;
+            let mut write_pos = init_write;
             let mut buf_len = [0u8; NUM_PARTITIONS];
 
             for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, pos, strand| {
@@ -1236,14 +1326,24 @@ fn build_hash_csr<P: PackedPs>(
                     }
                 }
             }
-        });
+        },
+    );
+
+    // Safety: Pass 1b wrote every element in `0..total_kmers` across disjoint partition chunks.
+    unsafe {
+        keys.set_len(total_kmers);
+        pos_strand.set_len(total_kmers);
+    }
 
     // Pass 2: Rayon-parallel fine-bucketing, tiny-bucket sort, per-strand freq_limit filter,
     // and in-place compaction per partition.
-    let mut offsets = vec![0u32; NUM_PARTITIONS * (sub_buckets + 1)];
+    let off_len = NUM_PARTITIONS * (sub_buckets + 1);
+    let mut offsets: Vec<u32> = Vec::with_capacity(off_len);
     let part_k_slices = split_by_offsets_mut(&mut keys, &part_offsets);
     let part_p_slices = split_by_offsets_mut(&mut pos_strand, &part_offsets);
-    let part_off_slices: Vec<&mut [u32]> = offsets.chunks_exact_mut(sub_buckets + 1).collect();
+    let part_off_slices: Vec<&mut [MaybeUninit<u32>]> = offsets.spare_capacity_mut()[..off_len]
+        .chunks_exact_mut(sub_buckets + 1)
+        .collect();
 
     let kept_entries: usize = (0..NUM_PARTITIONS)
         .into_par_iter()
@@ -1265,7 +1365,7 @@ fn build_hash_csr<P: PackedPs>(
                 let n = pk.len();
                 if n == 0 {
                     for slot in poff.iter_mut() {
-                        *slot = part_start as u32;
+                        slot.write(part_start as u32);
                     }
                     return 0usize;
                 }
@@ -1273,39 +1373,52 @@ fn build_hash_csr<P: PackedPs>(
                 sub_counts.fill(0);
                 for &k in pk.iter() {
                     let sub = ((fmix64(k) >> hash_shift) as usize) & sub_mask;
-                    sub_counts[sub] += 1;
+                    unsafe {
+                        *sub_counts.get_unchecked_mut(sub) += 1;
+                    }
                 }
 
                 let mut acc = 0u32;
                 for s in 0..sub_buckets {
-                    sub_write[s] = acc;
-                    acc += sub_counts[s];
+                    unsafe {
+                        *sub_write.get_unchecked_mut(s) = acc;
+                        acc += *sub_counts.get_unchecked(s);
+                    }
                 }
 
-                scratch_k.resize(n, 0);
-                scratch_p.resize(n, P::default());
+                if scratch_k.len() < n {
+                    let new_len = n + (n >> 3) + 1024;
+                    scratch_k.resize(new_len, 0);
+                    scratch_p.resize(new_len, P::default());
+                }
                 for i in 0..n {
-                    let k = pk[i];
-                    let sub = ((fmix64(k) >> hash_shift) as usize) & sub_mask;
-                    let dst = sub_write[sub] as usize;
-                    scratch_k[dst] = k;
-                    scratch_p[dst] = pp[i];
-                    sub_write[sub] += 1;
+                    unsafe {
+                        let k = *pk.get_unchecked(i);
+                        let sub = ((fmix64(k) >> hash_shift) as usize) & sub_mask;
+                        let dst = *sub_write.get_unchecked(sub) as usize;
+                        *scratch_k.get_unchecked_mut(dst) = k;
+                        *scratch_p.get_unchecked_mut(dst) = *pp.get_unchecked(i);
+                        *sub_write.get_unchecked_mut(sub) = (dst + 1) as u32;
+                    }
                 }
 
                 let mut write_idx = 0usize;
                 let mut sub_start = 0usize;
-                for s in 0..sub_buckets {
-                    poff[s] = (part_start + write_idx) as u32;
-                    let cnt = sub_counts[s] as usize;
+                for (slot, &cnt_u32) in poff.iter_mut().zip(sub_counts.iter()) {
+                    slot.write((part_start + write_idx) as u32);
+                    let cnt = cnt_u32 as usize;
                     if cnt == 0 {
                         continue;
                     }
                     let sub_end = sub_start + cnt;
                     if cnt == 1 {
                         if freq_limit >= 1 {
-                            pk[write_idx] = scratch_k[sub_start];
-                            pp[write_idx] = scratch_p[sub_start];
+                            unsafe {
+                                *pk.get_unchecked_mut(write_idx) =
+                                    *scratch_k.get_unchecked(sub_start);
+                                *pp.get_unchecked_mut(write_idx) =
+                                    *scratch_p.get_unchecked(sub_start);
+                            }
                             write_idx += 1;
                         }
                         sub_start = sub_end;
@@ -1322,62 +1435,85 @@ fn build_hash_csr<P: PackedPs>(
                         sort_buf.clear();
                         sort_buf.reserve(cnt);
                         for idx in sub_start..sub_end {
-                            sort_buf.push((scratch_k[idx], scratch_p[idx]));
+                            unsafe {
+                                sort_buf.push((
+                                    *scratch_k.get_unchecked(idx),
+                                    *scratch_p.get_unchecked(idx),
+                                ));
+                            }
                         }
                         sort_buf.sort_unstable();
                         for (off, &(k, ps)) in sort_buf.iter().enumerate() {
-                            scratch_k[sub_start + off] = k;
-                            scratch_p[sub_start + off] = ps;
+                            unsafe {
+                                *scratch_k.get_unchecked_mut(sub_start + off) = k;
+                                *scratch_p.get_unchecked_mut(sub_start + off) = ps;
+                            }
                         }
                     }
 
-                    // Per-strand freq_limit filtering across runs of identical keys.
-                    let mut r = sub_start;
-                    while r < sub_end {
-                        let key = scratch_k[r];
-                        let mut r_end = r + 1;
-                        let mut cnt0 = 0u64;
-                        let mut cnt1 = 0u64;
-                        if scratch_p[r].strand_bit() == 0 {
-                            cnt0 += 1;
-                        } else {
-                            cnt1 += 1;
-                        }
-                        while r_end < sub_end && scratch_k[r_end] == key {
-                            if scratch_p[r_end].strand_bit() == 0 {
+                    // Fast path: when total bucket size <= freq_limit, no key can exceed it.
+                    if (cnt as u64) <= freq_limit {
+                        pk[write_idx..write_idx + cnt]
+                            .copy_from_slice(&scratch_k[sub_start..sub_end]);
+                        pp[write_idx..write_idx + cnt]
+                            .copy_from_slice(&scratch_p[sub_start..sub_end]);
+                        write_idx += cnt;
+                    } else {
+                        // Per-strand freq_limit filtering across runs of identical keys.
+                        let mut r = sub_start;
+                        while r < sub_end {
+                            let key = unsafe { *scratch_k.get_unchecked(r) };
+                            let mut r_end = r + 1;
+                            let mut cnt0 = 0u64;
+                            let mut cnt1 = 0u64;
+                            if unsafe { scratch_p.get_unchecked(r).strand_bit() } == 0 {
                                 cnt0 += 1;
                             } else {
                                 cnt1 += 1;
                             }
-                            r_end += 1;
-                        }
-                        let keep0 = cnt0 <= freq_limit;
-                        let keep1 = cnt1 <= freq_limit;
-                        if keep0 && keep1 {
-                            let rlen = r_end - r;
-                            pk[write_idx..write_idx + rlen].copy_from_slice(&scratch_k[r..r_end]);
-                            pp[write_idx..write_idx + rlen].copy_from_slice(&scratch_p[r..r_end]);
-                            write_idx += rlen;
-                        } else if keep0 || keep1 {
-                            for &ps in &scratch_p[r..r_end] {
-                                let is_keep = if ps.strand_bit() == 0 { keep0 } else { keep1 };
-                                if is_keep {
-                                    pk[write_idx] = key;
-                                    pp[write_idx] = ps;
-                                    write_idx += 1;
+                            while r_end < sub_end
+                                && unsafe { *scratch_k.get_unchecked(r_end) } == key
+                            {
+                                if unsafe { scratch_p.get_unchecked(r_end).strand_bit() } == 0 {
+                                    cnt0 += 1;
+                                } else {
+                                    cnt1 += 1;
+                                }
+                                r_end += 1;
+                            }
+                            let keep0 = cnt0 <= freq_limit;
+                            let keep1 = cnt1 <= freq_limit;
+                            if keep0 && keep1 {
+                                let rlen = r_end - r;
+                                pk[write_idx..write_idx + rlen]
+                                    .copy_from_slice(&scratch_k[r..r_end]);
+                                pp[write_idx..write_idx + rlen]
+                                    .copy_from_slice(&scratch_p[r..r_end]);
+                                write_idx += rlen;
+                            } else if keep0 || keep1 {
+                                for &ps in &scratch_p[r..r_end] {
+                                    let is_keep = if ps.strand_bit() == 0 { keep0 } else { keep1 };
+                                    if is_keep {
+                                        pk[write_idx] = key;
+                                        pp[write_idx] = ps;
+                                        write_idx += 1;
+                                    }
                                 }
                             }
+                            r = r_end;
                         }
-                        r = r_end;
                     }
 
                     sub_start = sub_end;
                 }
-                poff[sub_buckets] = (part_start + write_idx) as u32;
+                poff[sub_buckets].write((part_start + write_idx) as u32);
                 write_idx
             },
         )
         .sum();
+
+    // Safety: every partition wrote all `sub_buckets + 1` elements of its `poff` slice.
+    unsafe { offsets.set_len(off_len) };
 
     Ok(RefIndex {
         word_length: wl,
@@ -1400,17 +1536,28 @@ fn build_hash_csr<P: PackedPs>(
 #[inline(always)]
 fn insertion_sort_pair<P: Copy + Ord>(keys: &mut [u64], ps: &mut [P]) {
     let n = keys.len();
+    debug_assert_eq!(n, ps.len());
+    let kptr = keys.as_mut_ptr();
+    let pptr = ps.as_mut_ptr();
     for i in 1..n {
-        let k = keys[i];
-        let p = ps[i];
-        let mut j = i;
-        while j > 0 && (keys[j - 1] > k || (keys[j - 1] == k && ps[j - 1] > p)) {
-            keys[j] = keys[j - 1];
-            ps[j] = ps[j - 1];
-            j -= 1;
+        unsafe {
+            let k = *kptr.add(i);
+            let p = *pptr.add(i);
+            let mut j = i;
+            while j > 0 {
+                let prev_k = *kptr.add(j - 1);
+                let prev_p = *pptr.add(j - 1);
+                if prev_k > k || (prev_k == k && prev_p > p) {
+                    *kptr.add(j) = prev_k;
+                    *pptr.add(j) = prev_p;
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+            *kptr.add(j) = k;
+            *pptr.add(j) = p;
         }
-        keys[j] = k;
-        ps[j] = p;
     }
 }
 

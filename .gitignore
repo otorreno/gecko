@@ -5,5 +5,15 @@
 !bin/*.mat
 
 !src/*
+!src/cuda/*.cuh
+!src/cuda/*.cu
+src/cuda/*.o
+
+!gpu-wgpu/Cargo.toml
+!gpu-wgpu/src/*.rs
+!gpu-wgpu/src/shaders/*.wgsl
+gpu-wgpu/target/
+
+!notebooks/*.ipynb
 
 !*/

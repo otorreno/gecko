@@ -1,0 +1,20 @@
+[package]
+name = "gecko-wgpu"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-vendor WGPU (Vulkan/Metal/DX12) GPU-accelerated pairwise genome comparison engine for GECKO"
+
+[[bin]]
+name = "gecko_wgpu"
+path = "src/main.rs"
+
+[dependencies]
+wgpu = "24"
+pollster = "0.4"
+bytemuck = { version = "1.21", features = ["derive"] }
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

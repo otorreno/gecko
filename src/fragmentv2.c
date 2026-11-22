@@ -80,7 +80,7 @@ struct FragFile* readFragmentsv2(char* s,int* nf,uint64_t *xtotal,uint64_t *ytot
 	long int longFile;
 	fseek(fe,0,SEEK_END);
 	longFile=ftell(fe);
-	n=(int)(longFile-2*sizeof(uint64_t))/sizeof(struct FragFile);
+	n=(int)((longFile-2*sizeof(uint64_t))/sizeofFragment());
 //	n=(int)(longFile-2*sizeof(int))/sizeof(Fragment);
 	//printf("\n ReadFragments Complete\nnum: %d\n",n);
 

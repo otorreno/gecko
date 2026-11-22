@@ -381,6 +381,86 @@ fn contains_run(runs: &[(u64, u64)], pos: u64) -> bool {
     idx > 0 && pos < runs[idx - 1].1
 }
 
+/// Compact LUT for fast scalar FASTA byte packing:
+/// `0..=3` = uppercase A/C/G/T(U), `4..=7` = lowercase a/c/g/t(u), `8` = N/n, `0xFF` = other.
+const PACK_LUT: [u8; 256] = {
+    let mut lut = [0xFFu8; 256];
+    lut[b'A' as usize] = 0;
+    lut[b'C' as usize] = 1;
+    lut[b'G' as usize] = 2;
+    lut[b'T' as usize] = 3;
+    lut[b'U' as usize] = 3;
+    lut[b'a' as usize] = 4;
+    lut[b'c' as usize] = 5;
+    lut[b'g' as usize] = 6;
+    lut[b't' as usize] = 7;
+    lut[b'u' as usize] = 7;
+    lut[b'N' as usize] = 8;
+    lut[b'n' as usize] = 8;
+    lut
+};
+
+/// Spread 32 bits of `x` into even bits (`0, 2, 4, ..., 62`) of a `u64` (portable Morton).
+#[inline(always)]
+fn spread_32_to_even_64(x: u32) -> u64 {
+    let mut v = x as u64;
+    v = (v | (v << 16)) & 0x0000_FFFF_0000_FFFF;
+    v = (v | (v << 8)) & 0x00FF_00FF_00FF_00FF;
+    v = (v | (v << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
+    v = (v | (v << 2)) & 0x3333_3333_3333_3333;
+    v = (v | (v << 1)) & 0x5555_5555_5555_5555;
+    v
+}
+
+/// Spread 16 bits of `x` into even bits (`0, 2, 4, ..., 30`) of a `u32` (portable Morton).
+#[inline(always)]
+fn spread_16_to_even_32(x: u16) -> u32 {
+    let mut v = x as u32;
+    v = (v | (v << 8)) & 0x00FF_00FF;
+    v = (v | (v << 4)) & 0x0F0F_0F0F;
+    v = (v | (v << 2)) & 0x3333_3333;
+    v = (v | (v << 1)) & 0x5555_5555;
+    v
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+#[inline]
+unsafe fn interleave_2bit_32_bmi2(lo_mask: u32, hi_mask: u32) -> u64 {
+    core::arch::x86_64::_pdep_u64(lo_mask as u64, 0x5555_5555_5555_5555)
+        | core::arch::x86_64::_pdep_u64(hi_mask as u64, 0xAAAA_AAAA_AAAA_AAAA)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+#[inline]
+unsafe fn interleave_2bit_16_bmi2(lo_mask: u16, hi_mask: u16) -> u32 {
+    core::arch::x86_64::_pdep_u32(lo_mask as u32, 0x5555_5555)
+        | core::arch::x86_64::_pdep_u32(hi_mask as u32, 0xAAAA_AAAA)
+}
+
+#[inline(always)]
+fn interleave_2bit_32(lo_mask: u32, hi_mask: u32, use_bmi2: bool) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if use_bmi2 {
+        // Safety: caller verified BMI2 feature detection.
+        return unsafe { interleave_2bit_32_bmi2(lo_mask, hi_mask) };
+    }
+    let _ = use_bmi2;
+    spread_32_to_even_64(lo_mask) | (spread_32_to_even_64(hi_mask) << 1)
+}
+
+#[inline(always)]
+fn interleave_2bit_16(lo_mask: u16, hi_mask: u16, use_bmi2: bool) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if use_bmi2 {
+        // Safety: caller verified BMI2 feature detection.
+        return unsafe { interleave_2bit_16_bmi2(lo_mask, hi_mask) };
+    }
+    let _ = use_bmi2;
+    spread_16_to_even_32(lo_mask) | (spread_16_to_even_32(hi_mask) << 1)
+}
+
 /// Streaming builder that packs ASCII FASTA bytes directly into 2-bit [`PackedSeq`] words
 /// without allocating an intermediate 1-byte/bp buffer.
 pub(crate) struct PackedSeqBuilder {
@@ -392,10 +472,20 @@ pub(crate) struct PackedSeqBuilder {
     soft_runs: Vec<(u64, u64)>,
     sep_pos: Vec<u64>,
     iupac: Vec<(u64, u8)>,
+    use_avx2: bool,
+    use_bmi2: bool,
 }
 
 impl PackedSeqBuilder {
     pub fn with_capacity_bases(cap_bases: usize) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        let (use_avx2, use_bmi2) = (
+            std::is_x86_feature_detected!("avx2"),
+            std::is_x86_feature_detected!("bmi2"),
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        let (use_avx2, use_bmi2) = (false, false);
+
         Self {
             len: 0,
             bits: Vec::with_capacity(cap_bases.div_ceil(32) + 2),
@@ -405,6 +495,8 @@ impl PackedSeqBuilder {
             soft_runs: Vec::new(),
             sep_pos: Vec::new(),
             iupac: Vec::new(),
+            use_avx2,
+            use_bmi2,
         }
     }
 
@@ -421,25 +513,67 @@ impl PackedSeqBuilder {
     }
 
     #[inline(always)]
-    fn record_n(&mut self, pos: u64) {
-        if let Some(last) = self.n_runs.last_mut()
-            && last.1 == pos
-        {
-            last.1 = pos + 1;
-            return;
+    fn push_32_2bit(&mut self, word: u64) {
+        if self.bit_pos == 0 {
+            self.bits.push(word);
+        } else {
+            self.cur_word |= word << self.bit_pos;
+            self.bits.push(self.cur_word);
+            self.cur_word = word >> (64 - self.bit_pos);
         }
-        self.n_runs.push((pos, pos + 1));
+        self.len += 32;
     }
 
     #[inline(always)]
-    fn record_soft(&mut self, pos: u64) {
-        if let Some(last) = self.soft_runs.last_mut()
-            && last.1 == pos
+    fn push_16_2bit(&mut self, word: u32) {
+        let w = word as u64;
+        self.cur_word |= w << self.bit_pos;
+        let next_pos = self.bit_pos + 32;
+        if next_pos >= 64 {
+            self.bits.push(self.cur_word);
+            let rem = next_pos - 64;
+            self.cur_word = if rem == 0 { 0 } else { w >> (32 - rem) };
+            self.bit_pos = rem;
+        } else {
+            self.bit_pos = next_pos;
+        }
+        self.len += 16;
+    }
+
+    #[inline(always)]
+    fn record_n_range(&mut self, start: u64, end: u64) {
+        if let Some(last) = self.n_runs.last_mut()
+            && last.1 == start
         {
-            last.1 = pos + 1;
+            last.1 = end;
             return;
         }
-        self.soft_runs.push((pos, pos + 1));
+        self.n_runs.push((start, end));
+    }
+
+    #[inline(always)]
+    fn record_soft_range(&mut self, start: u64, end: u64) {
+        if let Some(last) = self.soft_runs.last_mut()
+            && last.1 == start
+        {
+            last.1 = end;
+            return;
+        }
+        self.soft_runs.push((start, end));
+    }
+
+    #[inline(always)]
+    fn record_soft_bitmask(&mut self, base_pos: u64, mut mask: u32) {
+        while mask != 0 {
+            let s = mask.trailing_zeros();
+            let shifted = mask >> s;
+            let run_len = shifted.trailing_ones();
+            self.record_soft_range(base_pos + s as u64, base_pos + (s + run_len) as u64);
+            if s + run_len >= 32 {
+                break;
+            }
+            mask &= !(((1u32 << run_len) - 1) << s);
+        }
     }
 
     #[inline]
@@ -450,68 +584,184 @@ impl PackedSeqBuilder {
     }
 
     /// Push a raw FASTA sequence line/slice, returning the number of nucleotide bases added
-    /// (excluding separators).
+    /// (excluding separators). Uses AVX2 (32 bp/step) + SSE2 (16 bp/step) on x86_64.
     #[inline]
     pub fn push_fasta_bytes(&mut self, bytes: &[u8]) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        if self.use_avx2 && bytes.len() >= 16 {
+            // Safety: `self.use_avx2` verified by runtime `is_x86_feature_detected!("avx2")`.
+            return unsafe { self.push_fasta_bytes_avx2(bytes) };
+        }
+        self.push_fasta_bytes_scalar(bytes)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn push_fasta_bytes_avx2(&mut self, bytes: &[u8]) -> u64 {
+        use core::arch::x86_64::*;
+
+        let mut added = 0u64;
+        let mut i = 0usize;
+        let n = bytes.len();
+        let use_bmi2 = self.use_bmi2;
+
+        let va = _mm256_set1_epi8(b'A' as i8);
+        let vc = _mm256_set1_epi8(b'C' as i8);
+        let vg = _mm256_set1_epi8(b'G' as i8);
+        let vt = _mm256_set1_epi8(b'T' as i8);
+        let vn = _mm256_set1_epi8(b'N' as i8);
+        let v_upper_mask = _mm256_set1_epi8(0xDFu8 as i8);
+        let v_lower_bit = _mm256_set1_epi8(0x20);
+
+        while i + 32 <= n {
+            let v = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i) };
+            let eq_a = _mm256_cmpeq_epi8(v, va);
+            let eq_c = _mm256_cmpeq_epi8(v, vc);
+            let eq_g = _mm256_cmpeq_epi8(v, vg);
+            let eq_t = _mm256_cmpeq_epi8(v, vt);
+            let valid_up =
+                _mm256_or_si256(_mm256_or_si256(eq_a, eq_c), _mm256_or_si256(eq_g, eq_t));
+
+            if _mm256_movemask_epi8(valid_up) == -1 {
+                let lo = _mm256_movemask_epi8(_mm256_or_si256(eq_c, eq_t)) as u32;
+                let hi = _mm256_movemask_epi8(_mm256_or_si256(eq_g, eq_t)) as u32;
+                self.push_32_2bit(interleave_2bit_32(lo, hi, use_bmi2));
+                added += 32;
+                i += 32;
+                continue;
+            }
+
+            // Case-insensitive A/C/G/T check (handles soft-masked repeats & mixed boundaries).
+            let vu = _mm256_and_si256(v, v_upper_mask);
+            let ua = _mm256_cmpeq_epi8(vu, va);
+            let uc = _mm256_cmpeq_epi8(vu, vc);
+            let ug = _mm256_cmpeq_epi8(vu, vg);
+            let ut = _mm256_cmpeq_epi8(vu, vt);
+            let valid_ci = _mm256_or_si256(_mm256_or_si256(ua, uc), _mm256_or_si256(ug, ut));
+
+            if _mm256_movemask_epi8(valid_ci) == -1 {
+                let base_pos = self.len as u64;
+                let lo = _mm256_movemask_epi8(_mm256_or_si256(uc, ut)) as u32;
+                let hi = _mm256_movemask_epi8(_mm256_or_si256(ug, ut)) as u32;
+                let lower = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+                    _mm256_and_si256(v, v_lower_bit),
+                    v_lower_bit,
+                )) as u32;
+                if lower == u32::MAX {
+                    self.record_soft_range(base_pos, base_pos + 32);
+                } else if lower != 0 {
+                    self.record_soft_bitmask(base_pos, lower);
+                }
+                self.push_32_2bit(interleave_2bit_32(lo, hi, use_bmi2));
+                added += 32;
+                i += 32;
+                continue;
+            }
+
+            // All-N chunk fast path (centromeres / assembly gaps).
+            if _mm256_movemask_epi8(_mm256_cmpeq_epi8(vu, vn)) == -1 {
+                let base_pos = self.len as u64;
+                self.record_n_range(base_pos, base_pos + 32);
+                self.push_32_2bit(0);
+                added += 32;
+                i += 32;
+                continue;
+            }
+
+            added += self.push_fasta_bytes_scalar(&bytes[i..i + 32]);
+            i += 32;
+        }
+
+        // 16-byte SSE2 path covers the tail of 80-bp NCBI lines (32+32+16) with zero scalar work
+        // and half the tail of 60-bp Ensembl lines (32+16+12).
+        if i + 16 <= n {
+            let va16 = _mm_set1_epi8(b'A' as i8);
+            let vc16 = _mm_set1_epi8(b'C' as i8);
+            let vg16 = _mm_set1_epi8(b'G' as i8);
+            let vt16 = _mm_set1_epi8(b'T' as i8);
+            let vn16 = _mm_set1_epi8(b'N' as i8);
+            let vum16 = _mm_set1_epi8(0xDFu8 as i8);
+            let vlb16 = _mm_set1_epi8(0x20);
+
+            let v = unsafe { _mm_loadu_si128(bytes.as_ptr().add(i) as *const __m128i) };
+            let eq_a = _mm_cmpeq_epi8(v, va16);
+            let eq_c = _mm_cmpeq_epi8(v, vc16);
+            let eq_g = _mm_cmpeq_epi8(v, vg16);
+            let eq_t = _mm_cmpeq_epi8(v, vt16);
+            let valid_up = _mm_or_si128(_mm_or_si128(eq_a, eq_c), _mm_or_si128(eq_g, eq_t));
+
+            if _mm_movemask_epi8(valid_up) == 0xFFFF {
+                let lo = _mm_movemask_epi8(_mm_or_si128(eq_c, eq_t)) as u16;
+                let hi = _mm_movemask_epi8(_mm_or_si128(eq_g, eq_t)) as u16;
+                self.push_16_2bit(interleave_2bit_16(lo, hi, use_bmi2));
+                added += 16;
+                i += 16;
+            } else {
+                let vu = _mm_and_si128(v, vum16);
+                let ua = _mm_cmpeq_epi8(vu, va16);
+                let uc = _mm_cmpeq_epi8(vu, vc16);
+                let ug = _mm_cmpeq_epi8(vu, vg16);
+                let ut = _mm_cmpeq_epi8(vu, vt16);
+                let valid_ci = _mm_or_si128(_mm_or_si128(ua, uc), _mm_or_si128(ug, ut));
+
+                if _mm_movemask_epi8(valid_ci) == 0xFFFF {
+                    let base_pos = self.len as u64;
+                    let lo = _mm_movemask_epi8(_mm_or_si128(uc, ut)) as u16;
+                    let hi = _mm_movemask_epi8(_mm_or_si128(ug, ut)) as u16;
+                    let lower =
+                        _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_and_si128(v, vlb16), vlb16)) as u32;
+                    if lower == 0xFFFF {
+                        self.record_soft_range(base_pos, base_pos + 16);
+                    } else if lower != 0 {
+                        self.record_soft_bitmask(base_pos, lower);
+                    }
+                    self.push_16_2bit(interleave_2bit_16(lo, hi, use_bmi2));
+                    added += 16;
+                    i += 16;
+                } else if _mm_movemask_epi8(_mm_cmpeq_epi8(vu, vn16)) == 0xFFFF {
+                    let base_pos = self.len as u64;
+                    self.record_n_range(base_pos, base_pos + 16);
+                    self.push_16_2bit(0);
+                    added += 16;
+                    i += 16;
+                } else {
+                    added += self.push_fasta_bytes_scalar(&bytes[i..i + 16]);
+                    i += 16;
+                }
+            }
+        }
+
+        if i < n {
+            added += self.push_fasta_bytes_scalar(&bytes[i..]);
+        }
+        added
+    }
+
+    #[inline]
+    fn push_fasta_bytes_scalar(&mut self, bytes: &[u8]) -> u64 {
         let mut added = 0u64;
         for &b in bytes {
-            match b {
-                b'A' => {
-                    self.push_2bit(0);
-                    added += 1;
-                }
-                b'C' => {
-                    self.push_2bit(1);
-                    added += 1;
-                }
-                b'G' => {
-                    self.push_2bit(2);
-                    added += 1;
-                }
-                b'T' | b'U' => {
-                    self.push_2bit(3);
-                    added += 1;
-                }
-                b'a' => {
-                    let pos = self.len as u64;
-                    self.record_soft(pos);
-                    self.push_2bit(0);
-                    added += 1;
-                }
-                b'c' => {
-                    let pos = self.len as u64;
-                    self.record_soft(pos);
-                    self.push_2bit(1);
-                    added += 1;
-                }
-                b'g' => {
-                    let pos = self.len as u64;
-                    self.record_soft(pos);
-                    self.push_2bit(2);
-                    added += 1;
-                }
-                b't' | b'u' => {
-                    let pos = self.len as u64;
-                    self.record_soft(pos);
-                    self.push_2bit(3);
-                    added += 1;
-                }
-                b'N' | b'n' => {
-                    let pos = self.len as u64;
-                    self.record_n(pos);
-                    self.push_2bit(0);
-                    added += 1;
-                }
-                b'*' | SEQ_SEP => {
-                    self.push_sep();
-                }
-                other if other.is_ascii_alphabetic() => {
-                    let pos = self.len as u64;
-                    self.iupac.push((pos, other.to_ascii_uppercase()));
-                    self.push_2bit(0);
-                    added += 1;
-                }
-                _ => {}
+            let code = PACK_LUT[b as usize];
+            if code < 4 {
+                self.push_2bit(code as u64);
+                added += 1;
+            } else if code < 8 {
+                let pos = self.len as u64;
+                self.record_soft_range(pos, pos + 1);
+                self.push_2bit((code & 3) as u64);
+                added += 1;
+            } else if code == 8 {
+                let pos = self.len as u64;
+                self.record_n_range(pos, pos + 1);
+                self.push_2bit(0);
+                added += 1;
+            } else if b == b'*' || b == SEQ_SEP {
+                self.push_sep();
+            } else if b.is_ascii_alphabetic() {
+                let pos = self.len as u64;
+                self.iupac.push((pos, b.to_ascii_uppercase()));
+                self.push_2bit(0);
+                added += 1;
             }
         }
         added
@@ -1086,6 +1336,54 @@ mod tests {
             let bit_set = ((inv2[i >> 5] >> (i & 31)) & 1) != 0;
             let want_inv = !matches!(b, b'A' | b'C' | b'G' | b'T');
             assert_eq!(bit_set, want_inv, "multi-word bitmap mismatch at i={i}");
+        }
+    }
+
+    #[test]
+    fn simd_fasta_packing_matches_scalar_exactly() {
+        // Exercise 32-bp AVX2, 16-bp SSE2, and scalar paths across every starting bit_pos
+        // alignment (0..32) and all line types (pure upper, pure lower, mixed, all-N, U/u, IUPAC).
+        let lines: [&[u8]; 9] = [
+            b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT", // 80 bp pure upper
+            b"acgtacgtacgtacgtacgtacgtacgtacgtacgtacgtacgtacgtacgtacgtacgtacgtacgtacgtacgtacgt", // 80 bp pure lower
+            b"ACGTacgtACGTacgtTTTTggggCCCCaaaaACGTacgtACGTacgtTTTTggggCCCCaaaa", // 64 bp mixed
+            b"NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN",     // 60 bp all-N
+            b"ACGTCCGGTTAAACGTTTGGCCAAAACCCGGGTTTACGTACGGTTAACCGGAATTCCGGAA",    // 61 bp upper
+            b"acgtccggttaaacgtttggccaaAACCCGGGtttacgtacggttaaccggaattccgg",      // 59 bp mixed
+            b"ACGTNNNNacgtNNNNACGTUUUUacgtuuuuRYSWKM*ACGT", // special + U + IUPAC + sep
+            b"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGgggggggggggggggg", // 32 upper + 16 lower
+            b"NNNNNNNNNNNNNNNNACGTACGTACGTACGT",            // 16 N + 16 upper
+        ];
+
+        for prefix_len in 0..32usize {
+            let prefix = vec![b'C'; prefix_len];
+            let mut b_simd = PackedSeqBuilder::with_capacity_bases(1024);
+            let mut b_scalar = PackedSeqBuilder::with_capacity_bases(1024);
+            b_scalar.use_avx2 = false;
+
+            let a1 = b_simd.push_fasta_bytes(&prefix);
+            let a2 = b_scalar.push_fasta_bytes(&prefix);
+            assert_eq!(a1, a2);
+            for line in &lines {
+                assert_eq!(
+                    b_simd.push_fasta_bytes(line),
+                    b_scalar.push_fasta_bytes(line),
+                    "added mismatch for prefix_len={prefix_len}"
+                );
+            }
+
+            let s_simd = b_simd.finish();
+            let s_scalar = b_scalar.finish();
+            assert_eq!(s_simd.len, s_scalar.len);
+            assert_eq!(
+                s_simd.bits, s_scalar.bits,
+                "bits mismatch for prefix_len={prefix_len}"
+            );
+            assert_eq!(s_simd.n_runs, s_scalar.n_runs);
+            assert_eq!(s_simd.soft_runs, s_scalar.soft_runs);
+            assert_eq!(s_simd.sep_pos, s_scalar.sep_pos);
+            assert_eq!(s_simd.iupac, s_scalar.iupac);
+            assert_eq!(s_simd.special_runs, s_scalar.special_runs);
         }
     }
 }

@@ -19,6 +19,8 @@ pub struct WgpuRefIndex {
     pub bucket_off: Vec<u32>,
     pub keys: Vec<KeyU64Pair>,
     pub vals: Vec<u32>,
+    pub has_dropped: bool,
+    pub dropped_bitmap: Vec<u32>,
 }
 
 impl WgpuRefIndex {
@@ -106,48 +108,70 @@ impl WgpuRefIndex {
             .collect();
         drop(per_chunk_parts);
 
-        part_vecs.par_iter_mut().for_each(|v| {
-            v.sort_unstable_by_key(|&(h, ps)| (h, ps));
-            if freq_limit > 0 && !v.is_empty() {
-                let fl = freq_limit as usize;
-                let mut write = 0usize;
-                let mut i = 0usize;
-                let n = v.len();
-                while i < n {
-                    let h = v[i].0;
-                    let mut j = i + 1;
-                    while j < n && v[j].0 == h {
-                        j += 1;
-                    }
-                    let run_len = j - i;
-                    if run_len <= fl {
-                        v.copy_within(i..j, write);
-                        write += run_len;
-                    } else {
-                        let mut c0 = 0usize;
-                        let mut c1 = 0usize;
-                        for &(_, ps) in &v[i..j] {
-                            if (ps & 1) == 0 {
-                                c0 += 1;
-                            } else {
-                                c1 += 1;
+        let per_part_dropped: Vec<Vec<u32>> = part_vecs
+            .par_iter_mut()
+            .map(|v| {
+                let mut dropped = Vec::new();
+                v.sort_unstable_by_key(|&(h, ps)| (h, ps));
+                if freq_limit > 0 && !v.is_empty() {
+                    let fl = freq_limit as usize;
+                    let mut write = 0usize;
+                    let mut i = 0usize;
+                    let n = v.len();
+                    while i < n {
+                        let h = v[i].0;
+                        let mut j = i + 1;
+                        while j < n && v[j].0 == h {
+                            j += 1;
+                        }
+                        let run_len = j - i;
+                        if run_len <= fl {
+                            v.copy_within(i..j, write);
+                            write += run_len;
+                        } else {
+                            let mut c0 = 0usize;
+                            let mut c1 = 0usize;
+                            for &(_, ps) in &v[i..j] {
+                                if (ps & 1) == 0 {
+                                    c0 += 1;
+                                } else {
+                                    c1 += 1;
+                                }
+                            }
+                            let k0 = c0 <= fl;
+                            let k1 = c1 <= fl;
+                            for m in i..j {
+                                let ps = v[m].1;
+                                let keep = if (ps & 1) == 0 { k0 } else { k1 };
+                                if keep {
+                                    v[write] = v[m];
+                                    write += 1;
+                                } else {
+                                    dropped.push(ps >> 1);
+                                }
                             }
                         }
-                        let k0 = c0 <= fl;
-                        let k1 = c1 <= fl;
-                        for m in i..j {
-                            let keep = if (v[m].1 & 1) == 0 { k0 } else { k1 };
-                            if keep {
-                                v[write] = v[m];
-                                write += 1;
-                            }
-                        }
+                        i = j;
                     }
-                    i = j;
+                    v.truncate(write);
                 }
-                v.truncate(write);
+                dropped
+            })
+            .collect();
+
+        let any_dropped = per_part_dropped.iter().any(|d| !d.is_empty());
+        let mut dropped_bitmap = if any_dropped && len > 0 {
+            vec![0u32; len.div_ceil(32)]
+        } else {
+            vec![0u32; 1]
+        };
+        if any_dropped && len > 0 {
+            for part in per_part_dropped {
+                for pos in part {
+                    dropped_bitmap[(pos >> 5) as usize] |= 1u32 << (pos & 31);
+                }
             }
-        });
+        }
 
         let n_kept: u32 = part_vecs.iter().map(|v| v.len() as u32).sum();
 
@@ -186,6 +210,8 @@ impl WgpuRefIndex {
             bucket_off,
             keys,
             vals,
+            has_dropped: any_dropped && len > 0,
+            dropped_bitmap,
         }
     }
 }

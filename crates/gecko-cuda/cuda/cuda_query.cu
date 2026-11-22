@@ -17,6 +17,7 @@ static __global__ void query_left_maximal_kernel(
     const uint32_t * __restrict__ bucket_off,
     const uint64_t * __restrict__ idx_keys,
     const uint32_t * __restrict__ idx_vals,
+    const uint32_t * __restrict__ dropped_bitmap,
     int shift_bits,
     int wl,
     bool soft_mask,
@@ -85,9 +86,11 @@ static __global__ void query_left_maximal_kernel(
 
                     if (is_pal || (x_strand == y_strand)) {
                         bool left_ext = prev_x_valid && (posY_orig > 0) &&
-                                        (norm_seed_byte(seqY[posY_orig - 1], soft_mask) == prev_x);
+                                        (norm_seed_byte(seqY[posY_orig - 1], soft_mask) == prev_x) &&
+                                        !is_dropped_pos(dropped_bitmap, posY_orig - 1);
                         bool right_ext = next_x_valid && ((uint64_t)posY_orig + (uint64_t)wl < lenY) &&
-                                         (norm_seed_byte(seqY[(uint64_t)posY_orig + (uint64_t)wl], soft_mask) == next_x);
+                                         (norm_seed_byte(seqY[(uint64_t)posY_orig + (uint64_t)wl], soft_mask) == next_x) &&
+                                         !is_dropped_pos(dropped_bitmap, posY_orig + 1);
                         if (!left_ext || !right_ext) {
                             if (*hit_count <= max_hits) {
                                 uint32_t slot = atomicAdd(hit_count, 1U);
@@ -100,9 +103,11 @@ static __global__ void query_left_maximal_kernel(
                     if (compare_reverse && (is_pal || (x_strand != y_strand))) {
                         uint32_t posY_rc = (uint32_t)(lenY - (uint64_t)posY_orig - (uint64_t)wl);
                         bool left_ext = prev_x_valid && (posY_rc > 0) &&
-                                        (norm_seed_byte(seqY_rc[posY_rc - 1], soft_mask) == prev_x);
+                                        (norm_seed_byte(seqY_rc[posY_rc - 1], soft_mask) == prev_x) &&
+                                        !is_dropped_pos(dropped_bitmap, posY_orig + 1);
                         bool right_ext = next_x_valid && ((uint64_t)posY_rc + (uint64_t)wl < lenY) &&
-                                         (norm_seed_byte(seqY_rc[(uint64_t)posY_rc + (uint64_t)wl], soft_mask) == next_x);
+                                         (norm_seed_byte(seqY_rc[(uint64_t)posY_rc + (uint64_t)wl], soft_mask) == next_x) &&
+                                         !is_dropped_pos(dropped_bitmap, posY_orig - 1);
                         if (!left_ext || !right_ext) {
                             if (*hit_count <= max_hits) {
                                 uint32_t slot = atomicAdd(hit_count, 1U);
@@ -175,7 +180,7 @@ uint32_t gpu_query_tile_left_maximal(
     uint32_t grid = (uint32_t)((n_threads + 255) / 256);
     query_left_maximal_kernel<<<grid, 256>>>(
         d_seqX, lenX, d_seqY, d_seqY_rc, lenY,
-        idx.d_bucket_off, idx.d_keys, idx.d_vals, idx.shift_bits, wl,
+        idx.d_bucket_off, idx.d_keys, idx.d_vals, idx.d_dropped_bitmap, idx.shift_bits, wl,
         soft_mask, compare_reverse,
         tile_start, tile_end, d_hits, d_hit_count, max_hits);
     CUDA_CHECK_VOID(cudaGetLastError());

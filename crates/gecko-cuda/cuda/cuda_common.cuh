@@ -43,6 +43,7 @@ struct GpuRefIndex {
     uint64_t *d_keys;
     uint32_t *d_vals;
     uint32_t *d_bucket_off;
+    uint32_t *d_dropped_bitmap;
     uint32_t n_valid;
     uint32_t n_kept;
     int bucket_bits;
@@ -77,6 +78,14 @@ __device__ __forceinline__ uint8_t base_to_2bit(uint8_t c, bool soft_mask) {
 
 __device__ __forceinline__ bool is_sep_byte(uint8_t c) {
     return (c == 0) || (c == '*');
+}
+
+__device__ __forceinline__ bool is_dropped_pos(
+    const uint32_t * __restrict__ dropped_bitmap,
+    uint32_t pos
+) {
+    if (!dropped_bitmap) return false;
+    return ((__ldg(&dropped_bitmap[pos >> 5]) >> (pos & 31U)) & 1U) != 0U;
 }
 
 __device__ __forceinline__ uint8_t comp_base_dev(uint8_t c) {

@@ -264,6 +264,13 @@ impl WgpuContext {
                 contents: bytemuck::cast_slice(&idx.vals),
                 usage: wgpu::BufferUsages::STORAGE,
             });
+        let buf_dropped_bitmap =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("dropped_bitmap"),
+                    contents: bytemuck::cast_slice(&idx.dropped_bitmap),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
 
         let query_shader = self
             .device
@@ -383,6 +390,10 @@ impl WgpuContext {
                     binding: 8,
                     resource: buf_hit_count.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: buf_dropped_bitmap.as_entire_binding(),
+                },
             ],
         });
 
@@ -434,7 +445,9 @@ impl WgpuContext {
         let stride: u32 = 16;
         let len_x = seq_x.seq.len as u32;
         let len_y = seq_y.seq.len as u32;
-        let flags = (u32::from(soft_mask)) | (u32::from(compare_reverse) << 1);
+        let flags = (u32::from(soft_mask))
+            | (u32::from(compare_reverse) << 1)
+            | (u32::from(idx.has_dropped) << 2);
         let sim_th_x100 = (min_similarity * 100.0).round().max(0.0) as u32;
 
         let mut raw_frags = Vec::new();

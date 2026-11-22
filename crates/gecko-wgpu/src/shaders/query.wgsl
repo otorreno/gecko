@@ -12,7 +12,7 @@ struct QueryParams {
     tile_end: u32,
     max_hits: u32,
     stride: u32,
-    flags: u32,        // bit 0: soft_mask, bit 1: compare_reverse
+    flags: u32,        // bit 0: soft_mask, bit 1: compare_reverse, bit 2: has_dropped
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
@@ -39,6 +39,7 @@ struct HitRec {
 @group(0) @binding(6) var<storage, read> idx_vals: array<u32>;
 @group(0) @binding(7) var<storage, read_write> out_hits: array<HitRec>;
 @group(0) @binding(8) var<storage, read_write> hit_count: atomic<u32>;
+@group(0) @binding(9) var<storage, read> dropped_bitmap: array<u32>;
 
 fn read_byte_x(idx: u32) -> u32 {
     return (seq_x[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xFFu;
@@ -50,6 +51,13 @@ fn read_byte_y(idx: u32) -> u32 {
 
 fn read_byte_y_rc(idx: u32) -> u32 {
     return (seq_y_rc[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+fn is_dropped_pos(pos: u32, has_dropped: bool) -> bool {
+    if (!has_dropped) {
+        return false;
+    }
+    return ((dropped_bitmap[pos >> 5u] >> (pos & 31u)) & 1u) != 0u;
 }
 
 fn norm_seed_byte(c: u32, soft_mask: bool) -> u32 {
@@ -64,7 +72,7 @@ fn base_to_2bit(c: u32, soft_mask: bool) -> u32 {
     if (u == 65u) { return 0u; } // 'A'
     if (u == 67u) { return 1u; } // 'C'
     if (u == 71u) { return 2u; } // 'G'
-    if (u == 84u) { return 3u; } // 'T'
+    if (u == 84u || u == 85u) { return 3u; } // 'T' | 'U'
     return 4u;
 }
 
@@ -138,6 +146,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let wl = params.wl;
     let soft_mask = (params.flags & 1u) != 0u;
     let compare_rev = (params.flags & 2u) != 0u;
+    let has_dropped = (params.flags & 4u) != 0u;
     let bits = 2u * wl;
     var mask_lo: u32 = 0xFFFFFFFFu;
     var mask_hi: u32 = 0xFFFFFFFFu;
@@ -233,11 +242,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (is_pal || x_strand == y_strand) {
                         var left_ext = false;
                         if (prev_x_valid && pos_y_orig > 0u) {
-                            left_ext = (norm_seed_byte(read_byte_y(pos_y_orig - 1u), soft_mask) == prev_x);
+                            left_ext = (norm_seed_byte(read_byte_y(pos_y_orig - 1u), soft_mask) == prev_x)
+                                && !is_dropped_pos(pos_y_orig - 1u, has_dropped);
                         }
                         var right_ext = false;
                         if (next_x_valid && pos_y_orig + wl < params.len_y) {
-                            right_ext = (norm_seed_byte(read_byte_y(pos_y_orig + wl), soft_mask) == next_x);
+                            right_ext = (norm_seed_byte(read_byte_y(pos_y_orig + wl), soft_mask) == next_x)
+                                && !is_dropped_pos(pos_y_orig + 1u, has_dropped);
                         }
                         if (!left_ext || !right_ext) {
                             let slot = atomicAdd(&hit_count, 1u);
@@ -250,11 +261,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let pos_y_rc = params.len_y - pos_y_orig - wl;
                         var left_ext = false;
                         if (prev_x_valid && pos_y_rc > 0u) {
-                            left_ext = (norm_seed_byte(read_byte_y_rc(pos_y_rc - 1u), soft_mask) == prev_x);
+                            left_ext = (norm_seed_byte(read_byte_y_rc(pos_y_rc - 1u), soft_mask) == prev_x)
+                                && !is_dropped_pos(pos_y_orig + 1u, has_dropped);
                         }
                         var right_ext = false;
                         if (next_x_valid && pos_y_rc + wl < params.len_y) {
-                            right_ext = (norm_seed_byte(read_byte_y_rc(pos_y_rc + wl), soft_mask) == next_x);
+                            right_ext = (norm_seed_byte(read_byte_y_rc(pos_y_rc + wl), soft_mask) == next_x)
+                                && !is_dropped_pos(pos_y_orig - 1u, has_dropped);
                         }
                         if (!left_ext || !right_ext) {
                             let slot = atomicAdd(&hit_count, 1u);

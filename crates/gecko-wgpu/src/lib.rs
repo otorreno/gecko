@@ -179,3 +179,74 @@ pub fn compare_wgpu(
         info,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gecko_core::pipeline::compare_genomes;
+    use gecko_core::seq::complement_base;
+
+    #[test]
+    fn freq_bounded_interior_seeds_match_cpu_both_strands() {
+        // Construct a 120 bp block: 55 bp left flank + 10 bp unique core + 55 bp right flank.
+        // Repeat the left and right flanks 4 times in the reference (> freq_limit = 2) so all
+        // boundary k-mers of the exact match are dropped by freq_limit, leaving ONLY interior
+        // k-mers whose left & right flanking bases still match.
+        let left_flank = "ACGTCCGGTTAAACGTTTGGCCAAAACCCGGGTTTACGTACGGTTAACCGGAATT";
+        let right_flank = "GCTAGCTAGGCCTTAAACCGGTTTGGCCAATTCCGGATGCTAGCTAGGCCTTAAA";
+        let unique_fwd = "TGCATGCAAT";
+        let unique_rev = "CGATCGATCG";
+
+        let rc_str = |s: &str| -> String {
+            s.bytes()
+                .rev()
+                .map(complement_base)
+                .map(|b| b as char)
+                .collect()
+        };
+        let left_flank_rc = rc_str(left_flank);
+        let right_flank_rc = rc_str(right_flank);
+        let hsp_fwd = format!("{left_flank}{unique_fwd}{right_flank}");
+        let hsp_rev = format!("{left_flank}{unique_rev}{right_flank}");
+        let hsp_rev_rc = rc_str(&hsp_rev);
+
+        let query = Genome::from_records(
+            "q",
+            [(
+                "q0",
+                format!("NNNNNNNNNN{hsp_fwd}NNNNNNNNNN{hsp_rev}NNNNNNNNNN"),
+            )],
+        );
+        let reference = Genome::from_records(
+            "r",
+            [(
+                "r0",
+                format!(
+                    "NNNN{left_flank}NNNN{left_flank}NNNN{left_flank}NNNN\
+                     {right_flank}NNNN{right_flank}NNNN{right_flank}NNNN\
+                     {left_flank_rc}NNNN{left_flank_rc}NNNN{left_flank_rc}NNNN\
+                     {right_flank_rc}NNNN{right_flank_rc}NNNN{right_flank_rc}NNNN\
+                     {hsp_fwd}NNNN{hsp_rev_rc}NNNN"
+                ),
+            )],
+        );
+
+        let cfg = CompareConfig {
+            min_length: 80,
+            min_similarity: 75.0,
+            word_length: 16,
+            freq_limit: 2,
+            ..Default::default()
+        };
+
+        let cpu_res = compare_genomes(&query, &reference, &cfg, None).unwrap();
+        assert_eq!(cpu_res.stats.forward_fragments, 1);
+        assert_eq!(cpu_res.stats.reverse_fragments, 1);
+
+        // Run WGPU if any adapter (including software Lavapipe) is present on this host.
+        if probe_wgpu(true).is_ok() {
+            let (gpu_res, _) = compare_wgpu(&query, &reference, &cfg, true).unwrap();
+            assert_eq!(gpu_res.fragments, cpu_res.fragments);
+        }
+    }
+}

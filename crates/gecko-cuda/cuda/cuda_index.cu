@@ -145,6 +145,20 @@ static __global__ void mark_freq_filter_kernel(
     }
 }
 
+static __global__ void mark_dropped_bitmap_kernel(
+    const uint32_t * __restrict__ vals,
+    const uint8_t * __restrict__ keep_flags,
+    uint32_t n_valid,
+    uint32_t * __restrict__ dropped_bitmap
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_valid) return;
+    if (keep_flags[i] == 0) {
+        uint32_t pos = vals[i] >> 1;
+        atomicOr(&dropped_bitmap[pos >> 5], 1U << (pos & 31U));
+    }
+}
+
 static __global__ void mark_bucket_starts_kernel(
     const uint64_t * __restrict__ keys,
     uint32_t n,
@@ -282,6 +296,15 @@ GpuRefIndex gpu_build_ref_index(
         cub::DeviceSelect::Flagged(d_temp, temp_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
         CUDA_CHECK_VOID(cudaMemcpy(&idx.n_kept, d_num_out, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
+        if (idx.n_kept < idx.n_valid && lenY > 0) {
+            size_t bitmap_words = (size_t)((lenY + 31ULL) / 32ULL);
+            CUDA_CHECK_VOID(cudaMalloc(&idx.d_dropped_bitmap, bitmap_words * sizeof(uint32_t)));
+            CUDA_CHECK_VOID(cudaMemset(idx.d_dropped_bitmap, 0, bitmap_words * sizeof(uint32_t)));
+            mark_dropped_bitmap_kernel<<<(idx.n_valid + 255) / 256, 256>>>(
+                d_sorted_vals, d_keep, idx.n_valid, idx.d_dropped_bitmap);
+            CUDA_CHECK_VOID(cudaGetLastError());
+        }
+
         CUDA_CHECK_VOID(cudaFree(d_temp));
         CUDA_CHECK_VOID(cudaFree(d_keep));
         CUDA_CHECK_VOID(cudaFree(d_num_out));
@@ -332,5 +355,6 @@ void gpu_free_ref_index(GpuRefIndex &idx) {
     if (idx.d_keys) CUDA_CHECK_VOID(cudaFree(idx.d_keys));
     if (idx.d_vals) CUDA_CHECK_VOID(cudaFree(idx.d_vals));
     if (idx.d_bucket_off) CUDA_CHECK_VOID(cudaFree(idx.d_bucket_off));
+    if (idx.d_dropped_bitmap) CUDA_CHECK_VOID(cudaFree(idx.d_dropped_bitmap));
     idx = {};
 }

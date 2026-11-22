@@ -2,7 +2,7 @@ use rayon::prelude::*;
 
 use crate::formats::frags::Fragment;
 use crate::hits::Hit;
-use crate::seq::{Genome, SEQ_SEP};
+use crate::seq::{Genome, PackedSeq, SEQ_SEP};
 
 /// Default GECKO scoring parameters (+4 match, -4 mismatch, -1 ambiguous 'N').
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +23,7 @@ impl Default for Scoring {
 }
 
 impl Scoring {
-    /// Whether this scoring matches GECKO's default `+4/-4/-1` scheme accelerated by AVX2.
+    /// Whether this scoring matches GECKO's default `+4/-4/-1` scheme accelerated by 2-bit/AVX2.
     #[inline(always)]
     pub fn is_default_gecko(&self) -> bool {
         self.match_score == 4 && self.mismatch_penalty == 4 && self.n_penalty == 1
@@ -121,6 +121,19 @@ pub(crate) fn has_avx2() -> bool {
     }
 }
 
+/// Runtime check for BMI2 (`pext`) support.
+#[inline(always)]
+pub(crate) fn has_bmi2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("bmi2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// Extend a diagonal-sorted slice of [`Hit`]s in parallel across diagonal groups.
 ///
 /// Assumes `hits` is sorted by `(diag, pos_x)` and contains complete diagonals (never splits
@@ -136,6 +149,7 @@ pub fn extend_hits_parallel(
     }
 
     let use_avx2 = has_avx2() && opts.scoring.is_default_gecko();
+    let use_bmi2 = has_bmi2();
 
     // Partition `hits` into coarse chunks aligned to diagonal boundaries so `rayon` threads
     // process independent diagonals with zero synchronization.
@@ -155,7 +169,9 @@ pub fn extend_hits_parallel(
 
     let partial: Vec<ExtendBatchOutput> = ranges
         .into_par_iter()
-        .map(|(s, e)| extend_diagonal_slice(&hits[s..e], genome_x, genome_y, opts, use_avx2))
+        .map(|(s, e)| {
+            extend_diagonal_slice(&hits[s..e], genome_x, genome_y, opts, use_avx2, use_bmi2)
+        })
         .collect();
 
     let mut merged = ExtendBatchOutput::default();
@@ -178,6 +194,7 @@ fn extend_diagonal_slice(
     genome_y: &Genome,
     opts: ExtendOptions,
     use_avx2: bool,
+    use_bmi2: bool,
 ) -> ExtendBatchOutput {
     let mut out = ExtendBatchOutput::default();
     if hits.is_empty() {
@@ -199,8 +216,15 @@ fn extend_diagonal_slice(
         }
 
         out.hits_used += 1;
-        let outcome =
-            extend_single_hit_outcome(h, genome_x, genome_y, opts, use_avx2, &mut out.coverage);
+        let outcome = extend_single_hit_outcome(
+            h,
+            genome_x,
+            genome_y,
+            opts,
+            use_avx2,
+            use_bmi2,
+            &mut out.coverage,
+        );
         if let Some(frag) = outcome.fragment {
             last_offset = (h.pos_x + frag.length) as i64;
             out.fragments.push(frag);
@@ -210,7 +234,7 @@ fn extend_diagonal_slice(
     out
 }
 
-/// Forward pass state returned by scalar/AVX2 forward extension.
+/// Forward pass state returned by scalar / 2-bit AVX2 forward extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ForwardResult {
     xfil_max: u64,
@@ -219,7 +243,7 @@ struct ForwardResult {
     max_identities: u64,
 }
 
-/// Backward pass state returned by scalar/AVX2 backward extension.
+/// Backward pass state returned by scalar / 2-bit AVX2 backward extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackwardResult {
     xfil_max2: u64,
@@ -230,18 +254,20 @@ struct BackwardResult {
 
 /// Bidirectional ungapped extension from a single seed hit, faithful to GECKO's `FragFromHit`.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extend_single_hit_outcome(
     h: Hit,
     genome_x: &Genome,
     genome_y: &Genome,
     opts: ExtendOptions,
     use_avx2: bool,
+    use_bmi2: bool,
     coverage: &mut CoverageMatrix,
 ) -> ExtendOutcome {
-    let data_x = &genome_x.data;
-    let data_y = &genome_y.data;
-    let nx = data_x.len() as u64;
-    let ny = data_y.len() as u64;
+    let seq_x_pack = &genome_x.seq;
+    let seq_y_pack = &genome_y.seq;
+    let nx = seq_x_pack.len as u64;
+    let ny = seq_y_pack.len as u64;
 
     let pos_x = h.pos_x;
     let pos_y = h.pos_y();
@@ -268,23 +294,28 @@ pub(crate) fn extend_single_hit_outcome(
     let (fwd, bwd) = if use_avx2 && opts.scoring.is_default_gecko() {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let f = extend_forward_avx2(data_x, data_y, pos_x, pos_y, wl);
-            let b = extend_backward_avx2(data_x, data_y, pos_x, pos_y, f);
+            let f = extend_forward_2bit_avx2(seq_x_pack, seq_y_pack, pos_x, pos_y, wl, use_bmi2);
+            let b = extend_backward_2bit_avx2(seq_x_pack, seq_y_pack, pos_x, pos_y, f, use_bmi2);
             (f, b)
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            let f = extend_forward_scalar(data_x, data_y, pos_x, pos_y, wl, opts.scoring);
-            let b = extend_backward_scalar(data_x, data_y, pos_x, pos_y, f, opts.scoring);
+            let _ = use_bmi2;
+            let f = extend_forward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, wl);
+            let b = extend_backward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, f);
             (f, b)
         }
+    } else if opts.scoring.is_default_gecko() {
+        let f = extend_forward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, wl);
+        let b = extend_backward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, f);
+        (f, b)
     } else {
-        let f = extend_forward_scalar(data_x, data_y, pos_x, pos_y, wl, opts.scoring);
-        let b = extend_backward_scalar(data_x, data_y, pos_x, pos_y, f, opts.scoring);
+        let f = extend_forward_scalar(seq_x_pack, seq_y_pack, pos_x, pos_y, wl, opts.scoring);
+        let b = extend_backward_scalar(seq_x_pack, seq_y_pack, pos_x, pos_y, f, opts.scoring);
         (f, b)
     };
 
-    // Convert data coordinates (with `SEQ_SEP` separators) to GECKO concatenated nucleotide coordinates.
+    // Convert coordinate space (with `SEQ_SEP` slots) to GECKO concatenated nucleotide coordinates.
     let x_start = bwd.xfil_max2 - seq_x as u64;
     let y_start = bwd.ycol_max2 - seq_y as u64;
     let x_end = fwd.xfil_max - seq_x as u64;
@@ -329,21 +360,20 @@ pub(crate) fn extend_single_hit_outcome(
     }
 }
 
-#[inline(always)]
-fn ascii_upper_fast(b: u8) -> u8 {
-    b & 0xDF
-}
+// ---------------------------------------------------------------------------
+// Portable scalar extension (custom scoring + reference oracle for fuzz tests)
+// ---------------------------------------------------------------------------
 
 fn extend_forward_scalar(
-    data_x: &[u8],
-    data_y: &[u8],
+    seq_x: &PackedSeq,
+    seq_y: &PackedSeq,
     pos_x: u64,
     pos_y: u64,
     wl: u64,
     scoring: Scoring,
 ) -> ForwardResult {
-    let nx = data_x.len() as u64;
-    let ny = data_y.len() as u64;
+    let nx = seq_x.len as u64;
+    let ny = seq_y.len as u64;
     let ldiag = (nx - pos_x).min(ny - pos_y);
     let mut xfil = pos_x + wl;
     let mut ycol = pos_y + wl;
@@ -361,8 +391,8 @@ fn extend_forward_scalar(
     let n_pen = scoring.n_penalty;
 
     while frag_len < ldiag {
-        let vx = ascii_upper_fast(data_x[xfil as usize]);
-        let vy = ascii_upper_fast(data_y[ycol as usize]);
+        let vx = seq_x.byte_upper_at(xfil as usize);
+        let vy = seq_y.byte_upper_at(ycol as usize);
         if vx == SEQ_SEP || vy == SEQ_SEP {
             break;
         }
@@ -399,8 +429,8 @@ fn extend_forward_scalar(
 }
 
 fn extend_backward_scalar(
-    data_x: &[u8],
-    data_y: &[u8],
+    seq_x: &PackedSeq,
+    seq_y: &PackedSeq,
     pos_x: u64,
     pos_y: u64,
     fwd: ForwardResult,
@@ -424,8 +454,8 @@ fn extend_backward_scalar(
         let mut back_len = 0u64;
 
         while back_len < ldiag2 {
-            let vx = ascii_upper_fast(data_x[xfil2 as usize]);
-            let vy = ascii_upper_fast(data_y[ycol2 as usize]);
+            let vx = seq_x.byte_upper_at(xfil2 as usize);
+            let vy = seq_y.byte_upper_at(ycol2 as usize);
             if vx == SEQ_SEP || vy == SEQ_SEP {
                 break;
             }
@@ -461,6 +491,400 @@ fn extend_backward_scalar(
         max_identities,
     }
 }
+
+// ---------------------------------------------------------------------------
+// 2-bit helpers (special-run distance queries + even-bit compaction)
+// ---------------------------------------------------------------------------
+
+/// Distance forward from `pos` until the next special (`N`/`SEQ_SEP`/IUPAC) position.
+/// Returns `0` if `pos` itself lies inside a special run.
+#[inline(always)]
+fn safe_forward_dist(runs: &[(u64, u64)], pos: u64, cursor: &mut usize) -> u64 {
+    while *cursor < runs.len() && runs[*cursor].1 <= pos {
+        *cursor += 1;
+    }
+    if *cursor < runs.len() {
+        runs[*cursor].0.saturating_sub(pos)
+    } else {
+        u64::MAX
+    }
+}
+
+/// Distance backward from `pos` (inclusive) until the nearest special position at or before `pos`.
+/// Returns `0` if `pos` itself lies inside a special run.
+#[inline(always)]
+fn safe_backward_dist(runs: &[(u64, u64)], pos: u64, cursor: &mut usize) -> u64 {
+    while *cursor > 0 && runs[*cursor - 1].0 > pos {
+        *cursor -= 1;
+    }
+    if *cursor > 0 {
+        let e = runs[*cursor - 1].1;
+        if pos < e { 0 } else { pos - e + 1 }
+    } else {
+        pos + 1
+    }
+}
+
+/// Portable SWAR compaction of even bits (`0, 2, 4, ..., 62`) of `x` into bits `0..31`.
+#[inline(always)]
+fn pack_even_bits_swar(mut x: u64) -> u32 {
+    x = (x | (x >> 1)) & 0x3333_3333_3333_3333;
+    x = (x | (x >> 2)) & 0x0F0F_0F0F_0F0F_0F0F;
+    x = (x | (x >> 4)) & 0x00FF_00FF_00FF_00FF;
+    x = (x | (x >> 8)) & 0x0000_FFFF_0000_FFFF;
+    x = (x | (x >> 16)) & 0x0000_0000_FFFF_FFFF;
+    x as u32
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+#[inline]
+unsafe fn pack_even_bits_bmi2(x: u64) -> u32 {
+    core::arch::x86_64::_pext_u64(x, 0x5555_5555_5555_5555) as u32
+}
+
+// ---------------------------------------------------------------------------
+// Portable 2-bit extension (used on non-AVX2 CPUs for default +4/-4/-1 scoring)
+// ---------------------------------------------------------------------------
+
+fn extend_forward_2bit_portable(
+    seq_x: &PackedSeq,
+    seq_y: &PackedSeq,
+    pos_x: u64,
+    pos_y: u64,
+    wl: u64,
+) -> ForwardResult {
+    let nx = seq_x.len as u64;
+    let ny = seq_y.len as u64;
+    let mut rem = (nx - pos_x).min(ny - pos_y) - wl;
+    let mut xfil = pos_x + wl;
+    let mut ycol = pos_y + wl;
+
+    let mut xfil_max = pos_x + wl - 1;
+    let mut ycol_max = pos_y + wl - 1;
+    let mut n_identities = wl;
+    let mut max_identities = wl;
+    let mut fscore = 4 * wl as i64;
+    let mut fscore_max = fscore;
+
+    let sp_x = &seq_x.special_runs;
+    let sp_y = &seq_y.special_runs;
+    let mut cx = sp_x.partition_point(|&(_, e)| e <= xfil);
+    let mut cy = sp_y.partition_point(|&(_, e)| e <= ycol);
+
+    while rem > 0 {
+        let mut safe = rem
+            .min(safe_forward_dist(sp_x, xfil, &mut cx))
+            .min(safe_forward_dist(sp_y, ycol, &mut cy));
+
+        if safe == 0 {
+            let vx = seq_x.byte_upper_at(xfil as usize);
+            let vy = seq_y.byte_upper_at(ycol as usize);
+            if vx == SEQ_SEP || vy == SEQ_SEP {
+                break;
+            }
+            if vx == b'N' || vy == b'N' {
+                fscore -= 1;
+            } else if vx == vy {
+                fscore += 4;
+                n_identities += 1;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max = xfil;
+                    ycol_max = ycol;
+                    max_identities = n_identities;
+                }
+            } else {
+                fscore -= 4;
+            }
+            xfil += 1;
+            ycol += 1;
+            rem -= 1;
+            if fscore < 0 {
+                break;
+            }
+            continue;
+        }
+
+        while safe >= 32 {
+            let diff = seq_x.load_32(xfil as usize) ^ seq_y.load_32(ycol as usize);
+            if diff == 0 {
+                fscore += 128;
+                n_identities += 32;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max = xfil + 31;
+                    ycol_max = ycol + 31;
+                    max_identities = n_identities;
+                }
+                xfil += 32;
+                ycol += 32;
+                rem -= 32;
+                safe -= 32;
+                continue;
+            }
+
+            let mm_even = (diff | (diff >> 1)) & 0x5555_5555_5555_5555;
+            let matches = 32 - mm_even.count_ones() as i64;
+            if fscore >= 128 && fscore + 128 <= fscore_max {
+                fscore += (2 * matches - 32) * 4;
+                n_identities += matches as u64;
+                xfil += 32;
+                ycol += 32;
+                rem -= 32;
+                safe -= 32;
+                continue;
+            }
+
+            // Step this 32-base chunk using `mm_even` directly (zero memory reads).
+            let mut bits = mm_even;
+            for _ in 0..32 {
+                if (bits & 1) == 0 {
+                    fscore += 4;
+                    n_identities += 1;
+                    if fscore > fscore_max {
+                        fscore_max = fscore;
+                        xfil_max = xfil;
+                        ycol_max = ycol;
+                        max_identities = n_identities;
+                    }
+                } else {
+                    fscore -= 4;
+                }
+                xfil += 1;
+                ycol += 1;
+                rem -= 1;
+                safe -= 1;
+                bits >>= 2;
+                if fscore < 0 {
+                    return ForwardResult {
+                        xfil_max,
+                        ycol_max,
+                        fscore_max,
+                        max_identities,
+                    };
+                }
+            }
+        }
+
+        // Clean tail (< 32 bases before special run or end of diagonal).
+        while safe > 0 {
+            if seq_x.base_2bit(xfil as usize) == seq_y.base_2bit(ycol as usize) {
+                fscore += 4;
+                n_identities += 1;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max = xfil;
+                    ycol_max = ycol;
+                    max_identities = n_identities;
+                }
+            } else {
+                fscore -= 4;
+            }
+            xfil += 1;
+            ycol += 1;
+            rem -= 1;
+            safe -= 1;
+            if fscore < 0 {
+                return ForwardResult {
+                    xfil_max,
+                    ycol_max,
+                    fscore_max,
+                    max_identities,
+                };
+            }
+        }
+    }
+
+    ForwardResult {
+        xfil_max,
+        ycol_max,
+        fscore_max,
+        max_identities,
+    }
+}
+
+fn extend_backward_2bit_portable(
+    seq_x: &PackedSeq,
+    seq_y: &PackedSeq,
+    pos_x: u64,
+    pos_y: u64,
+    fwd: ForwardResult,
+) -> BackwardResult {
+    let mut rem = pos_x.min(pos_y);
+    let mut xfil_max2 = pos_x;
+    let mut ycol_max2 = pos_y;
+    let mut fscore = fwd.fscore_max;
+    let mut fscore_max = fwd.fscore_max;
+    let mut n_identities = fwd.max_identities;
+    let mut max_identities = fwd.max_identities;
+
+    if rem == 0 {
+        return BackwardResult {
+            xfil_max2,
+            ycol_max2,
+            fscore_max,
+            max_identities,
+        };
+    }
+
+    let mut xfil2 = pos_x - 1;
+    let mut ycol2 = pos_y - 1;
+
+    let sp_x = &seq_x.special_runs;
+    let sp_y = &seq_y.special_runs;
+    let mut cx = sp_x.partition_point(|&(s, _)| s <= xfil2);
+    let mut cy = sp_y.partition_point(|&(s, _)| s <= ycol2);
+
+    while rem > 0 {
+        let mut safe = rem
+            .min(safe_backward_dist(sp_x, xfil2, &mut cx))
+            .min(safe_backward_dist(sp_y, ycol2, &mut cy));
+
+        if safe == 0 {
+            let vx = seq_x.byte_upper_at(xfil2 as usize);
+            let vy = seq_y.byte_upper_at(ycol2 as usize);
+            if vx == SEQ_SEP || vy == SEQ_SEP {
+                break;
+            }
+            if vx == b'N' || vy == b'N' {
+                fscore -= 1;
+            } else if vx == vy {
+                fscore += 4;
+                n_identities += 1;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max2 = xfil2;
+                    ycol_max2 = ycol2;
+                    max_identities = n_identities;
+                }
+            } else {
+                fscore -= 4;
+            }
+            rem -= 1;
+            if fscore < 0 || rem == 0 {
+                break;
+            }
+            xfil2 -= 1;
+            ycol2 -= 1;
+            continue;
+        }
+
+        while safe >= 32 {
+            let diff = seq_x.load_32_rev(xfil2 as usize) ^ seq_y.load_32_rev(ycol2 as usize);
+            if diff == 0 {
+                fscore += 128;
+                n_identities += 32;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max2 = xfil2 - 31;
+                    ycol_max2 = ycol2 - 31;
+                    max_identities = n_identities;
+                }
+                rem -= 32;
+                safe -= 32;
+                if rem == 0 {
+                    return BackwardResult {
+                        xfil_max2,
+                        ycol_max2,
+                        fscore_max,
+                        max_identities,
+                    };
+                }
+                xfil2 -= 32;
+                ycol2 -= 32;
+                continue;
+            }
+
+            let mm_even = (diff | (diff >> 1)) & 0x5555_5555_5555_5555;
+            let matches = 32 - mm_even.count_ones() as i64;
+            if fscore >= 128 && fscore + 128 <= fscore_max {
+                fscore += (2 * matches - 32) * 4;
+                n_identities += matches as u64;
+                rem -= 32;
+                safe -= 32;
+                if rem == 0 {
+                    return BackwardResult {
+                        xfil_max2,
+                        ycol_max2,
+                        fscore_max,
+                        max_identities,
+                    };
+                }
+                xfil2 -= 32;
+                ycol2 -= 32;
+                continue;
+            }
+
+            let mut bits = mm_even;
+            for _ in 0..32 {
+                if (bits & 1) == 0 {
+                    fscore += 4;
+                    n_identities += 1;
+                    if fscore > fscore_max {
+                        fscore_max = fscore;
+                        xfil_max2 = xfil2;
+                        ycol_max2 = ycol2;
+                        max_identities = n_identities;
+                    }
+                } else {
+                    fscore -= 4;
+                }
+                rem -= 1;
+                safe -= 1;
+                bits >>= 2;
+                if fscore < 0 || rem == 0 {
+                    return BackwardResult {
+                        xfil_max2,
+                        ycol_max2,
+                        fscore_max,
+                        max_identities,
+                    };
+                }
+                xfil2 -= 1;
+                ycol2 -= 1;
+            }
+        }
+
+        while safe > 0 {
+            if seq_x.base_2bit(xfil2 as usize) == seq_y.base_2bit(ycol2 as usize) {
+                fscore += 4;
+                n_identities += 1;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max2 = xfil2;
+                    ycol_max2 = ycol2;
+                    max_identities = n_identities;
+                }
+            } else {
+                fscore -= 4;
+            }
+            rem -= 1;
+            safe -= 1;
+            if fscore < 0 || rem == 0 {
+                return BackwardResult {
+                    xfil_max2,
+                    ycol_max2,
+                    fscore_max,
+                    max_identities,
+                };
+            }
+            xfil2 -= 1;
+            ycol2 -= 1;
+        }
+    }
+
+    BackwardResult {
+        xfil_max2,
+        ycol_max2,
+        fscore_max,
+        max_identities,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2-bit + AVX2 (+ optional BMI2) bit-exact bidirectional extension
+// ---------------------------------------------------------------------------
 
 /// Compute 32-byte inclusive `i8` prefix sum, horizontal min, and horizontal max for `step`
 /// whose lanes are `+1` (match) or `-1` (mismatch).
@@ -504,20 +928,41 @@ unsafe fn prefix_sum_minmax_32(
     (p, chunk_min, chunk_max)
 }
 
-/// Bit-exact AVX2 forward ungapped extension for default `+4/-4/-1(N)` GECKO scoring.
+/// Expand a 32-bit `eq_mask` (bit `k` = 1 if match, 0 if mismatch) into a 32-lane `i8` AVX2
+/// step vector (`+1` for match, `-1` for mismatch).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn extend_forward_avx2(
-    data_x: &[u8],
-    data_y: &[u8],
+#[inline]
+unsafe fn eq_mask_to_step(
+    eq_mask: u32,
+    byte_shuf: core::arch::x86_64::__m256i,
+    bit_mask: core::arch::x86_64::__m256i,
+    pos_one: core::arch::x86_64::__m256i,
+    neg_one: core::arch::x86_64::__m256i,
+) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+
+    let bcast = _mm256_set1_epi32(eq_mask as i32);
+    let bytes = _mm256_shuffle_epi8(bcast, byte_shuf);
+    let eq = _mm256_cmpeq_epi8(_mm256_and_si256(bytes, bit_mask), bit_mask);
+    _mm256_blendv_epi8(neg_one, pos_one, eq)
+}
+
+/// Bit-exact 2-bit + AVX2 forward ungapped extension for default `+4/-4/-1(N)` GECKO scoring.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn extend_forward_2bit_avx2(
+    seq_x: &PackedSeq,
+    seq_y: &PackedSeq,
     pos_x: u64,
     pos_y: u64,
     wl: u64,
+    use_bmi2: bool,
 ) -> ForwardResult {
     use core::arch::x86_64::*;
 
-    let nx = data_x.len() as u64;
-    let ny = data_y.len() as u64;
+    let nx = seq_x.len as u64;
+    let ny = seq_y.len as u64;
     let mut rem = (nx - pos_x).min(ny - pos_y) - wl;
     let mut xfil = pos_x + wl;
     let mut ycol = pos_y + wl;
@@ -529,151 +974,173 @@ unsafe fn extend_forward_avx2(
     let mut fscore = 4 * wl as i64;
     let mut fscore_max = fscore;
 
-    let mask_df = _mm256_set1_epi8(0xDFu8 as i8);
-    let zero = _mm256_setzero_si256();
-    let vn = _mm256_set1_epi8(b'N' as i8);
+    let sp_x = &seq_x.special_runs;
+    let sp_y = &seq_y.special_runs;
+    let mut cx = sp_x.partition_point(|&(_, e)| e <= xfil);
+    let mut cy = sp_y.partition_point(|&(_, e)| e <= ycol);
+
+    let byte_shuf = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
+        3, 3,
+    );
+    let bit_mask = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
     let pos_one = _mm256_set1_epi8(1);
     let neg_one = _mm256_set1_epi8(-1);
 
-    let px = data_x.as_ptr();
-    let py = data_y.as_ptr();
+    while rem > 0 {
+        let mut safe = rem
+            .min(safe_forward_dist(sp_x, xfil, &mut cx))
+            .min(safe_forward_dist(sp_y, ycol, &mut cy));
 
-    while rem >= 32 {
-        let vx = unsafe { _mm256_loadu_si256(px.add(xfil as usize) as *const __m256i) };
-        let vy = unsafe { _mm256_loadu_si256(py.add(ycol as usize) as *const __m256i) };
-        let ux = _mm256_and_si256(vx, mask_df);
-        let uy = _mm256_and_si256(vy, mask_df);
-
-        let sp_x = _mm256_or_si256(_mm256_cmpeq_epi8(ux, zero), _mm256_cmpeq_epi8(ux, vn));
-        let sp_y = _mm256_or_si256(_mm256_cmpeq_epi8(uy, zero), _mm256_cmpeq_epi8(uy, vn));
-        let sp = _mm256_movemask_epi8(_mm256_or_si256(sp_x, sp_y));
-
-        if sp != 0 {
-            // Handle this 32-byte chunk scalar (breaks immediately on SEQ_SEP or fscore < 0).
-            for _ in 0..32 {
-                let cx = ascii_upper_fast(unsafe { *px.add(xfil as usize) });
-                let cy = ascii_upper_fast(unsafe { *py.add(ycol as usize) });
-                if cx == SEQ_SEP || cy == SEQ_SEP {
-                    return ForwardResult {
-                        xfil_max,
-                        ycol_max,
-                        fscore_max,
-                        max_identities,
-                    };
+        if safe == 0 {
+            let vx = seq_x.byte_upper_at(xfil as usize);
+            let vy = seq_y.byte_upper_at(ycol as usize);
+            if vx == SEQ_SEP || vy == SEQ_SEP {
+                break;
+            }
+            if vx == b'N' || vy == b'N' {
+                fscore -= 1;
+            } else if vx == vy {
+                fscore += 4;
+                n_identities += 1;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max = xfil;
+                    ycol_max = ycol;
+                    max_identities = n_identities;
                 }
-                if cx == b'N' || cy == b'N' {
-                    fscore -= 1;
-                } else if cx == cy {
-                    fscore += 4;
-                    n_identities += 1;
-                    if fscore > fscore_max {
-                        fscore_max = fscore;
-                        xfil_max = xfil;
-                        ycol_max = ycol;
-                        max_identities = n_identities;
+            } else {
+                fscore -= 4;
+            }
+            xfil += 1;
+            ycol += 1;
+            rem -= 1;
+            if fscore < 0 {
+                break;
+            }
+            continue;
+        }
+
+        while safe >= 32 {
+            let diff = seq_x.load_32(xfil as usize) ^ seq_y.load_32(ycol as usize);
+
+            // Fast-path 1: all 32 bases match (1 scalar instruction!).
+            if diff == 0 {
+                fscore += 128;
+                n_identities += 32;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max = xfil + 31;
+                    ycol_max = ycol + 31;
+                    max_identities = n_identities;
+                }
+                xfil += 32;
+                ycol += 32;
+                rem -= 32;
+                safe -= 32;
+                continue;
+            }
+
+            let mm_even = (diff | (diff >> 1)) & 0x5555_5555_5555_5555;
+            let matches = 32 - mm_even.count_ones() as i64;
+
+            // Fast-path 2: long decay tail (1 popcnt instruction!).
+            if fscore >= 128 && fscore + 128 <= fscore_max {
+                fscore += (2 * matches - 32) * 4;
+                n_identities += matches as u64;
+                xfil += 32;
+                ycol += 32;
+                rem -= 32;
+                safe -= 32;
+                continue;
+            }
+
+            // General path: bit-exact 32-byte i8 AVX2 prefix sum from packed match bitmask.
+            let mm_mask = if use_bmi2 {
+                unsafe { pack_even_bits_bmi2(mm_even) }
+            } else {
+                pack_even_bits_swar(mm_even)
+            };
+            let eq_mask = !mm_mask;
+            let step = unsafe { eq_mask_to_step(eq_mask, byte_shuf, bit_mask, pos_one, neg_one) };
+            let (p, chunk_min, chunk_max) = unsafe { prefix_sum_minmax_32(step) };
+
+            if fscore + 4 * chunk_min < 0 {
+                // Terminating chunk: finish exact boundary via `mm_even` (zero memory reads).
+                let mut bits = mm_even;
+                for _ in 0..32 {
+                    if (bits & 1) == 0 {
+                        fscore += 4;
+                        n_identities += 1;
+                        if fscore > fscore_max {
+                            fscore_max = fscore;
+                            xfil_max = xfil;
+                            ycol_max = ycol;
+                            max_identities = n_identities;
+                        }
+                    } else {
+                        fscore -= 4;
                     }
-                } else {
-                    fscore -= 4;
+                    xfil += 1;
+                    ycol += 1;
+                    bits >>= 2;
+                    if fscore < 0 {
+                        break;
+                    }
                 }
-                xfil += 1;
-                ycol += 1;
-                rem -= 1;
-                if fscore < 0 {
-                    return ForwardResult {
-                        xfil_max,
-                        ycol_max,
-                        fscore_max,
-                        max_identities,
-                    };
-                }
+                return ForwardResult {
+                    xfil_max,
+                    ycol_max,
+                    fscore_max,
+                    max_identities,
+                };
             }
-            continue;
-        }
 
-        let eq = _mm256_cmpeq_epi8(ux, uy);
-        let eq_mask = _mm256_movemask_epi8(eq) as u32;
-
-        // Fast-path 1: all 32 match.
-        if eq_mask == u32::MAX {
-            fscore += 128;
-            n_identities += 32;
-            if fscore > fscore_max {
-                fscore_max = fscore;
-                xfil_max = xfil + 31;
-                ycol_max = ycol + 31;
-                max_identities = n_identities;
+            if fscore + 4 * chunk_max > fscore_max {
+                let vmax_bcast = _mm256_set1_epi8(chunk_max as i8);
+                let max_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(p, vmax_bcast)) as u32;
+                let best_idx = max_mask.trailing_zeros() as usize;
+                let ident_before = (eq_mask & (u32::MAX >> (31 - best_idx))).count_ones() as u64;
+                fscore_max = fscore + 4 * chunk_max;
+                xfil_max = xfil + best_idx as u64;
+                ycol_max = ycol + best_idx as u64;
+                max_identities = n_identities + ident_before;
             }
-            xfil += 32;
-            ycol += 32;
-            rem -= 32;
-            continue;
-        }
 
-        // Fast-path 2: long decay tail where neither fscore < 0 nor fscore > fscore_max can occur.
-        if fscore >= 128 && fscore + 128 <= fscore_max {
-            let matches = eq_mask.count_ones() as i64;
             fscore += (2 * matches - 32) * 4;
             n_identities += matches as u64;
             xfil += 32;
             ycol += 32;
             rem -= 32;
-            continue;
+            safe -= 32;
         }
 
-        // General path: bit-exact 32-byte i8 SIMD prefix sum.
-        let step = _mm256_blendv_epi8(neg_one, pos_one, eq);
-        let (p, chunk_min, chunk_max) = unsafe { prefix_sum_minmax_32(step) };
-
-        if fscore + 4 * chunk_min < 0 {
-            // Terminating chunk: finish exact boundary in scalar tail below.
-            break;
-        }
-
-        if fscore + 4 * chunk_max > fscore_max {
-            let vmax_bcast = _mm256_set1_epi8(chunk_max as i8);
-            let max_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(p, vmax_bcast)) as u32;
-            let best_idx = max_mask.trailing_zeros() as usize;
-            let ident_before = (eq_mask & (u32::MAX >> (31 - best_idx))).count_ones() as u64;
-            fscore_max = fscore + 4 * chunk_max;
-            xfil_max = xfil + best_idx as u64;
-            ycol_max = ycol + best_idx as u64;
-            max_identities = n_identities + ident_before;
-        }
-
-        let matches = eq_mask.count_ones() as i64;
-        fscore += (2 * matches - 32) * 4;
-        n_identities += matches as u64;
-        xfil += 32;
-        ycol += 32;
-        rem -= 32;
-    }
-
-    // Scalar tail for remaining < 32 bases or the single terminating chunk.
-    while rem > 0 {
-        let cx = ascii_upper_fast(unsafe { *px.add(xfil as usize) });
-        let cy = ascii_upper_fast(unsafe { *py.add(ycol as usize) });
-        if cx == SEQ_SEP || cy == SEQ_SEP {
-            break;
-        }
-        if cx == b'N' || cy == b'N' {
-            fscore -= 1;
-        } else if cx == cy {
-            fscore += 4;
-            n_identities += 1;
-            if fscore > fscore_max {
-                fscore_max = fscore;
-                xfil_max = xfil;
-                ycol_max = ycol;
-                max_identities = n_identities;
+        // Clean tail (< 32 bases before next special run or diagonal end).
+        while safe > 0 {
+            if seq_x.base_2bit(xfil as usize) == seq_y.base_2bit(ycol as usize) {
+                fscore += 4;
+                n_identities += 1;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max = xfil;
+                    ycol_max = ycol;
+                    max_identities = n_identities;
+                }
+            } else {
+                fscore -= 4;
             }
-        } else {
-            fscore -= 4;
-        }
-        xfil += 1;
-        ycol += 1;
-        rem -= 1;
-        if fscore < 0 {
-            break;
+            xfil += 1;
+            ycol += 1;
+            rem -= 1;
+            safe -= 1;
+            if fscore < 0 {
+                return ForwardResult {
+                    xfil_max,
+                    ycol_max,
+                    fscore_max,
+                    max_identities,
+                };
+            }
         }
     }
 
@@ -685,15 +1152,16 @@ unsafe fn extend_forward_avx2(
     }
 }
 
-/// Bit-exact AVX2 backward ungapped extension for default `+4/-4/-1(N)` GECKO scoring.
+/// Bit-exact 2-bit + AVX2 backward ungapped extension for default `+4/-4/-1(N)` GECKO scoring.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn extend_backward_avx2(
-    data_x: &[u8],
-    data_y: &[u8],
+unsafe fn extend_backward_2bit_avx2(
+    seq_x: &PackedSeq,
+    seq_y: &PackedSeq,
     pos_x: u64,
     pos_y: u64,
     fwd: ForwardResult,
+    use_bmi2: bool,
 ) -> BackwardResult {
     use core::arch::x86_64::*;
 
@@ -717,91 +1185,136 @@ unsafe fn extend_backward_avx2(
     let mut xfil2 = pos_x - 1;
     let mut ycol2 = pos_y - 1;
 
-    let mask_df = _mm256_set1_epi8(0xDFu8 as i8);
-    let zero = _mm256_setzero_si256();
-    let vn = _mm256_set1_epi8(b'N' as i8);
+    let sp_x = &seq_x.special_runs;
+    let sp_y = &seq_y.special_runs;
+    let mut cx = sp_x.partition_point(|&(s, _)| s <= xfil2);
+    let mut cy = sp_y.partition_point(|&(s, _)| s <= ycol2);
+
+    let byte_shuf = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
+        3, 3,
+    );
+    let bit_mask = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
     let pos_one = _mm256_set1_epi8(1);
     let neg_one = _mm256_set1_epi8(-1);
-    let rev_shuf = _mm256_setr_epi8(
-        15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6,
-        5, 4, 3, 2, 1, 0,
-    );
 
-    let px = data_x.as_ptr();
-    let py = data_y.as_ptr();
+    while rem > 0 {
+        let mut safe = rem
+            .min(safe_backward_dist(sp_x, xfil2, &mut cx))
+            .min(safe_backward_dist(sp_y, ycol2, &mut cy));
 
-    while rem >= 32 {
-        // Load [xfil2 - 31 ..= xfil2] and reverse so lane k corresponds to xfil2 - k.
-        let vx_raw = unsafe { _mm256_loadu_si256(px.add((xfil2 - 31) as usize) as *const __m256i) };
-        let vy_raw = unsafe { _mm256_loadu_si256(py.add((ycol2 - 31) as usize) as *const __m256i) };
-        let vx_s = _mm256_shuffle_epi8(vx_raw, rev_shuf);
-        let vy_s = _mm256_shuffle_epi8(vy_raw, rev_shuf);
-        let vx = _mm256_permute2x128_si256::<0x01>(vx_s, vx_s);
-        let vy = _mm256_permute2x128_si256::<0x01>(vy_s, vy_s);
-
-        let ux = _mm256_and_si256(vx, mask_df);
-        let uy = _mm256_and_si256(vy, mask_df);
-
-        let sp_x = _mm256_or_si256(_mm256_cmpeq_epi8(ux, zero), _mm256_cmpeq_epi8(ux, vn));
-        let sp_y = _mm256_or_si256(_mm256_cmpeq_epi8(uy, zero), _mm256_cmpeq_epi8(uy, vn));
-        let sp = _mm256_movemask_epi8(_mm256_or_si256(sp_x, sp_y));
-
-        if sp != 0 {
-            for _ in 0..32 {
-                let cx = ascii_upper_fast(unsafe { *px.add(xfil2 as usize) });
-                let cy = ascii_upper_fast(unsafe { *py.add(ycol2 as usize) });
-                if cx == SEQ_SEP || cy == SEQ_SEP {
-                    return BackwardResult {
-                        xfil_max2,
-                        ycol_max2,
-                        fscore_max,
-                        max_identities,
-                    };
-                }
-                if cx == b'N' || cy == b'N' {
-                    fscore -= 1;
-                } else if cx == cy {
-                    fscore += 4;
-                    n_identities += 1;
-                    if fscore > fscore_max {
-                        fscore_max = fscore;
-                        xfil_max2 = xfil2;
-                        ycol_max2 = ycol2;
-                        max_identities = n_identities;
-                    }
-                } else {
-                    fscore -= 4;
-                }
-                rem -= 1;
-                if fscore < 0 || rem == 0 {
-                    return BackwardResult {
-                        xfil_max2,
-                        ycol_max2,
-                        fscore_max,
-                        max_identities,
-                    };
-                }
-                xfil2 -= 1;
-                ycol2 -= 1;
+        if safe == 0 {
+            let vx = seq_x.byte_upper_at(xfil2 as usize);
+            let vy = seq_y.byte_upper_at(ycol2 as usize);
+            if vx == SEQ_SEP || vy == SEQ_SEP {
+                break;
             }
+            if vx == b'N' || vy == b'N' {
+                fscore -= 1;
+            } else if vx == vy {
+                fscore += 4;
+                n_identities += 1;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max2 = xfil2;
+                    ycol_max2 = ycol2;
+                    max_identities = n_identities;
+                }
+            } else {
+                fscore -= 4;
+            }
+            rem -= 1;
+            if fscore < 0 || rem == 0 {
+                break;
+            }
+            xfil2 -= 1;
+            ycol2 -= 1;
             continue;
         }
 
-        let eq = _mm256_cmpeq_epi8(ux, uy);
-        let eq_mask = _mm256_movemask_epi8(eq) as u32;
+        while safe >= 32 {
+            let diff = seq_x.load_32_rev(xfil2 as usize) ^ seq_y.load_32_rev(ycol2 as usize);
 
-        // Fast-path 1: all 32 match.
-        if eq_mask == u32::MAX {
-            fscore += 128;
-            n_identities += 32;
-            if fscore > fscore_max {
-                fscore_max = fscore;
-                xfil_max2 = xfil2 - 31;
-                ycol_max2 = ycol2 - 31;
-                max_identities = n_identities;
+            // Fast-path 1: all 32 bases match.
+            if diff == 0 {
+                fscore += 128;
+                n_identities += 32;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max2 = xfil2 - 31;
+                    ycol_max2 = ycol2 - 31;
+                    max_identities = n_identities;
+                }
+                rem -= 32;
+                safe -= 32;
+                if rem == 0 {
+                    return BackwardResult {
+                        xfil_max2,
+                        ycol_max2,
+                        fscore_max,
+                        max_identities,
+                    };
+                }
+                xfil2 -= 32;
+                ycol2 -= 32;
+                continue;
             }
-            rem -= 32;
-            if rem == 0 {
+
+            let mm_even = (diff | (diff >> 1)) & 0x5555_5555_5555_5555;
+            let matches = 32 - mm_even.count_ones() as i64;
+
+            // Fast-path 2: long decay tail.
+            if fscore >= 128 && fscore + 128 <= fscore_max {
+                fscore += (2 * matches - 32) * 4;
+                n_identities += matches as u64;
+                rem -= 32;
+                safe -= 32;
+                if rem == 0 {
+                    return BackwardResult {
+                        xfil_max2,
+                        ycol_max2,
+                        fscore_max,
+                        max_identities,
+                    };
+                }
+                xfil2 -= 32;
+                ycol2 -= 32;
+                continue;
+            }
+
+            // General path: bit-exact 32-byte i8 AVX2 prefix sum.
+            let mm_mask = if use_bmi2 {
+                unsafe { pack_even_bits_bmi2(mm_even) }
+            } else {
+                pack_even_bits_swar(mm_even)
+            };
+            let eq_mask = !mm_mask;
+            let step = unsafe { eq_mask_to_step(eq_mask, byte_shuf, bit_mask, pos_one, neg_one) };
+            let (p, chunk_min, chunk_max) = unsafe { prefix_sum_minmax_32(step) };
+
+            if fscore + 4 * chunk_min < 0 {
+                let mut bits = mm_even;
+                for _ in 0..32 {
+                    if (bits & 1) == 0 {
+                        fscore += 4;
+                        n_identities += 1;
+                        if fscore > fscore_max {
+                            fscore_max = fscore;
+                            xfil_max2 = xfil2;
+                            ycol_max2 = ycol2;
+                            max_identities = n_identities;
+                        }
+                    } else {
+                        fscore -= 4;
+                    }
+                    rem -= 1;
+                    bits >>= 2;
+                    if fscore < 0 || rem == 0 {
+                        break;
+                    }
+                    xfil2 -= 1;
+                    ycol2 -= 1;
+                }
                 return BackwardResult {
                     xfil_max2,
                     ycol_max2,
@@ -809,17 +1322,22 @@ unsafe fn extend_backward_avx2(
                     max_identities,
                 };
             }
-            xfil2 -= 32;
-            ycol2 -= 32;
-            continue;
-        }
 
-        // Fast-path 2: long decay tail.
-        if fscore >= 128 && fscore + 128 <= fscore_max {
-            let matches = eq_mask.count_ones() as i64;
+            if fscore + 4 * chunk_max > fscore_max {
+                let vmax_bcast = _mm256_set1_epi8(chunk_max as i8);
+                let max_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(p, vmax_bcast)) as u32;
+                let best_idx = max_mask.trailing_zeros() as usize;
+                let ident_before = (eq_mask & (u32::MAX >> (31 - best_idx))).count_ones() as u64;
+                fscore_max = fscore + 4 * chunk_max;
+                xfil_max2 = xfil2 - best_idx as u64;
+                ycol_max2 = ycol2 - best_idx as u64;
+                max_identities = n_identities + ident_before;
+            }
+
             fscore += (2 * matches - 32) * 4;
             n_identities += matches as u64;
             rem -= 32;
+            safe -= 32;
             if rem == 0 {
                 return BackwardResult {
                     xfil_max2,
@@ -830,71 +1348,35 @@ unsafe fn extend_backward_avx2(
             }
             xfil2 -= 32;
             ycol2 -= 32;
-            continue;
         }
 
-        // General path: bit-exact 32-byte i8 SIMD prefix sum.
-        let step = _mm256_blendv_epi8(neg_one, pos_one, eq);
-        let (p, chunk_min, chunk_max) = unsafe { prefix_sum_minmax_32(step) };
-
-        if fscore + 4 * chunk_min < 0 {
-            break;
-        }
-
-        if fscore + 4 * chunk_max > fscore_max {
-            let vmax_bcast = _mm256_set1_epi8(chunk_max as i8);
-            let max_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(p, vmax_bcast)) as u32;
-            let best_idx = max_mask.trailing_zeros() as usize;
-            let ident_before = (eq_mask & (u32::MAX >> (31 - best_idx))).count_ones() as u64;
-            fscore_max = fscore + 4 * chunk_max;
-            xfil_max2 = xfil2 - best_idx as u64;
-            ycol_max2 = ycol2 - best_idx as u64;
-            max_identities = n_identities + ident_before;
-        }
-
-        let matches = eq_mask.count_ones() as i64;
-        fscore += (2 * matches - 32) * 4;
-        n_identities += matches as u64;
-        rem -= 32;
-        if rem == 0 {
-            return BackwardResult {
-                xfil_max2,
-                ycol_max2,
-                fscore_max,
-                max_identities,
-            };
-        }
-        xfil2 -= 32;
-        ycol2 -= 32;
-    }
-
-    // Scalar tail for remaining < 32 bases or terminating chunk.
-    while rem > 0 {
-        let cx = ascii_upper_fast(unsafe { *px.add(xfil2 as usize) });
-        let cy = ascii_upper_fast(unsafe { *py.add(ycol2 as usize) });
-        if cx == SEQ_SEP || cy == SEQ_SEP {
-            break;
-        }
-        if cx == b'N' || cy == b'N' {
-            fscore -= 1;
-        } else if cx == cy {
-            fscore += 4;
-            n_identities += 1;
-            if fscore > fscore_max {
-                fscore_max = fscore;
-                xfil_max2 = xfil2;
-                ycol_max2 = ycol2;
-                max_identities = n_identities;
+        // Clean tail (< 32 bases).
+        while safe > 0 {
+            if seq_x.base_2bit(xfil2 as usize) == seq_y.base_2bit(ycol2 as usize) {
+                fscore += 4;
+                n_identities += 1;
+                if fscore > fscore_max {
+                    fscore_max = fscore;
+                    xfil_max2 = xfil2;
+                    ycol_max2 = ycol2;
+                    max_identities = n_identities;
+                }
+            } else {
+                fscore -= 4;
             }
-        } else {
-            fscore -= 4;
+            rem -= 1;
+            safe -= 1;
+            if fscore < 0 || rem == 0 {
+                return BackwardResult {
+                    xfil_max2,
+                    ycol_max2,
+                    fscore_max,
+                    max_identities,
+                };
+            }
+            xfil2 -= 1;
+            ycol2 -= 1;
         }
-        rem -= 1;
-        if fscore < 0 || rem == 0 {
-            break;
-        }
-        xfil2 -= 1;
-        ycol2 -= 1;
     }
 
     BackwardResult {
@@ -917,8 +1399,8 @@ unsafe fn extend_backward_avx2(
 /// Returns `max(pos_x + safe_b * wl - 1, pos_x + wl / 2)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exact_rejected_skip(
-    data_x: &[u8],
-    data_y: &[u8],
+    seq_x: &PackedSeq,
+    seq_y: &PackedSeq,
     pos_x: u64,
     pos_y: u64,
     xfil_max: u64,
@@ -951,30 +1433,57 @@ pub(crate) fn exact_rejected_skip(
     let mut s = 0i64;
     let mut off = 0usize;
 
+    let sp_x = &seq_x.special_runs;
+    let sp_y = &seq_y.special_runs;
+    let mut cx = sp_x.partition_point(|&(_, e)| e <= pos_x);
+    let mut cy = sp_y.partition_point(|&(_, e)| e <= pos_y);
+
     for _ in 0..n_blocks {
         let end = (off + wl).min(span_len);
         let mut b_max = s;
         let mut b_min = i64::MAX;
         while off < end {
-            let vx = ascii_upper_fast(data_x[base_x + off]);
-            let vy = ascii_upper_fast(data_y[base_y + off]);
-            if vx == SEQ_SEP || vy == SEQ_SEP {
-                break;
-            }
-            if vx == b'N' || vy == b'N' {
-                s -= n_pen;
-            } else if vx == vy {
-                s += point;
+            let px = pos_x + off as u64;
+            let py = pos_y + off as u64;
+            let safe = safe_forward_dist(sp_x, px, &mut cx)
+                .min(safe_forward_dist(sp_y, py, &mut cy))
+                .min((end - off) as u64) as usize;
+            if safe > 0 {
+                for _ in 0..safe {
+                    if seq_x.base_2bit(base_x + off) == seq_y.base_2bit(base_y + off) {
+                        s += point;
+                    } else {
+                        s -= mismatch;
+                    }
+                    if s < b_min {
+                        b_min = s;
+                    }
+                    if s > b_max {
+                        b_max = s;
+                    }
+                    off += 1;
+                }
             } else {
-                s -= mismatch;
+                let vx = seq_x.byte_upper_at(base_x + off);
+                let vy = seq_y.byte_upper_at(base_y + off);
+                if vx == SEQ_SEP || vy == SEQ_SEP {
+                    break;
+                }
+                if vx == b'N' || vy == b'N' {
+                    s -= n_pen;
+                } else if vx == vy {
+                    s += point;
+                } else {
+                    s -= mismatch;
+                }
+                if s < b_min {
+                    b_min = s;
+                }
+                if s > b_max {
+                    b_max = s;
+                }
+                off += 1;
             }
-            if s < b_min {
-                b_min = s;
-            }
-            if s > b_max {
-                b_max = s;
-            }
-            off += 1;
         }
         scratch.blk_min.push(b_min);
         scratch.blk_max.push(b_max);
@@ -1037,17 +1546,11 @@ mod tests {
         assert_eq!(f.length, seq.len() as u64);
         assert_eq!(f.ident, seq.len() as u64);
         assert!((f.similarity - 100.0).abs() < 1e-4);
-        // Verified no OOB panic on 100% similarity bin!
         assert_eq!(out.coverage.bins[seq.len()][99], 1);
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
-    fn avx2_extension_is_bit_exact_with_scalar() {
-        if !has_avx2() {
-            return;
-        }
-
+    fn two_bit_portable_and_avx2_extension_are_bit_exact_with_scalar() {
         let mut rng = 0xDEAD_BEEF_CAFE_BABEu64;
         let mut next_u64 = || {
             rng = rng
@@ -1059,8 +1562,10 @@ mod tests {
         let upper = *b"ACGT";
         let lower = *b"acgt";
         let scoring = Scoring::default();
+        let avx2 = has_avx2();
+        let bmi2 = has_bmi2();
 
-        for trial in 0..300 {
+        for trial in 0..1000 {
             let len = 40 + (next_u64() as usize % 600);
             let mismatch_pct = [0, 5, 15, 30, 48, 60, 80][trial % 7];
             let mut sx = Vec::with_capacity(len);
@@ -1078,6 +1583,8 @@ mod tests {
                 let r2 = next_u64();
                 let by = if (r2 % 100) < 3 {
                     if (r2 & 1) == 0 { b'N' } else { b'n' }
+                } else if (r2 % 1000) < 3 {
+                    b'R' // test rare IUPAC ambiguity code
                 } else if (r2 % 100) < mismatch_pct {
                     let alt = upper[(((r >> 8) + 1 + (r2 % 3)) & 3) as usize];
                     if (r2 & 4) == 0 {
@@ -1097,9 +1604,9 @@ mod tests {
             if trial % 5 == 0 && len > 80 {
                 let sep_pos = 10 + (next_u64() as usize % (len - 20));
                 if (trial & 1) == 0 {
-                    sx[sep_pos] = SEQ_SEP;
+                    sx[sep_pos] = b'*';
                 } else {
-                    sy[sep_pos] = SEQ_SEP;
+                    sy[sep_pos] = b'*';
                 }
             }
 
@@ -1107,42 +1614,59 @@ mod tests {
             if len <= wl + 4 {
                 continue;
             }
-            let pos = (next_u64() as usize) % (len - wl);
-            // Make sure the seed itself is an exact match (no SEQ_SEP/N).
+            let pos_x = (next_u64() as usize) % (len - wl);
+            // Deliberately test mismatched mod-32 alignments between X and Y!
+            let shift_y = (next_u64() as usize) % 32;
+            let pos_y = if pos_x + shift_y + wl < len {
+                pos_x + shift_y
+            } else {
+                pos_x
+            };
             for k in 0..wl {
-                let b = upper[(pos + k) & 3];
-                sx[pos + k] = b;
-                sy[pos + k] = b;
+                let b = upper[(pos_x + k) & 3];
+                sx[pos_x + k] = b;
+                sy[pos_y + k] = b;
             }
 
-            let pos_u64 = pos as u64;
+            let gx = Genome::from_records("x", [("x0", sx.as_slice())]);
+            let gy = Genome::from_records("y", [("y0", sy.as_slice())]);
+            let px = pos_x as u64;
+            let py = pos_y as u64;
             let wl_u64 = wl as u64;
 
-            let f_scalar = extend_forward_scalar(&sx, &sy, pos_u64, pos_u64, wl_u64, scoring);
-            let f_avx2 = unsafe { extend_forward_avx2(&sx, &sy, pos_u64, pos_u64, wl_u64) };
-            assert_eq!(
-                f_avx2, f_scalar,
-                "forward mismatch at trial={trial} len={len} wl={wl} pos={pos}"
-            );
+            let f_scalar = extend_forward_scalar(&gx.seq, &gy.seq, px, py, wl_u64, scoring);
+            let f_port = extend_forward_2bit_portable(&gx.seq, &gy.seq, px, py, wl_u64);
+            assert_eq!(f_port, f_scalar, "portable forward mismatch trial={trial}");
 
-            let b_scalar = extend_backward_scalar(&sx, &sy, pos_u64, pos_u64, f_scalar, scoring);
-            let b_avx2 = unsafe { extend_backward_avx2(&sx, &sy, pos_u64, pos_u64, f_avx2) };
-            assert_eq!(
-                b_avx2, b_scalar,
-                "backward mismatch at trial={trial} len={len} wl={wl} pos={pos}"
-            );
+            let b_scalar = extend_backward_scalar(&gx.seq, &gy.seq, px, py, f_scalar, scoring);
+            let b_port = extend_backward_2bit_portable(&gx.seq, &gy.seq, px, py, f_port);
+            assert_eq!(b_port, b_scalar, "portable backward mismatch trial={trial}");
+
+            #[cfg(target_arch = "x86_64")]
+            if avx2 {
+                let f_avx2 =
+                    unsafe { extend_forward_2bit_avx2(&gx.seq, &gy.seq, px, py, wl_u64, bmi2) };
+                assert_eq!(f_avx2, f_scalar, "avx2 forward mismatch trial={trial}");
+                let b_avx2 =
+                    unsafe { extend_backward_2bit_avx2(&gx.seq, &gy.seq, px, py, f_avx2, bmi2) };
+                assert_eq!(b_avx2, b_scalar, "avx2 backward mismatch trial={trial}");
+                // Also verify SWAR fallback path directly!
+                let f_swar =
+                    unsafe { extend_forward_2bit_avx2(&gx.seq, &gy.seq, px, py, wl_u64, false) };
+                assert_eq!(f_swar, f_scalar, "avx2+swar forward mismatch trial={trial}");
+            }
+            let _ = (avx2, bmi2);
         }
     }
 
     #[test]
     fn exact_rejected_skip_skips_monotonic_span_and_stops_before_dip() {
         let wl = 16usize;
-        // 1) Monotonically increasing 400 bp match span: safe_b should advance nearly to the end.
-        let good = vec![b'A'; 400];
+        let g_good = Genome::from_records("g", [("g0", vec![b'A'; 400])]);
         let mut scratch = SkipScratch::default();
         let skip = exact_rejected_skip(
-            &good,
-            &good,
+            &g_good.seq,
+            &g_good.seq,
             0,
             0,
             399,
@@ -1155,17 +1679,24 @@ mod tests {
             "expected large skip on monotonic span, got {skip}"
         );
 
-        // 2) Prefix match (64 bp), deep mismatch valley (64 bp), then long match (300 bp):
-        // The deep valley causes suf_min to drop below early blk_max, so skip must stop safely!
-        let sx = vec![b'A'; 428];
+        let gx = Genome::from_records("x", [("x0", vec![b'A'; 428])]);
         let mut sy = vec![b'A'; 428];
         sy[64..128].fill(b'C');
-        let skip2 = exact_rejected_skip(&sx, &sy, 0, 0, 427, wl, Scoring::default(), &mut scratch);
+        let gy = Genome::from_records("y", [("y0", sy)]);
+        let skip2 = exact_rejected_skip(
+            &gx.seq,
+            &gy.seq,
+            0,
+            0,
+            427,
+            wl,
+            Scoring::default(),
+            &mut scratch,
+        );
         assert!(
             skip2 < 128,
             "skip must not step over a valley boundary where a new HSP begins (got {skip2})"
         );
-        // Verify minimum skip bound when safe_b == 0.
         assert!(skip2 >= (wl / 2) as u64);
     }
 }

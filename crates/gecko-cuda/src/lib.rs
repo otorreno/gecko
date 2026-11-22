@@ -143,7 +143,7 @@ mod ffi {
     /// without building `Y_rc` on the host CPU.
     fn build_rc_starts(reference: &Genome) -> Vec<u64> {
         let n_seqs = reference.records.len();
-        let buf_len = reference.data.len() as u64;
+        let buf_len = reference.seq.len as u64;
         let mut starts = Vec::with_capacity(n_seqs);
         starts.push(0);
         for k in (1..n_seqs).rev() {
@@ -262,23 +262,26 @@ mod ffi {
         config: &CompareConfig,
     ) -> Result<(CompareResult, CudaDeviceInfo)> {
         validate_cuda_config(config)?;
-        if query.data.len() >= (1usize << 31) || reference.data.len() >= (1usize << 31) {
+        if query.seq.len >= (1usize << 31) || reference.seq.len >= (1usize << 31) {
             return Err(GeckoError::InvalidParameter(
                 "CUDA backend requires sequences < 2.14 Gb".into(),
             ));
         }
         let info = probe_cuda().map_err(GeckoError::InvalidParameter)?;
 
-        let handle = RefGuard(unsafe {
-            gecko_cuda_prepare_ref(
-                reference.data.as_ptr(),
-                reference.data.len() as u64,
-                config.word_length as c_int,
-                config.freq_limit as u32,
-                c_int::from(config.soft_mask),
-                c_int::from(config.compare_reverse),
-            )
-        });
+        let handle = {
+            let ref_ascii = reference.seq.to_ascii_vec();
+            RefGuard(unsafe {
+                gecko_cuda_prepare_ref(
+                    ref_ascii.as_ptr(),
+                    ref_ascii.len() as u64,
+                    config.word_length as c_int,
+                    config.freq_limit as u32,
+                    c_int::from(config.soft_mask),
+                    c_int::from(config.compare_reverse),
+                )
+            })
+        };
         if handle.0.is_null() {
             return Err(GeckoError::InvalidParameter(
                 "CUDA reference index preparation failed".into(),
@@ -293,18 +296,21 @@ mod ffi {
         };
 
         let mut raw = GeckoCudaResult::default();
-        let rc = unsafe {
-            gecko_cuda_query_and_extend(
-                handle.0,
-                query.data.as_ptr(),
-                query.data.len() as u64,
-                min_len as u32,
-                config.min_similarity,
-                config.scoring.match_score as c_int,
-                config.scoring.mismatch_penalty as c_int,
-                config.scoring.n_penalty as c_int,
-                &mut raw,
-            )
+        let rc = {
+            let q_ascii = query.seq.to_ascii_vec();
+            unsafe {
+                gecko_cuda_query_and_extend(
+                    handle.0,
+                    q_ascii.as_ptr(),
+                    q_ascii.len() as u64,
+                    min_len as u32,
+                    config.min_similarity,
+                    config.scoring.match_score as c_int,
+                    config.scoring.mismatch_penalty as c_int,
+                    config.scoring.n_penalty as c_int,
+                    &mut raw,
+                )
+            }
         };
         if rc != 0 {
             if !raw.frags.is_null() {
@@ -336,22 +342,25 @@ mod ffi {
         let (query, reference, handle) = std::thread::scope(|s| -> Result<_> {
             let q_thread = s.spawn(|| Genome::from_fasta_path(query_path));
             let reference = Genome::from_fasta_path(ref_path)?;
-            if reference.data.len() >= (1usize << 31) {
+            if reference.seq.len >= (1usize << 31) {
                 let _ = q_thread.join();
                 return Err(GeckoError::InvalidParameter(
                     "CUDA backend requires reference < 2.14 Gb".into(),
                 ));
             }
-            let handle = RefGuard(unsafe {
-                gecko_cuda_prepare_ref(
-                    reference.data.as_ptr(),
-                    reference.data.len() as u64,
-                    config.word_length as c_int,
-                    config.freq_limit as u32,
-                    c_int::from(config.soft_mask),
-                    c_int::from(config.compare_reverse),
-                )
-            });
+            let handle = {
+                let ref_ascii = reference.seq.to_ascii_vec();
+                RefGuard(unsafe {
+                    gecko_cuda_prepare_ref(
+                        ref_ascii.as_ptr(),
+                        ref_ascii.len() as u64,
+                        config.word_length as c_int,
+                        config.freq_limit as u32,
+                        c_int::from(config.soft_mask),
+                        c_int::from(config.compare_reverse),
+                    )
+                })
+            };
             let query = q_thread.join().expect("FASTA query loader panicked")?;
             if handle.0.is_null() {
                 return Err(GeckoError::InvalidParameter(
@@ -361,7 +370,7 @@ mod ffi {
             Ok((query, reference, handle))
         })?;
 
-        if query.data.len() >= (1usize << 31) {
+        if query.seq.len >= (1usize << 31) {
             return Err(GeckoError::InvalidParameter(
                 "CUDA backend requires query < 2.14 Gb".into(),
             ));
@@ -375,18 +384,21 @@ mod ffi {
         };
 
         let mut raw = GeckoCudaResult::default();
-        let rc = unsafe {
-            gecko_cuda_query_and_extend(
-                handle.0,
-                query.data.as_ptr(),
-                query.data.len() as u64,
-                min_len as u32,
-                config.min_similarity,
-                config.scoring.match_score as c_int,
-                config.scoring.mismatch_penalty as c_int,
-                config.scoring.n_penalty as c_int,
-                &mut raw,
-            )
+        let rc = {
+            let q_ascii = query.seq.to_ascii_vec();
+            unsafe {
+                gecko_cuda_query_and_extend(
+                    handle.0,
+                    q_ascii.as_ptr(),
+                    q_ascii.len() as u64,
+                    min_len as u32,
+                    config.min_similarity,
+                    config.scoring.match_score as c_int,
+                    config.scoring.mismatch_penalty as c_int,
+                    config.scoring.n_penalty as c_int,
+                    &mut raw,
+                )
+            }
         };
         if rc != 0 {
             if !raw.frags.is_null() {

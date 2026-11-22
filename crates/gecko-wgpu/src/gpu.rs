@@ -80,23 +80,6 @@ pub struct WgpuContext {
     max_workgroups: u32,
 }
 
-/// Pack ASCII sequence bytes into little-endian u32 words (4 bases per u32) for WGSL.
-fn pack_u32_words(bytes: &[u8]) -> Vec<u32> {
-    let n_words = bytes.len().div_ceil(4) + 2;
-    let mut words = Vec::with_capacity(n_words);
-    let (chunks, rem) = bytes.as_chunks::<4>();
-    for &ch in chunks {
-        words.push(u32::from_le_bytes(ch));
-    }
-    if !rem.is_empty() {
-        let mut last = [0u8; 4];
-        last[..rem.len()].copy_from_slice(rem);
-        words.push(u32::from_le_bytes(last));
-    }
-    words.resize(n_words, 0);
-    words
-}
-
 impl WgpuContext {
     pub fn init(allow_software: bool) -> Result<Self, String> {
         let backends = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
@@ -230,34 +213,36 @@ impl WgpuContext {
             ));
         }
 
-        let x_words = pack_u32_words(&seq_x.data);
-        let y_words = pack_u32_words(&seq_y.data);
-        let y_rc_words = match seq_y_rc {
-            Some(rc) => pack_u32_words(&rc.data),
-            None => vec![0u32; 4],
+        let buf_x = {
+            let x_bytes = seq_x.seq.to_ascii_vec_padded_u32();
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("seq_x"),
+                    contents: &x_bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
         };
-
-        let buf_x = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("seq_x"),
-                contents: bytemuck::cast_slice(&x_words),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let buf_y = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("seq_y"),
-                contents: bytemuck::cast_slice(&y_words),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let buf_y_rc = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("seq_y_rc"),
-                contents: bytemuck::cast_slice(&y_rc_words),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+        let buf_y = {
+            let y_bytes = seq_y.seq.to_ascii_vec_padded_u32();
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("seq_y"),
+                    contents: &y_bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let buf_y_rc = {
+            let y_rc_bytes = match seq_y_rc {
+                Some(rc) => rc.seq.to_ascii_vec_padded_u32(),
+                None => vec![0u8; 16],
+            };
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("seq_y_rc"),
+                    contents: &y_rc_bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
         let buf_bucket_off = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -438,8 +423,8 @@ impl WgpuContext {
 
         let tile_bp: u32 = 8 * 1024 * 1024;
         let stride: u32 = 16;
-        let len_x = seq_x.data.len() as u32;
-        let len_y = seq_y.data.len() as u32;
+        let len_x = seq_x.seq.len as u32;
+        let len_y = seq_y.seq.len as u32;
         let flags = (u32::from(soft_mask)) | (u32::from(compare_reverse) << 1);
         let sim_th_x100 = (min_similarity * 100.0).round().max(0.0) as u32;
 

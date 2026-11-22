@@ -5,12 +5,12 @@ use rayon::prelude::*;
 use crate::error::Result;
 use crate::extend::{
     CoverageMatrix, ExtendOptions, SkipScratch, exact_rejected_skip, extend_single_hit_outcome,
-    has_avx2,
+    has_avx2, has_bmi2,
 };
 use crate::formats::frags::Fragment;
 use crate::hits::Hit;
 use crate::pipeline::{CompareConfig, CompareResult, CompareStats};
-use crate::ref_index::{PosStrandVec, RefIndex, base_lut};
+use crate::ref_index::{PosStrandVec, RefIndex, RefIndexKind, fmix64};
 use crate::seq::Genome;
 
 const QUERY_CHUNK_BYTES: usize = 1 << 20; // ~1 Mb dynamic Rayon chunks
@@ -145,9 +145,10 @@ impl WorkerState {
 
 /// Execute the streaming canonical-index comparison over `query` against a pre-built [`RefIndex`].
 ///
-/// Zero hit materialization or global hit sorting is performed: query k-mers are scanned in
-/// ~1 Mb parallel chunks using 64-item software-prefetched batches, filtered through lock-free
-/// per-thread 2-tier diagonal caches, and extended immediately with bit-exact AVX2 SIMD.
+/// Zero hit materialization or global hit sorting is performed: query k-mers are streamed
+/// directly from 2-bit packed `u64` words in ~1 Mb parallel chunks using 64-item software-prefetched
+/// batches, filtered through lock-free per-thread 2-tier diagonal caches, and extended immediately
+/// with bit-exact 2-bit + AVX2/BMI2 SIMD.
 pub fn compare_streaming(
     query: &Genome,
     reference: &Genome,
@@ -158,8 +159,7 @@ pub fn compare_streaming(
     config.validate()?;
 
     let wl = config.word_length;
-    let data_x = &query.data;
-    if data_x.len() < wl || ref_index.kept_entries == 0 {
+    if query.seq.len < wl || ref_index.kept_entries == 0 {
         return Ok(CompareResult {
             fragments: Vec::new(),
             coverage: CoverageMatrix::new(),
@@ -169,14 +169,14 @@ pub fn compare_streaming(
 
     let compare_reverse = config.compare_reverse && rev_ref.is_some();
     let use_avx2 = has_avx2();
-    let lut = base_lut(config.soft_mask);
+    let use_bmi2 = has_bmi2();
     let mask = if wl == 32 {
         u64::MAX
     } else {
         (1u64 << (2 * wl)) - 1
     };
     let rc_shift = (2 * (wl - 1)) as u32;
-    let ny = reference.data.len() as u64;
+    let ny = reference.seq.len as u64;
 
     let fwd_opts = ExtendOptions {
         min_length: config.min_length,
@@ -192,7 +192,7 @@ pub fn compare_streaming(
     };
 
     // Build ~1 Mb dynamic Rayon chunks partitioning all valid start positions `[0 .. max_starts)`.
-    let max_starts = data_x.len() - wl + 1;
+    let max_starts = query.seq.len - wl + 1;
     let mut chunks = Vec::with_capacity(max_starts.div_ceil(QUERY_CHUNK_BYTES));
     let mut s = 0usize;
     while s < max_starts {
@@ -207,8 +207,6 @@ pub fn compare_streaming(
         .fold(
             || WorkerState::new(compare_reverse),
             |mut state, (chunk_start, chunk_end)| {
-                // If work-stealing handed us an earlier chunk out of order, clear the diagonal
-                // caches so a later chunk's `max_x` can never falsely shadow an earlier chunk.
                 if chunk_start < state.last_chunk_end {
                     state.fwd_cache.clear();
                     if let Some(rc) = state.rev_cache.as_mut() {
@@ -227,11 +225,12 @@ pub fn compare_streaming(
                     ny,
                     mask,
                     rc_shift,
-                    lut,
+                    config.soft_mask,
                     config.max_rep.max(1),
                     fwd_opts,
                     rev_opts,
                     use_avx2,
+                    use_bmi2,
                     &mut state,
                 );
 
@@ -286,11 +285,12 @@ fn scan_query_chunk(
     ny: u64,
     mask: u64,
     rc_shift: u32,
-    lut: &[u8; 256],
+    soft_mask: bool,
     max_rep: usize,
     fwd_opts: ExtendOptions,
     rev_opts: ExtendOptions,
     use_avx2: bool,
+    use_bmi2: bool,
     state: &mut WorkerState,
 ) {
     if ref_index.is_direct() {
@@ -305,11 +305,12 @@ fn scan_query_chunk(
             ny,
             mask,
             rc_shift,
-            lut,
+            soft_mask,
             max_rep,
             fwd_opts,
             rev_opts,
             use_avx2,
+            use_bmi2,
             state,
         );
     } else {
@@ -324,11 +325,12 @@ fn scan_query_chunk(
             ny,
             mask,
             rc_shift,
-            lut,
+            soft_mask,
             max_rep,
             fwd_opts,
             rev_opts,
             use_avx2,
+            use_bmi2,
             state,
         );
     }
@@ -346,41 +348,64 @@ fn scan_query_chunk_impl<const IS_DIRECT: bool>(
     ny: u64,
     mask: u64,
     rc_shift: u32,
-    lut: &[u8; 256],
+    soft_mask: bool,
     max_rep: usize,
     fwd_opts: ExtendOptions,
     rev_opts: ExtendOptions,
     use_avx2: bool,
+    use_bmi2: bool,
     state: &mut WorkerState,
 ) {
-    let data_x = &query.data;
-    let scan_start = chunk_start;
-    let scan_end = (chunk_end + wl - 1).min(data_x.len());
+    let seq_x = &query.seq;
+    let scan_end = (chunk_end + wl - 1).min(seq_x.len);
 
     let (sub_bits, hash_shift) = match &ref_index.kind {
-        crate::ref_index::RefIndexKind::DirectCsr { sub_bits, .. } => (*sub_bits, 0u32),
-        crate::ref_index::RefIndexKind::HashCsr {
+        RefIndexKind::DirectCsr { sub_bits, .. } => (*sub_bits, 0u32),
+        RefIndexKind::HashCsr {
             sub_bits,
             hash_shift,
             ..
         } => (*sub_bits, *hash_shift),
     };
 
-    let mut kf = 0u64;
-    let mut kr = 0u64;
-    let mut valid_run = 0usize;
-
     let mut batch = [QueryItem::default(); BATCH_SIZE];
     let mut batch_len = 0usize;
 
-    for (rel, &raw) in data_x[scan_start..scan_end].iter().enumerate() {
-        let b = lut[raw as usize];
-        if b != 0xFF {
-            kf = ((kf << 2) | (b as u64)) & mask;
-            kr = (kr >> 2) | (((b ^ 3) as u64) << rc_shift);
-            valid_run += 1;
-            if valid_run >= wl {
-                let pos_x = (scan_start + rel + 1 - wl) as u64;
+    seq_x.for_each_valid_run(chunk_start, scan_end, soft_mask, |rs, re| {
+        if re - rs < wl {
+            return;
+        }
+        // Prime first `wl - 1` bases of the clean run directly from 2-bit u64 words.
+        let mut kf = 0u64;
+        let mut kr = 0u64;
+        let mut idx = rs;
+        let prime_end = rs + wl - 1;
+        while idx < prime_end {
+            let w_idx = idx >> 5;
+            let lane = idx & 31;
+            let avail = (32 - lane).min(prime_end - idx);
+            let mut word = unsafe { *seq_x.bits.get_unchecked(w_idx) } >> (lane << 1);
+            for _ in 0..avail {
+                let b = word & 3;
+                word >>= 2;
+                kf = ((kf << 2) | b) & mask;
+                kr = (kr >> 2) | ((b ^ 3) << rc_shift);
+            }
+            idx += avail;
+        }
+
+        // Stream 32 bases per u64 load, batching 64 k-mers for software-prefetched probing.
+        while idx < re {
+            let w_idx = idx >> 5;
+            let lane = idx & 31;
+            let avail = (32 - lane).min(re - idx);
+            let mut word = unsafe { *seq_x.bits.get_unchecked(w_idx) } >> (lane << 1);
+            let start_pos = (idx + 1 - wl) as u64;
+            for pos_x in start_pos..start_pos + avail as u64 {
+                let b = word & 3;
+                word >>= 2;
+                kf = ((kf << 2) | b) & mask;
+                kr = (kr >> 2) | ((b ^ 3) << rc_shift);
                 let (canon, q_kind) = if kf < kr {
                     (kf, 0u8)
                 } else if kr < kf {
@@ -392,7 +417,7 @@ fn scan_query_chunk_impl<const IS_DIRECT: bool>(
                     let b = canon as usize;
                     b + (b >> sub_bits)
                 } else {
-                    let b = (crate::ref_index::fmix64(canon) >> hash_shift) as usize;
+                    let b = (fmix64(canon) >> hash_shift) as usize;
                     b + (b >> sub_bits)
                 };
                 batch[batch_len] = QueryItem {
@@ -415,17 +440,15 @@ fn scan_query_chunk_impl<const IS_DIRECT: bool>(
                         fwd_opts,
                         rev_opts,
                         use_avx2,
+                        use_bmi2,
                         state,
                     );
                     batch_len = 0;
                 }
             }
-        } else {
-            valid_run = 0;
-            kf = 0;
-            kr = 0;
+            idx += avail;
         }
-    }
+    });
 
     if batch_len > 0 {
         flush_batch(
@@ -440,6 +463,7 @@ fn scan_query_chunk_impl<const IS_DIRECT: bool>(
             fwd_opts,
             rev_opts,
             use_avx2,
+            use_bmi2,
             state,
         );
     }
@@ -460,6 +484,7 @@ fn flush_batch(
     fwd_opts: ExtendOptions,
     rev_opts: ExtendOptions,
     use_avx2: bool,
+    use_bmi2: bool,
     state: &mut WorkerState,
 ) {
     let n = batch.len();
@@ -493,7 +518,7 @@ fn flush_batch(
 
         handle_matched_range(
             item, lo, hi, pos_strand, query, reference, rev_ref, wl, ny, max_rep, fwd_opts,
-            rev_opts, use_avx2, state,
+            rev_opts, use_avx2, use_bmi2, state,
         );
     }
 }
@@ -514,6 +539,7 @@ fn handle_matched_range(
     fwd_opts: ExtendOptions,
     rev_opts: ExtendOptions,
     use_avx2: bool,
+    use_bmi2: bool,
     state: &mut WorkerState,
 ) {
     let total = hi - lo;
@@ -533,21 +559,25 @@ fn handle_matched_range(
             // Palindrome (`kf == kr`): emit both forward and reverse hits.
             matched_any = true;
             process_hit_fwd(
-                item.pos_x, pos_y, query, reference, fwd_opts, use_avx2, state,
+                item.pos_x, pos_y, query, reference, fwd_opts, use_avx2, use_bmi2, state,
             );
             if let Some(rr) = rev_ref {
                 let rev_pos_y = ny - pos_y - wl;
-                process_hit_rev(item.pos_x, rev_pos_y, query, rr, rev_opts, use_avx2, state);
+                process_hit_rev(
+                    item.pos_x, rev_pos_y, query, rr, rev_opts, use_avx2, use_bmi2, state,
+                );
             }
         } else if r_strand == item.q_kind {
             matched_any = true;
             process_hit_fwd(
-                item.pos_x, pos_y, query, reference, fwd_opts, use_avx2, state,
+                item.pos_x, pos_y, query, reference, fwd_opts, use_avx2, use_bmi2, state,
             );
         } else if let Some(rr) = rev_ref {
             matched_any = true;
             let rev_pos_y = ny - pos_y - wl;
-            process_hit_rev(item.pos_x, rev_pos_y, query, rr, rev_opts, use_avx2, state);
+            process_hit_rev(
+                item.pos_x, rev_pos_y, query, rr, rev_opts, use_avx2, use_bmi2, state,
+            );
         }
     }
 
@@ -556,6 +586,7 @@ fn handle_matched_range(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn process_hit_fwd(
     pos_x: u64,
@@ -564,6 +595,7 @@ fn process_hit_fwd(
     reference: &Genome,
     opts: ExtendOptions,
     use_avx2: bool,
+    use_bmi2: bool,
     state: &mut WorkerState,
 ) {
     let diag = pos_x as i64 - pos_y as i64;
@@ -578,6 +610,7 @@ fn process_hit_fwd(
         reference,
         opts,
         use_avx2,
+        use_bmi2,
         &mut state.coverage,
     );
     if let Some(frag) = outcome.fragment {
@@ -585,8 +618,8 @@ fn process_hit_fwd(
         state.fragments.push(frag);
     } else if outcome.xfil_max > pos_x + 256 {
         let skip_end = exact_rejected_skip(
-            &query.data,
-            &reference.data,
+            &query.seq,
+            &reference.seq,
             pos_x,
             pos_y,
             outcome.xfil_max,
@@ -602,6 +635,7 @@ fn process_hit_fwd(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn process_hit_rev(
     pos_x: u64,
@@ -610,6 +644,7 @@ fn process_hit_rev(
     rev_ref: &Genome,
     opts: ExtendOptions,
     use_avx2: bool,
+    use_bmi2: bool,
     state: &mut WorkerState,
 ) {
     let diag = pos_x as i64 - pos_y as i64;
@@ -625,6 +660,7 @@ fn process_hit_rev(
         rev_ref,
         opts,
         use_avx2,
+        use_bmi2,
         &mut state.coverage,
     );
     if let Some(frag) = outcome.fragment {
@@ -632,8 +668,8 @@ fn process_hit_rev(
         state.fragments.push(frag);
     } else if outcome.xfil_max > pos_x + 256 {
         let skip_end = exact_rejected_skip(
-            &query.data,
-            &rev_ref.data,
+            &query.seq,
+            &rev_ref.seq,
             pos_x,
             pos_y,
             outcome.xfil_max,

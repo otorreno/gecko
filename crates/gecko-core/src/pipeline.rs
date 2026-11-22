@@ -8,9 +8,9 @@ use crate::formats::csv::ComparisonMetadata;
 use crate::formats::frags::Fragment;
 use crate::hits::{HitOptions, generate_and_consume_hits, generate_and_consume_hits_from_index};
 use crate::kmer::{DictOptions, INDEX_WORD_SIZE, KmerDict, KmerIndex};
-use crate::ref_index::RefIndex;
+use crate::ref_index::{RefIndex, compute_slab_ranges};
 use crate::seq::Genome;
-use crate::stream::compare_streaming;
+use crate::stream::{compare_streaming, dedup_fragments};
 
 /// Full configuration for a pairwise GECKO comparison.
 #[derive(Debug, Clone)]
@@ -29,7 +29,7 @@ pub struct CompareConfig {
     pub fixed_length: bool,
     /// If true (default), lowercase bases do not seed k-mers (soft-masking) but can extend.
     pub soft_mask: bool,
-    /// Memory budget in bytes for indexing/sorting before falling back to out-of-core disk runs.
+    /// Memory budget in bytes for indexing/sorting before falling back to slab streaming or disk runs.
     pub memory_budget: usize,
     /// Whether to compare the reverse complement of the reference (`true` by default).
     pub compare_reverse: bool,
@@ -139,9 +139,12 @@ impl CompareResult {
 /// Run a full pairwise genome comparison, optionally reusing cached `.gidx` dictionaries in
 /// `cache_dir`.
 ///
-/// Uses the streaming canonical-index engine (`RefIndex`) whenever `cache_dir` is `None` and the
-/// estimated reference index memory fits within `config.memory_budget`; otherwise automatically
-/// falls back to the out-of-core `KmerIndex::OnDisk` / `.gidx` pipeline.
+/// Strategy when `cache_dir` is `None`:
+/// 1. **Single-slab streaming** (`RefIndex` over all of `reference`) when it fits in `memory_budget`.
+/// 2. **Reference-slab streaming** (sequential memory-bounded slabs of `reference`, zero temp disk
+///    spilling) when `memory_budget` has at least 128 MiB net headroom above 2-bit `rev_ref`.
+/// 3. **Out-of-core `KmerIndex::OnDisk`** fallback for ultra-tight `--memory` budgets or `.gidx`
+///    disk caching.
 pub fn compare_genomes(
     query: &Genome,
     reference: &Genome,
@@ -150,30 +153,107 @@ pub fn compare_genomes(
 ) -> Result<CompareResult> {
     config.validate()?;
 
-    if cache_dir.is_none()
-        && RefIndex::fits_in_budget(
+    if cache_dir.is_none() {
+        if RefIndex::fits_in_budget(
             reference,
             config.word_length,
             config.soft_mask,
             config.compare_reverse,
             config.memory_budget,
-        )
-    {
-        let ref_index = RefIndex::build(
+        ) {
+            let ref_index = RefIndex::build(
+                reference,
+                config.word_length,
+                config.freq_limit,
+                config.soft_mask,
+            )?;
+            let rev_ref = if config.compare_reverse {
+                Some(reference.reverse_complement())
+            } else {
+                None
+            };
+            return compare_streaming(query, reference, &ref_index, rev_ref.as_ref(), config);
+        }
+
+        if let Some(max_kmers_per_slab) = RefIndex::max_kmers_per_slab_for_budget(
             reference,
+            config.word_length,
+            config.compare_reverse,
+            config.memory_budget,
+        ) {
+            return compare_genomes_slab_streaming(query, reference, config, max_kmers_per_slab);
+        }
+    }
+
+    compare_genomes_kmer_index(query, reference, config, cache_dir)
+}
+
+/// Zero-spill Reference-Slab Streaming: partitions `reference` into disjoint slabs of at most
+/// `max_kmers_per_slab` valid k-mers, builds one [`RefIndex`] per slab while keeping full 2-bit
+/// sequences in RAM so HSP extensions cross slab boundaries seamlessly, then deduplicates.
+pub(crate) fn compare_genomes_slab_streaming(
+    query: &Genome,
+    reference: &Genome,
+    config: &CompareConfig,
+    max_kmers_per_slab: usize,
+) -> Result<CompareResult> {
+    let slabs = compute_slab_ranges(
+        reference,
+        config.word_length,
+        config.soft_mask,
+        max_kmers_per_slab,
+    );
+    if slabs.is_empty() {
+        return Ok(CompareResult {
+            fragments: Vec::new(),
+            coverage: CoverageMatrix::new(),
+            stats: CompareStats::default(),
+        });
+    }
+
+    let rev_ref = if config.compare_reverse {
+        Some(reference.reverse_complement())
+    } else {
+        None
+    };
+
+    let mut merged = CompareResult {
+        fragments: Vec::new(),
+        coverage: CoverageMatrix::new(),
+        stats: CompareStats::default(),
+    };
+
+    for (slab_start, slab_end) in slabs {
+        let slab_index = RefIndex::build_range(
+            reference,
+            slab_start,
+            slab_end,
             config.word_length,
             config.freq_limit,
             config.soft_mask,
         )?;
-        let rev_ref = if config.compare_reverse {
-            Some(reference.reverse_complement())
-        } else {
-            None
-        };
-        return compare_streaming(query, reference, &ref_index, rev_ref.as_ref(), config);
+        let mut slab_res =
+            compare_streaming(query, reference, &slab_index, rev_ref.as_ref(), config)?;
+        drop(slab_index);
+
+        merged.stats.word_matches += slab_res.stats.word_matches;
+        merged.stats.raw_hits += slab_res.stats.raw_hits;
+        merged.stats.filtered_hits += slab_res.stats.filtered_hits;
+        merged.stats.hits_used += slab_res.stats.hits_used;
+        merged.coverage.merge_from(&slab_res.coverage);
+        merged.fragments.append(&mut slab_res.fragments);
     }
 
-    compare_genomes_kmer_index(query, reference, config, cache_dir)
+    dedup_fragments(&mut merged.fragments);
+    for f in &merged.fragments {
+        if f.strand == 'f' {
+            merged.stats.forward_fragments += 1;
+        } else {
+            merged.stats.reverse_fragments += 1;
+        }
+    }
+
+    Ok(merged)
 }
 
 /// Out-of-core / `.gidx`-cached comparison using legacy sorted [`KmerIndex`] dictionaries.
@@ -600,17 +680,24 @@ mod tests {
             };
 
             let res_stream = compare_genomes(&q, &r, &cfg, None).unwrap();
+            let res_slab = compare_genomes_slab_streaming(&q, &r, &cfg, 300).unwrap();
             let res_legacy = compare_genomes_kmer_index(&q, &r, &cfg, None).unwrap();
 
             let mut f_stream = res_stream.fragments.clone();
+            let mut f_slab = res_slab.fragments.clone();
             let mut f_legacy = res_legacy.fragments.clone();
             let key = |f: &Fragment| (f.strand, f.seq_x, f.seq_y, f.diag, f.x_start, f.x_end);
             f_stream.sort_by_key(key);
+            f_slab.sort_by_key(key);
             f_legacy.sort_by_key(key);
 
             assert_eq!(
                 f_stream, f_legacy,
                 "fragment mismatch for wl={wl}, compare_reverse={compare_reverse}"
+            );
+            assert_eq!(
+                f_slab, f_legacy,
+                "slab streaming mismatch for wl={wl}, compare_reverse={compare_reverse}"
             );
             assert!(
                 !f_stream.is_empty(),

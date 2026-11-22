@@ -45,7 +45,7 @@ pub fn compare_wgpu(
             config.word_length
         )));
     }
-    if query.data.len() >= (1usize << 31) || reference.data.len() >= (1usize << 31) {
+    if query.seq.len >= (1usize << 31) || reference.seq.len >= (1usize << 31) {
         return Err(GeckoError::InvalidParameter(
             "WGPU backend requires sequences < 2.14 Gb".into(),
         ));

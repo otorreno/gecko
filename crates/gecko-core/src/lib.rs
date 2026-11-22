@@ -19,4 +19,4 @@ pub use pipeline::{
     compare_with_ref_index,
 };
 pub use ref_index::{PosStrandVec, RefIndex};
-pub use seq::{Genome, SeqRecord};
+pub use seq::{Genome, PackedSeq, SeqRecord};

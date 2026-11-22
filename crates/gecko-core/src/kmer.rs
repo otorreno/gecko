@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::error::{GeckoError, Result};
 use crate::radix::parallel_radix_sort_u128_key;
-use crate::seq::{Genome, SEQ_SEP};
+use crate::seq::Genome;
 
 /// Canonical k-mer word size stored in GECKO dictionaries (32 bp packed into 64 bits).
 pub const INDEX_WORD_SIZE: usize = 32;
@@ -89,39 +89,40 @@ impl KmerDict {
         };
 
         let mut entries: Vec<WordEntry> =
-            Vec::with_capacity(genome.data.len().min(max_entries_in_mem));
+            Vec::with_capacity(genome.seq.len.min(max_entries_in_mem));
         let mut spill_files: Vec<File> = Vec::new();
+        let mut io_err: Option<GeckoError> = None;
 
-        let mut cur_word: u64 = 0;
-        let mut valid_run: usize = 0;
-
-        for (idx, &raw_byte) in genome.data.iter().enumerate() {
-            if raw_byte == SEQ_SEP {
-                valid_run = 0;
-                cur_word = 0;
-                continue;
-            }
-            let base_bits = encode_base(raw_byte, opts.soft_mask);
-            match base_bits {
-                Some(bits) => {
+        genome
+            .seq
+            .for_each_valid_run(0, genome.seq.len, opts.soft_mask, |rs, re| {
+                if io_err.is_some() || re - rs < index_k {
+                    return;
+                }
+                let mut cur_word: u64 = 0;
+                for idx in rs..re {
+                    let bits = genome.seq.base_2bit(idx) as u64;
                     cur_word = ((cur_word << 2) | bits) & kmer_mask;
-                    valid_run += 1;
-                    if valid_run >= index_k {
+                    if idx + 1 >= rs + index_k {
                         let start_pos = (idx + 1 - index_k) as u64;
                         entries.push(WordEntry {
                             kmer: cur_word << shift_to_msb,
                             pos: start_pos,
                         });
                         if entries.len() >= max_entries_in_mem {
-                            spill_files.push(sort_and_spill_entries(&mut entries)?);
+                            match sort_and_spill_entries(&mut entries) {
+                                Ok(f) => spill_files.push(f),
+                                Err(e) => {
+                                    io_err = Some(e);
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
-                None => {
-                    valid_run = 0;
-                    cur_word = 0;
-                }
-            }
+            });
+        if let Some(e) = io_err {
+            return Err(e);
         }
 
         if spill_files.is_empty() {
@@ -361,27 +362,6 @@ pub fn decode_kmer(msb_kmer: u64, k: usize) -> String {
     String::from_utf8(out).unwrap()
 }
 
-#[inline]
-fn encode_base(b: u8, soft_mask: bool) -> Option<u64> {
-    if soft_mask {
-        match b {
-            b'A' => Some(0),
-            b'C' => Some(1),
-            b'G' => Some(2),
-            b'T' => Some(3),
-            _ => None,
-        }
-    } else {
-        match b {
-            b'A' | b'a' => Some(0),
-            b'C' | b'c' => Some(1),
-            b'G' | b'g' => Some(2),
-            b'T' | b't' => Some(3),
-            _ => None,
-        }
-    }
-}
-
 fn sort_and_spill_entries(entries: &mut Vec<WordEntry>) -> Result<File> {
     parallel_radix_sort_u128_key(entries, |e| (e.kmer, e.pos));
     let mut tmp = tempfile::tempfile()?;
@@ -458,38 +438,40 @@ impl KmerIndex {
         };
 
         let mut entries: Vec<WordEntry> =
-            Vec::with_capacity(genome.data.len().min(max_entries_in_mem));
+            Vec::with_capacity(genome.seq.len.min(max_entries_in_mem));
         let mut spill_files: Vec<File> = Vec::new();
+        let mut io_err: Option<GeckoError> = None;
 
-        let mut cur_word: u64 = 0;
-        let mut valid_run: usize = 0;
-
-        for (idx, &raw_byte) in genome.data.iter().enumerate() {
-            if raw_byte == SEQ_SEP {
-                valid_run = 0;
-                cur_word = 0;
-                continue;
-            }
-            match encode_base(raw_byte, opts.soft_mask) {
-                Some(bits) => {
+        genome
+            .seq
+            .for_each_valid_run(0, genome.seq.len, opts.soft_mask, |rs, re| {
+                if io_err.is_some() || re - rs < index_k {
+                    return;
+                }
+                let mut cur_word: u64 = 0;
+                for idx in rs..re {
+                    let bits = genome.seq.base_2bit(idx) as u64;
                     cur_word = ((cur_word << 2) | bits) & kmer_mask;
-                    valid_run += 1;
-                    if valid_run >= index_k {
+                    if idx + 1 >= rs + index_k {
                         let start_pos = (idx + 1 - index_k) as u64;
                         entries.push(WordEntry {
                             kmer: cur_word << shift_to_msb,
                             pos: start_pos,
                         });
                         if entries.len() >= max_entries_in_mem {
-                            spill_files.push(sort_and_spill_entries(&mut entries)?);
+                            match sort_and_spill_entries(&mut entries) {
+                                Ok(f) => spill_files.push(f),
+                                Err(e) => {
+                                    io_err = Some(e);
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
-                None => {
-                    valid_run = 0;
-                    cur_word = 0;
-                }
-            }
+            });
+        if let Some(e) = io_err {
+            return Err(e);
         }
 
         if spill_files.is_empty() {

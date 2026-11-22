@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 
 use crate::error::{GeckoError, Result};
-use crate::seq::Genome;
+use crate::seq::{Genome, PackedSeq};
 
 const NUM_PARTITIONS: usize = 256;
 const STAGE_CAP: usize = 64;
@@ -178,33 +178,81 @@ fn choose_bucket_bits(total_kmers: usize) -> u32 {
     p
 }
 
-/// Count exact valid k-mers in `reference.data` in parallel (used for RAM estimation).
+/// Count exact valid k-mers in `reference.seq` in O(#runs) without touching sequence bits.
 pub fn count_valid_kmers(reference: &Genome, word_length: usize, soft_mask: bool) -> usize {
-    let data = &reference.data;
-    if data.len() < word_length {
+    count_valid_kmers_in_range(&reference.seq, 0, reference.seq.len, word_length, soft_mask)
+}
+
+/// Count exact valid k-mers whose start positions fall in `[slab_start .. slab_end)`.
+pub fn count_valid_kmers_in_range(
+    seq: &PackedSeq,
+    slab_start: usize,
+    slab_end: usize,
+    word_length: usize,
+    soft_mask: bool,
+) -> usize {
+    if seq.len < word_length || slab_start >= slab_end {
         return 0;
     }
-    let lut = base_lut(soft_mask);
-    let ranges = make_chunk_ranges(data.len(), word_length);
-    ranges
-        .par_iter()
-        .map(|&(start, end)| {
-            let scan_end = (end + word_length - 1).min(data.len());
-            let mut valid_run = 0usize;
-            let mut count = 0usize;
-            for &b in &data[start..scan_end] {
-                if lut[b as usize] != 0xFF {
-                    valid_run += 1;
-                    if valid_run >= word_length {
-                        count += 1;
-                    }
-                } else {
-                    valid_run = 0;
-                }
+    let max_starts = seq.len - word_length + 1;
+    let end = slab_end.min(max_starts);
+    if slab_start >= end {
+        return 0;
+    }
+    let scan_end = (end + word_length - 1).min(seq.len);
+    let mut count = 0usize;
+    seq.for_each_valid_run(slab_start, scan_end, soft_mask, |rs, re| {
+        if re - rs >= word_length {
+            count += re - rs - word_length + 1;
+        }
+    });
+    count
+}
+
+/// Partition valid k-mer start positions `[0 .. seq.len - wl + 1)` into disjoint reference slabs,
+/// each containing at most `max_kmers_per_slab` valid k-mers, for zero-spill slab streaming.
+pub fn compute_slab_ranges(
+    reference: &Genome,
+    word_length: usize,
+    soft_mask: bool,
+    max_kmers_per_slab: usize,
+) -> Vec<(usize, usize)> {
+    let seq = &reference.seq;
+    if seq.len < word_length {
+        return Vec::new();
+    }
+    let max_starts = seq.len - word_length + 1;
+    let cap = max_kmers_per_slab.max(1);
+    let mut slabs = Vec::new();
+    let mut cur_slab_start = 0usize;
+    let mut cur_kmers = 0usize;
+
+    seq.for_each_valid_run(0, seq.len, soft_mask, |rs, re| {
+        if re - rs < word_length {
+            return;
+        }
+        let mut run_pos = rs;
+        let run_last_start_excl = re - word_length + 1;
+        while run_pos < run_last_start_excl {
+            let room = cap - cur_kmers;
+            let avail = run_last_start_excl - run_pos;
+            if avail < room {
+                cur_kmers += avail;
+                run_pos = run_last_start_excl;
+            } else {
+                let split_end = run_pos + room;
+                slabs.push((cur_slab_start, split_end));
+                cur_slab_start = split_end;
+                cur_kmers = 0;
+                run_pos = split_end;
             }
-            count
-        })
-        .sum()
+        }
+    });
+
+    if cur_slab_start < max_starts && (cur_kmers > 0 || slabs.is_empty()) {
+        slabs.push((cur_slab_start, max_starts));
+    }
+    slabs
 }
 
 impl RefIndex {
@@ -218,13 +266,13 @@ impl RefIndex {
         if total_kmers >= u32::MAX as usize {
             return usize::MAX;
         }
-        let ps_bytes = if reference.data.len() < (1usize << 31) {
+        let ps_bytes = if reference.seq.len < (1usize << 31) {
             std::mem::size_of::<u32>()
         } else {
             std::mem::size_of::<u64>()
         };
         let rev_bytes = if compare_reverse {
-            reference.data.len()
+            reference.seq.heap_bytes()
         } else {
             0
         };
@@ -258,9 +306,8 @@ impl RefIndex {
         }
     }
 
-    /// Estimate exact peak RAM in bytes required to build and hold `RefIndex` (plus `rev_ref` if
-    /// `compare_reverse` is true). Returns `usize::MAX` if the reference exceeds `u32` offset
-    /// capacity (`>= u32::MAX` valid k-mers).
+    /// Estimate exact peak RAM in bytes required to build and hold `RefIndex` (plus 2-bit `rev_ref`
+    /// if `compare_reverse` is true). Returns `usize::MAX` if the reference has `>= 2^32` valid k-mers.
     pub fn estimate_bytes(
         reference: &Genome,
         word_length: usize,
@@ -271,8 +318,7 @@ impl RefIndex {
         Self::estimate_bytes_for_kmers(reference, total_kmers, word_length, compare_reverse)
     }
 
-    /// Check whether `RefIndex` fits within `memory_budget`, short-circuiting in O(1) without
-    /// scanning `reference.data` whenever the `total_bases` upper bound already fits.
+    /// Check whether a single-slab `RefIndex` fits within `memory_budget`.
     pub fn fits_in_budget(
         reference: &Genome,
         word_length: usize,
@@ -280,18 +326,68 @@ impl RefIndex {
         compare_reverse: bool,
         memory_budget: usize,
     ) -> bool {
-        let upper_kmers = (reference.total_bases as usize).saturating_sub(word_length - 1);
-        if Self::estimate_bytes_for_kmers(reference, upper_kmers, word_length, compare_reverse)
-            <= memory_budget
-        {
-            return true;
-        }
         Self::estimate_bytes(reference, word_length, soft_mask, compare_reverse) <= memory_budget
     }
 
-    /// Build a canonical reference index directly at `word_length` (`4..=32`).
+    /// Compute the maximum number of valid k-mers per reference slab that fits comfortably inside
+    /// `memory_budget` (accounting for 2-bit `rev_ref`, Hash/Direct CSR arrays, and build scratch).
+    /// Returns `None` if `memory_budget` is too small for efficient slab streaming (< 128 MiB net).
+    pub fn max_kmers_per_slab_for_budget(
+        reference: &Genome,
+        word_length: usize,
+        compare_reverse: bool,
+        memory_budget: usize,
+    ) -> Option<usize> {
+        const MIN_SLAB_BUDGET: usize = 128 * 1024 * 1024;
+        let rev_bytes = if compare_reverse {
+            reference.seq.heap_bytes()
+        } else {
+            0
+        };
+        let slab_budget = memory_budget.saturating_sub(rev_bytes);
+        if slab_budget < MIN_SLAB_BUDGET {
+            return None;
+        }
+        let ps_bytes = if reference.seq.len < (1usize << 31) {
+            4usize
+        } else {
+            8usize
+        };
+        // Hash-CSR ~ (8 + ps_bytes) + ~1.5B offsets + scratch headroom; Direct CSR <= that.
+        let bytes_per_kmer = if use_direct_csr(word_length, reference.total_bases) {
+            ps_bytes + 5
+        } else {
+            8 + ps_bytes + 3
+        };
+        let usable = slab_budget * 7 / 10;
+        let max_kmers = (usable / bytes_per_kmer).min((u32::MAX as usize) - 1);
+        if max_kmers < 1_000_000 {
+            None
+        } else {
+            Some(max_kmers)
+        }
+    }
+
+    /// Build a canonical reference index directly at `word_length` (`4..=32`) over all of `reference`.
     pub fn build(
         reference: &Genome,
+        word_length: usize,
+        freq_limit: u64,
+        soft_mask: bool,
+    ) -> Result<Self> {
+        let max_starts = reference
+            .seq
+            .len
+            .saturating_sub(word_length.saturating_sub(1));
+        Self::build_range(reference, 0, max_starts, word_length, freq_limit, soft_mask)
+    }
+
+    /// Build a canonical reference index covering valid k-mers whose start positions lie in
+    /// `[slab_start .. slab_end)`, preserving exact global reference coordinates.
+    pub fn build_range(
+        reference: &Genome,
+        slab_start: usize,
+        slab_end: usize,
         word_length: usize,
         freq_limit: u64,
         soft_mask: bool,
@@ -302,17 +398,45 @@ impl RefIndex {
             )));
         }
 
-        let use_u32_ps = reference.data.len() < (1usize << 31);
+        let use_u32_ps = reference.seq.len < (1usize << 31);
         if use_direct_csr(word_length, reference.total_bases) {
             if use_u32_ps {
-                build_direct_csr_u32(reference, word_length, freq_limit, soft_mask)
+                build_direct_csr_u32(
+                    reference,
+                    slab_start,
+                    slab_end,
+                    word_length,
+                    freq_limit,
+                    soft_mask,
+                )
             } else {
-                build_direct_csr_u64(reference, word_length, freq_limit, soft_mask)
+                build_direct_csr_u64(
+                    reference,
+                    slab_start,
+                    slab_end,
+                    word_length,
+                    freq_limit,
+                    soft_mask,
+                )
             }
         } else if use_u32_ps {
-            build_hash_csr_u32(reference, word_length, freq_limit, soft_mask)
+            build_hash_csr_u32(
+                reference,
+                slab_start,
+                slab_end,
+                word_length,
+                freq_limit,
+                soft_mask,
+            )
         } else {
-            build_hash_csr_u64(reference, word_length, freq_limit, soft_mask)
+            build_hash_csr_u64(
+                reference,
+                slab_start,
+                slab_end,
+                word_length,
+                freq_limit,
+                soft_mask,
+            )
         }
     }
 
@@ -543,20 +667,28 @@ struct SendMutPtr<T>(*mut T);
 unsafe impl<T: Send> Send for SendMutPtr<T> {}
 unsafe impl<T: Send> Sync for SendMutPtr<T> {}
 
-/// Partition `[0 .. data_len.saturating_sub(wl - 1))` into balanced chunks for Pass 1.
-fn make_chunk_ranges(data_len: usize, wl: usize) -> Vec<(usize, usize)> {
-    let max_starts = data_len.saturating_sub(wl - 1);
-    if max_starts == 0 {
+/// Partition valid start positions `[slab_start .. slab_end)` into balanced chunks for Pass 1.
+fn make_chunk_ranges(
+    slab_start: usize,
+    slab_end: usize,
+    seq_len: usize,
+    wl: usize,
+) -> Vec<(usize, usize)> {
+    let max_starts = seq_len.saturating_sub(wl - 1);
+    let lo = slab_start.min(max_starts);
+    let hi = slab_end.min(max_starts);
+    if lo >= hi {
         return Vec::new();
     }
+    let span = hi - lo;
     let threads = rayon::current_num_threads().max(1);
     let target_chunks = (threads * 4).clamp(1, 64);
-    let chunk_len = max_starts.div_ceil(target_chunks).max(65_536);
+    let chunk_len = span.div_ceil(target_chunks).max(65_536);
 
     let mut ranges = Vec::with_capacity(target_chunks + 1);
-    let mut s = 0usize;
-    while s < max_starts {
-        let e = (s + chunk_len).min(max_starts);
+    let mut s = lo;
+    while s < hi {
+        let e = (s + chunk_len).min(hi);
         ranges.push((s, e));
         s = e;
     }
@@ -616,45 +748,67 @@ fn kmer_mask(wl: usize) -> u64 {
     }
 }
 
-/// Inline helper: iterate valid canonical k-mers whose start position lies in `[start..end)`.
+/// Iterate all valid canonical k-mers whose start position lies in `[start..end)` directly from
+/// 2-bit packed `u64` words (jumping over `N` and soft-masked gaps in O(1), zero LUT lookups).
 #[inline(always)]
-fn for_each_canonical_kmer<F>(
-    data: &[u8],
+fn for_each_canonical_kmer_2bit<F>(
+    seq: &PackedSeq,
     start: usize,
     end: usize,
     wl: usize,
-    lut: &[u8; 256],
+    soft_mask: bool,
     mut f: F,
 ) where
     F: FnMut(u64, u64, u64),
 {
     let mask = kmer_mask(wl);
     let rc_shift = (2 * (wl - 1)) as u32;
-    let scan_end = (end + wl - 1).min(data.len());
-    let mut kf = 0u64;
-    let mut kr = 0u64;
-    let mut valid_run = 0usize;
+    let scan_end = (end + wl - 1).min(seq.len);
 
-    for (idx, &raw) in data[start..scan_end].iter().enumerate() {
-        let b = lut[raw as usize];
-        if b != 0xFF {
-            kf = ((kf << 2) | (b as u64)) & mask;
-            kr = (kr >> 2) | (((b ^ 3) as u64) << rc_shift);
-            valid_run += 1;
-            if valid_run >= wl {
-                let pos = (start + idx + 1 - wl) as u64;
+    seq.for_each_valid_run(start, scan_end, soft_mask, |rs, re| {
+        if re - rs < wl {
+            return;
+        }
+        // Prime first `wl - 1` bases of the clean run.
+        let mut kf = 0u64;
+        let mut kr = 0u64;
+        let mut idx = rs;
+        let prime_end = rs + wl - 1;
+        while idx < prime_end {
+            let w_idx = idx >> 5;
+            let lane = idx & 31;
+            let avail = (32 - lane).min(prime_end - idx);
+            let mut word = unsafe { *seq.bits.get_unchecked(w_idx) } >> (lane << 1);
+            for _ in 0..avail {
+                let b = word & 3;
+                word >>= 2;
+                kf = ((kf << 2) | b) & mask;
+                kr = (kr >> 2) | ((b ^ 3) << rc_shift);
+            }
+            idx += avail;
+        }
+
+        // Emit one canonical k-mer per base through `re`, loading 32 bases per u64 word.
+        while idx < re {
+            let w_idx = idx >> 5;
+            let lane = idx & 31;
+            let avail = (32 - lane).min(re - idx);
+            let mut word = unsafe { *seq.bits.get_unchecked(w_idx) } >> (lane << 1);
+            let start_pos = (idx + 1 - wl) as u64;
+            for pos in start_pos..start_pos + avail as u64 {
+                let b = word & 3;
+                word >>= 2;
+                kf = ((kf << 2) | b) & mask;
+                kr = (kr >> 2) | ((b ^ 3) << rc_shift);
                 if kr < kf {
                     f(kr, pos, 1);
                 } else {
                     f(kf, pos, 0);
                 }
             }
-        } else {
-            valid_run = 0;
-            kf = 0;
-            kr = 0;
+            idx += avail;
         }
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -701,41 +855,46 @@ impl PackedPs for u64 {
 
 fn build_direct_csr_u32(
     reference: &Genome,
+    slab_start: usize,
+    slab_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
-    build_direct_csr::<u32>(reference, wl, freq_limit, soft_mask)
+    build_direct_csr::<u32>(reference, slab_start, slab_end, wl, freq_limit, soft_mask)
 }
 
 fn build_direct_csr_u64(
     reference: &Genome,
+    slab_start: usize,
+    slab_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
-    build_direct_csr::<u64>(reference, wl, freq_limit, soft_mask)
+    build_direct_csr::<u64>(reference, slab_start, slab_end, wl, freq_limit, soft_mask)
 }
 
 fn build_direct_csr<P: PackedPs>(
     reference: &Genome,
+    slab_start: usize,
+    slab_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
-    let data = &reference.data;
-    let lut = base_lut(soft_mask);
+    let seq = &reference.seq;
     let sub_bits = (2 * wl - 8) as u32;
     let sub_keys = 1usize << sub_bits;
     let sub_mask = sub_keys - 1;
 
-    let ranges = make_chunk_ranges(data.len(), wl);
+    let ranges = make_chunk_ranges(slab_start, slab_end, seq.len, wl);
     if ranges.is_empty() {
         return Ok(RefIndex {
             word_length: wl,
             freq_limit,
             soft_mask,
-            ref_data_len: data.len(),
+            ref_data_len: seq.len,
             total_kmers: 0,
             kept_entries: 0,
             kind: RefIndexKind::DirectCsr {
@@ -751,7 +910,7 @@ fn build_direct_csr<P: PackedPs>(
         .par_iter()
         .map(|&(start, end)| {
             let mut counts = [0usize; NUM_PARTITIONS];
-            for_each_canonical_kmer(data, start, end, wl, lut, |canon, _, _| {
+            for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
                 counts[(canon >> sub_bits) as usize] += 1;
             });
             counts
@@ -761,7 +920,7 @@ fn build_direct_csr<P: PackedPs>(
     let (part_offsets, chunk_write, total_kmers) = compute_partition_layout(&chunk_counts);
     if total_kmers >= u32::MAX as usize {
         return Err(GeckoError::InvalidParameter(
-            "reference has >= 2^32 valid k-mers; use out-of-core --memory fallback".into(),
+            "reference slab has >= 2^32 valid k-mers; use smaller --memory budget".into(),
         ));
     }
 
@@ -790,7 +949,7 @@ fn build_direct_csr<P: PackedPs>(
                     .unwrap();
             let mut buf_len = [0u8; NUM_PARTITIONS];
 
-            for_each_canonical_kmer(data, start, end, wl, lut, |canon, pos, strand| {
+            for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, pos, strand| {
                 let p = (canon >> sub_bits) as usize;
                 let idx = buf_len[p] as usize;
                 buf_k[p][idx] = (canon as usize & sub_mask) as u32;
@@ -920,7 +1079,7 @@ fn build_direct_csr<P: PackedPs>(
         word_length: wl,
         freq_limit,
         soft_mask,
-        ref_data_len: data.len(),
+        ref_data_len: seq.len,
         total_kmers,
         kept_entries,
         kind: RefIndexKind::DirectCsr {
@@ -937,32 +1096,37 @@ fn build_direct_csr<P: PackedPs>(
 
 fn build_hash_csr_u32(
     reference: &Genome,
+    slab_start: usize,
+    slab_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
-    build_hash_csr::<u32>(reference, wl, freq_limit, soft_mask)
+    build_hash_csr::<u32>(reference, slab_start, slab_end, wl, freq_limit, soft_mask)
 }
 
 fn build_hash_csr_u64(
     reference: &Genome,
+    slab_start: usize,
+    slab_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
-    build_hash_csr::<u64>(reference, wl, freq_limit, soft_mask)
+    build_hash_csr::<u64>(reference, slab_start, slab_end, wl, freq_limit, soft_mask)
 }
 
 fn build_hash_csr<P: PackedPs>(
     reference: &Genome,
+    slab_start: usize,
+    slab_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
-    let data = &reference.data;
-    let lut = base_lut(soft_mask);
+    let seq = &reference.seq;
 
-    let ranges = make_chunk_ranges(data.len(), wl);
+    let ranges = make_chunk_ranges(slab_start, slab_end, seq.len, wl);
     if ranges.is_empty() {
         let bucket_bits = 14u32;
         let sub_bits = bucket_bits - 8;
@@ -971,7 +1135,7 @@ fn build_hash_csr<P: PackedPs>(
             word_length: wl,
             freq_limit,
             soft_mask,
-            ref_data_len: data.len(),
+            ref_data_len: seq.len,
             total_kmers: 0,
             kept_entries: 0,
             kind: RefIndexKind::HashCsr {
@@ -989,7 +1153,7 @@ fn build_hash_csr<P: PackedPs>(
         .par_iter()
         .map(|&(start, end)| {
             let mut counts = [0usize; NUM_PARTITIONS];
-            for_each_canonical_kmer(data, start, end, wl, lut, |canon, _, _| {
+            for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
                 let p = (fmix64(canon) >> 56) as usize;
                 counts[p] += 1;
             });
@@ -1000,7 +1164,7 @@ fn build_hash_csr<P: PackedPs>(
     let (part_offsets, chunk_write, total_kmers) = compute_partition_layout(&chunk_counts);
     if total_kmers >= u32::MAX as usize {
         return Err(GeckoError::InvalidParameter(
-            "reference has >= 2^32 valid k-mers; use out-of-core --memory fallback".into(),
+            "reference slab has >= 2^32 valid k-mers; use smaller --memory budget".into(),
         ));
     }
 
@@ -1035,7 +1199,7 @@ fn build_hash_csr<P: PackedPs>(
                     .unwrap();
             let mut buf_len = [0u8; NUM_PARTITIONS];
 
-            for_each_canonical_kmer(data, start, end, wl, lut, |canon, pos, strand| {
+            for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, pos, strand| {
                 let p = (fmix64(canon) >> 56) as usize;
                 let idx = buf_len[p] as usize;
                 buf_k[p][idx] = canon;
@@ -1219,7 +1383,7 @@ fn build_hash_csr<P: PackedPs>(
         word_length: wl,
         freq_limit,
         soft_mask,
-        ref_data_len: data.len(),
+        ref_data_len: seq.len,
         total_kmers,
         kept_entries,
         kind: RefIndexKind::HashCsr {
@@ -1255,16 +1419,21 @@ mod tests {
     use super::*;
 
     fn encode_kmer(s: &[u8]) -> (u64, u64) {
-        let lut = base_lut(true);
         let wl = s.len();
         let mask = kmer_mask(wl);
         let rc_shift = (2 * (wl - 1)) as u32;
         let mut kf = 0u64;
         let mut kr = 0u64;
         for &b in s {
-            let v = lut[b as usize];
-            kf = ((kf << 2) | (v as u64)) & mask;
-            kr = (kr >> 2) | (((v ^ 3) as u64) << rc_shift);
+            let v: u64 = match b {
+                b'A' => 0,
+                b'C' => 1,
+                b'G' => 2,
+                b'T' => 3,
+                _ => panic!("invalid base"),
+            };
+            kf = ((kf << 2) | v) & mask;
+            kr = (kr >> 2) | ((v ^ 3) << rc_shift);
         }
         (kf, kr)
     }

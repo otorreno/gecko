@@ -244,6 +244,8 @@ uint32_t gpu_query_tile_left_maximal(
     uint8_t *d_hit_flags,
     uint32_t *d_hit_count,
     uint32_t *d_filt_count,
+    void *&d_cub_temp,
+    size_t &cub_temp_cap,
     uint32_t max_hits,
     uint32_t &out_raw_leftmax,
     bool &out_overflowed

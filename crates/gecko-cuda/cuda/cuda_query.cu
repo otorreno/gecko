@@ -173,6 +173,19 @@ static __global__ void filter_sorted_hits_kernel(
     }
 }
 
+static void ensure_cub_temp(void *&d_temp, size_t &cap, size_t needed) {
+    if (needed <= cap) return;
+    if (d_temp) {
+        CUDA_CHECK_VOID(cudaFree(d_temp));
+        d_temp = nullptr;
+        cap = 0;
+    }
+    /* Round up to 4 MiB boundary to avoid repeated reallocations as hit counts grow */
+    size_t alloc_bytes = (needed + (4ULL << 20) - 1ULL) & ~((4ULL << 20) - 1ULL);
+    CUDA_CHECK_VOID(cudaMalloc(&d_temp, alloc_bytes));
+    cap = alloc_bytes;
+}
+
 uint32_t gpu_query_tile_left_maximal(
     const GpuSeqView &seqX,
     const GpuSeqView &seqY,
@@ -186,6 +199,8 @@ uint32_t gpu_query_tile_left_maximal(
     uint8_t *d_hit_flags,
     uint32_t *d_hit_count,
     uint32_t *d_filt_count,
+    void *&d_cub_temp,
+    size_t &cub_temp_cap,
     uint32_t max_hits,
     uint32_t &out_raw_leftmax,
     bool &out_overflowed
@@ -212,22 +227,20 @@ uint32_t gpu_query_tile_left_maximal(
     out_raw_leftmax = h_nhits;
     if (h_nhits <= 1) return h_nhits;
 
-    void *d_temp = nullptr;
-    size_t temp_bytes = 0;
-    cub::DeviceRadixSort::SortKeys(nullptr, temp_bytes, d_hits, d_hits_sorted, (int)h_nhits);
-    CUDA_CHECK_VOID(cudaMalloc(&d_temp, temp_bytes));
-    cub::DeviceRadixSort::SortKeys(d_temp, temp_bytes, d_hits, d_hits_sorted, (int)h_nhits);
-    CUDA_CHECK_VOID(cudaFree(d_temp));
+    int end_bit = compare_reverse ? 64 : 63;
+    size_t sort_bytes = 0;
+    cub::DeviceRadixSort::SortKeys(nullptr, sort_bytes, d_hits, d_hits_sorted, (int)h_nhits, 0, end_bit);
+    size_t sel_bytes = 0;
+    cub::DeviceSelect::Flagged(nullptr, sel_bytes, d_hits_sorted, d_hit_flags, d_hits, d_filt_count, (int)h_nhits);
+    size_t need_bytes = (sort_bytes > sel_bytes) ? sort_bytes : sel_bytes;
+    ensure_cub_temp(d_cub_temp, cub_temp_cap, need_bytes);
+
+    cub::DeviceRadixSort::SortKeys(d_cub_temp, sort_bytes, d_hits, d_hits_sorted, (int)h_nhits, 0, end_bit);
 
     filter_sorted_hits_kernel<<<(h_nhits + 255) / 256, 256>>>(
         d_hits_sorted, h_nhits, (uint32_t)(wl / 2), d_hit_flags);
 
-    d_temp = nullptr;
-    temp_bytes = 0;
-    cub::DeviceSelect::Flagged(nullptr, temp_bytes, d_hits_sorted, d_hit_flags, d_hits, d_filt_count, (int)h_nhits);
-    CUDA_CHECK_VOID(cudaMalloc(&d_temp, temp_bytes));
-    cub::DeviceSelect::Flagged(d_temp, temp_bytes, d_hits_sorted, d_hit_flags, d_hits, d_filt_count, (int)h_nhits);
-    CUDA_CHECK_VOID(cudaFree(d_temp));
+    cub::DeviceSelect::Flagged(d_cub_temp, sel_bytes, d_hits_sorted, d_hit_flags, d_hits, d_filt_count, (int)h_nhits);
 
     uint32_t h_nfilt = 0;
     CUDA_CHECK_VOID(cudaMemcpy(&h_nfilt, d_filt_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));

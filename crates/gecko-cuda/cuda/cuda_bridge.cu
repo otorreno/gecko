@@ -101,6 +101,8 @@ struct GeckoCudaScratch {
     uint32_t *d_filt_count = nullptr;
     uint32_t *d_long_count = nullptr;
     uint32_t *d_frag_count = nullptr;
+    void *d_cub_temp = nullptr;
+    size_t cub_temp_cap = 0;
     bool allocated = false;
 };
 
@@ -129,6 +131,7 @@ static void free_scratch(GeckoCudaScratch &sc) {
     if (sc.d_filt_count) cudaFree(sc.d_filt_count);
     if (sc.d_long_count) cudaFree(sc.d_long_count);
     if (sc.d_frag_count) cudaFree(sc.d_frag_count);
+    if (sc.d_cub_temp) cudaFree(sc.d_cub_temp);
     sc = GeckoCudaScratch{};
 }
 
@@ -327,6 +330,7 @@ extern "C" int gecko_cuda_query_and_extend(
             h->wl, h->compare_reverse,
             tile_start, tile_end,
             d_hits, d_hits_sorted, d_hit_flags, d_hit_count, d_filt_count,
+            h->scratch.d_cub_temp, h->scratch.cub_temp_cap,
             (uint32_t)GECKO_MAX_TILE_HITS, raw_leftmax, hit_overflow);
         if (hit_overflow && (tile_end - tile_start) > 1) {
             uint64_t mid = tile_start + (tile_end - tile_start) / 2;

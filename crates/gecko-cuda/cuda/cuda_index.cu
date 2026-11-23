@@ -326,17 +326,28 @@ GpuRefIndex gpu_build_ref_index(
     CUDA_CHECK_VOID(cudaMalloc(&d_chunk_counts, (size_t)(num_chunks > 0 ? num_chunks : 1) * sizeof(uint32_t)));
     CUDA_CHECK_VOID(cudaMalloc(&d_chunk_offsets, (size_t)(num_chunks + 1) * sizeof(uint32_t)));
 
+    void *d_cub_temp = nullptr;
+    size_t cub_temp_cap = 0;
+    auto ensure_idx_temp = [&](size_t needed) {
+        if (needed <= cub_temp_cap) return;
+        if (d_cub_temp) {
+            CUDA_CHECK_VOID(cudaFree(d_cub_temp));
+            d_cub_temp = nullptr;
+            cub_temp_cap = 0;
+        }
+        CUDA_CHECK_VOID(cudaMalloc(&d_cub_temp, needed));
+        cub_temp_cap = needed;
+    };
+
     if (num_chunks > 0) {
         count_valid_kmers_kernel<<<(num_chunks + 255) / 256, 256>>>(
             seqY, wl, num_chunks, d_chunk_counts);
         CUDA_CHECK_VOID(cudaGetLastError());
 
-        void *d_temp = nullptr;
         size_t temp_bytes = 0;
         cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes, d_chunk_counts, d_chunk_offsets, num_chunks);
-        CUDA_CHECK_VOID(cudaMalloc(&d_temp, temp_bytes));
-        cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_chunk_counts, d_chunk_offsets, num_chunks);
-        CUDA_CHECK_VOID(cudaFree(d_temp));
+        ensure_idx_temp(temp_bytes);
+        cub::DeviceScan::ExclusiveSum(d_cub_temp, temp_bytes, d_chunk_counts, d_chunk_offsets, num_chunks);
 
         uint32_t last_off = 0, last_cnt = 0;
         CUDA_CHECK_VOID(cudaMemcpy(&last_off, d_chunk_offsets + (num_chunks - 1), sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -364,12 +375,10 @@ GpuRefIndex gpu_build_ref_index(
     cub::DoubleBuffer<uint32_t> db_vals(d_vals_a, d_vals_b);
 
     if (idx.n_valid > 1) {
-        void *d_temp = nullptr;
         size_t temp_bytes = 0;
         cub::DeviceRadixSort::SortPairs(nullptr, temp_bytes, db_keys, db_vals, (int)idx.n_valid);
-        CUDA_CHECK_VOID(cudaMalloc(&d_temp, temp_bytes));
-        cub::DeviceRadixSort::SortPairs(d_temp, temp_bytes, db_keys, db_vals, (int)idx.n_valid);
-        CUDA_CHECK_VOID(cudaFree(d_temp));
+        ensure_idx_temp(temp_bytes);
+        cub::DeviceRadixSort::SortPairs(d_cub_temp, temp_bytes, db_keys, db_vals, (int)idx.n_valid);
     }
 
     uint64_t *d_sorted_keys = db_keys.Current();
@@ -388,14 +397,13 @@ GpuRefIndex gpu_build_ref_index(
         mark_freq_filter_kernel<<<(idx.n_valid + 255) / 256, 256>>>(
             d_sorted_keys, d_sorted_vals, idx.n_valid, freq_limit, d_keep);
 
-        void *d_temp = nullptr;
         size_t temp_bytes = 0, temp_bytes2 = 0;
         cub::DeviceSelect::Flagged(nullptr, temp_bytes, d_sorted_keys, d_keep, d_alt_keys, d_num_out, (int)idx.n_valid);
         cub::DeviceSelect::Flagged(nullptr, temp_bytes2, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
-        if (temp_bytes2 > temp_bytes) temp_bytes = temp_bytes2;
-        CUDA_CHECK_VOID(cudaMalloc(&d_temp, temp_bytes));
-        cub::DeviceSelect::Flagged(d_temp, temp_bytes, d_sorted_keys, d_keep, d_alt_keys, d_num_out, (int)idx.n_valid);
-        cub::DeviceSelect::Flagged(d_temp, temp_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
+        size_t need_sel = (temp_bytes2 > temp_bytes) ? temp_bytes2 : temp_bytes;
+        ensure_idx_temp(need_sel);
+        cub::DeviceSelect::Flagged(d_cub_temp, temp_bytes, d_sorted_keys, d_keep, d_alt_keys, d_num_out, (int)idx.n_valid);
+        cub::DeviceSelect::Flagged(d_cub_temp, temp_bytes2, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
         CUDA_CHECK_VOID(cudaMemcpy(&idx.n_kept, d_num_out, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
         if (idx.n_kept < idx.n_valid && lenY > 0) {
@@ -407,12 +415,12 @@ GpuRefIndex gpu_build_ref_index(
             CUDA_CHECK_VOID(cudaGetLastError());
         }
 
-        CUDA_CHECK_VOID(cudaFree(d_temp));
         CUDA_CHECK_VOID(cudaFree(d_keep));
         CUDA_CHECK_VOID(cudaFree(d_num_out));
         std::swap(d_sorted_keys, d_alt_keys);
         std::swap(d_sorted_vals, d_alt_vals);
     }
+    if (d_cub_temp) CUDA_CHECK_VOID(cudaFree(d_cub_temp));
     CUDA_CHECK_VOID(cudaFree(d_alt_keys));
     CUDA_CHECK_VOID(cudaFree(d_alt_vals));
 

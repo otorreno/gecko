@@ -41,7 +41,7 @@ pub struct BackendRunOutput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectedBackend {
+pub enum SelectedBackend {
     Cuda,
     Wgpu,
     Cpu,
@@ -110,7 +110,7 @@ pub fn print_backends(allow_software_gpu: bool) {
     println!("  cpu  : AVAILABLE - {}", cpu_label());
 }
 
-fn resolve_backend(
+pub fn resolve_backend(
     requested: BackendArg,
     allow_software_gpu: bool,
     config: &CompareConfig,

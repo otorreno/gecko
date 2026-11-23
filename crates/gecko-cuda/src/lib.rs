@@ -188,7 +188,7 @@ mod ffi {
         ) -> *mut GeckoCudaRefHandle;
 
         fn gecko_cuda_query_and_extend(
-            handle: *const GeckoCudaRefHandle,
+            handle: *mut GeckoCudaRefHandle,
             query_seq: *const GeckoPackedSeqHost,
             min_len: u32,
             sim_th: f32,
@@ -202,7 +202,7 @@ mod ffi {
         fn gecko_cuda_free_frags(frags: *mut GpuFrag);
     }
 
-    struct RefGuard(*mut GeckoCudaRefHandle);
+    pub struct RefGuard(*mut GeckoCudaRefHandle);
     impl Drop for RefGuard {
         fn drop(&mut self) {
             if !self.0.is_null() {
@@ -356,75 +356,105 @@ mod ffi {
         }
     }
 
+    pub struct PreparedRefInner<'a> {
+        handle: RefGuard,
+        reference: &'a Genome,
+        soft_mask: bool,
+    }
+
+    impl<'a> PreparedRefInner<'a> {
+        pub fn build(
+            reference: &'a Genome,
+            config: &CompareConfig,
+        ) -> Result<(Self, CudaDeviceInfo)> {
+            validate_cuda_config(config)?;
+            if reference.seq.len >= (1usize << 31) {
+                return Err(GeckoError::InvalidParameter(
+                    "CUDA backend requires reference < 2.14 Gb".into(),
+                ));
+            }
+            let info = probe_cuda().map_err(GeckoError::InvalidParameter)?;
+            let handle = {
+                let ref_view = HostPackedView::new(reference, config.soft_mask);
+                let ref_ffi = ref_view.as_ffi();
+                RefGuard(unsafe {
+                    gecko_cuda_prepare_ref(
+                        &ref_ffi,
+                        config.word_length as c_int,
+                        config.freq_limit as u32,
+                        c_int::from(config.soft_mask),
+                        c_int::from(config.compare_reverse),
+                    )
+                })
+            };
+            if handle.0.is_null() {
+                return Err(GeckoError::InvalidParameter(
+                    "CUDA reference index preparation failed".into(),
+                ));
+            }
+            Ok((
+                Self {
+                    handle,
+                    reference,
+                    soft_mask: config.soft_mask,
+                },
+                info,
+            ))
+        }
+
+        pub fn query(&mut self, query: &Genome, config: &CompareConfig) -> Result<CompareResult> {
+            validate_cuda_config(config)?;
+            if query.seq.len >= (1usize << 31) {
+                return Err(GeckoError::InvalidParameter(
+                    "CUDA backend requires query < 2.14 Gb".into(),
+                ));
+            }
+            let min_len = if config.fixed_length {
+                config.min_length
+            } else {
+                let shorter = query.total_bases.min(self.reference.total_bases);
+                ((shorter as f64) * (config.min_length as f64 / 100.0)) as u64
+            };
+            let mut raw = GeckoCudaResult::default();
+            let rc = {
+                let q_view = HostPackedView::new(query, self.soft_mask);
+                let q_ffi = q_view.as_ffi();
+                unsafe {
+                    gecko_cuda_query_and_extend(
+                        self.handle.0,
+                        &q_ffi,
+                        min_len as u32,
+                        config.min_similarity,
+                        config.scoring.match_score as c_int,
+                        config.scoring.mismatch_penalty as c_int,
+                        config.scoring.n_penalty as c_int,
+                        &mut raw,
+                    )
+                }
+            };
+            if rc != 0 {
+                if !raw.frags.is_null() {
+                    unsafe { gecko_cuda_free_frags(raw.frags) };
+                }
+                return Err(GeckoError::InvalidParameter(format!(
+                    "CUDA query/extend execution failed (rc={rc})"
+                )));
+            }
+            let result = finalize_cuda_result(query, self.reference, config, &raw);
+            if !raw.frags.is_null() {
+                unsafe { gecko_cuda_free_frags(raw.frags) };
+            }
+            Ok(result)
+        }
+    }
+
     pub fn compare_cuda(
         query: &Genome,
         reference: &Genome,
         config: &CompareConfig,
     ) -> Result<(CompareResult, CudaDeviceInfo)> {
-        validate_cuda_config(config)?;
-        if query.seq.len >= (1usize << 31) || reference.seq.len >= (1usize << 31) {
-            return Err(GeckoError::InvalidParameter(
-                "CUDA backend requires sequences < 2.14 Gb".into(),
-            ));
-        }
-        let info = probe_cuda().map_err(GeckoError::InvalidParameter)?;
-
-        let handle = {
-            let ref_view = HostPackedView::new(reference, config.soft_mask);
-            let ref_ffi = ref_view.as_ffi();
-            RefGuard(unsafe {
-                gecko_cuda_prepare_ref(
-                    &ref_ffi,
-                    config.word_length as c_int,
-                    config.freq_limit as u32,
-                    c_int::from(config.soft_mask),
-                    c_int::from(config.compare_reverse),
-                )
-            })
-        };
-        if handle.0.is_null() {
-            return Err(GeckoError::InvalidParameter(
-                "CUDA reference index preparation failed".into(),
-            ));
-        }
-
-        let min_len = if config.fixed_length {
-            config.min_length
-        } else {
-            let shorter = query.total_bases.min(reference.total_bases);
-            ((shorter as f64) * (config.min_length as f64 / 100.0)) as u64
-        };
-
-        let mut raw = GeckoCudaResult::default();
-        let rc = {
-            let q_view = HostPackedView::new(query, config.soft_mask);
-            let q_ffi = q_view.as_ffi();
-            unsafe {
-                gecko_cuda_query_and_extend(
-                    handle.0,
-                    &q_ffi,
-                    min_len as u32,
-                    config.min_similarity,
-                    config.scoring.match_score as c_int,
-                    config.scoring.mismatch_penalty as c_int,
-                    config.scoring.n_penalty as c_int,
-                    &mut raw,
-                )
-            }
-        };
-        if rc != 0 {
-            if !raw.frags.is_null() {
-                unsafe { gecko_cuda_free_frags(raw.frags) };
-            }
-            return Err(GeckoError::InvalidParameter(format!(
-                "CUDA query/extend execution failed (rc={rc})"
-            )));
-        }
-
-        let result = finalize_cuda_result(query, reference, config, &raw);
-        if !raw.frags.is_null() {
-            unsafe { gecko_cuda_free_frags(raw.frags) };
-        }
+        let (mut prepared, info) = PreparedRefInner::build(reference, config)?;
+        let result = prepared.query(query, config)?;
         Ok((result, info))
     }
 
@@ -514,6 +544,51 @@ mod ffi {
             unsafe { gecko_cuda_free_frags(raw.frags) };
         }
         Ok((query, reference, result, info))
+    }
+}
+
+/// VRAM-resident prepared CUDA reference index + pooled tile scratch workspace.
+///
+/// Build once per reference genome and call [`CudaPreparedRef::query`] across arbitrarily many
+/// query genomes (e.g., all-vs-all matrices) without rebuilding the GPU index or reallocating
+/// tile scratch buffers.
+pub struct CudaPreparedRef<'a> {
+    #[cfg(has_cuda_kernels)]
+    inner: ffi::PreparedRefInner<'a>,
+    #[cfg(not(has_cuda_kernels))]
+    _marker: std::marker::PhantomData<&'a Genome>,
+}
+
+impl<'a> CudaPreparedRef<'a> {
+    /// Upload `reference` to VRAM and build its canonical GPU Hash-CSR index once.
+    pub fn build(reference: &'a Genome, config: &CompareConfig) -> Result<(Self, CudaDeviceInfo)> {
+        #[cfg(has_cuda_kernels)]
+        {
+            let (inner, info) = ffi::PreparedRefInner::build(reference, config)?;
+            Ok((Self { inner }, info))
+        }
+        #[cfg(not(has_cuda_kernels))]
+        {
+            let _ = (reference, config);
+            Err(gecko_core::error::GeckoError::InvalidParameter(
+                "CUDA backend not compiled in (rebuild with `--features cuda`)".into(),
+            ))
+        }
+    }
+
+    /// Query `query` against the VRAM-resident reference index, reusing pooled scratch buffers.
+    pub fn query(&mut self, query: &Genome, config: &CompareConfig) -> Result<CompareResult> {
+        #[cfg(has_cuda_kernels)]
+        {
+            self.inner.query(query, config)
+        }
+        #[cfg(not(has_cuda_kernels))]
+        {
+            let _ = (query, config);
+            Err(gecko_core::error::GeckoError::InvalidParameter(
+                "CUDA backend not compiled in (rebuild with `--features cuda`)".into(),
+            ))
+        }
     }
 }
 

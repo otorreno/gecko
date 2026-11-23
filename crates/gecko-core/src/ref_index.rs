@@ -114,20 +114,22 @@ impl PosStrandVec {
 #[derive(Debug, Clone)]
 pub(crate) enum RefIndexKind {
     /// Direct CSR indexed by canonical key directly (zero key storage).
-    /// `offsets` has `256 * (sub_keys + 1)` entries so each of the 256 partitions has its own
-    /// sentinel slot (`b_idx = key + (key >> sub_bits)`).
+    /// `offsets` has `n_parts * (sub_keys + 1)` entries so each coarse partition has its own
+    /// sentinel slot (`b_idx = b_local + (b_local >> sub_bits)`).
     DirectCsr {
         sub_bits: u32,
         offsets: Vec<u32>,
         pos_strand: PosStrandVec,
     },
     /// 2-level parallel radix-partitioned Hash-CSR keyed by `fmix64(canonical_key)`.
-    /// `offsets` has `256 * (2^(P - 8) + 1)` entries (`b_idx = b + (b >> (P - 8))`).
+    /// Stores 32-bit hash tags (`fmix64(canon) as u32`, padded with 8 trailing sentinel zeros for
+    /// branchless 8-wide AVX2 probing), halving key memory vs `Vec<u64>` while preserving exact
+    /// global `freq_limit` filtering and 100% bit-exact seed verification on uncovered hits.
     HashCsr {
         sub_bits: u32,
         hash_shift: u32,
         offsets: Vec<u32>,
-        keys: Vec<u64>,
+        tags: Vec<u32>,
         pos_strand: PosStrandVec,
     },
 }
@@ -136,6 +138,8 @@ pub(crate) enum RefIndexKind {
 ///
 /// Indexes only Reference Y once at `word_length` (`4..=32`) using canonical keys
 /// `min(kf, kr)` and a 1-bit strand flag `(kr < kf)`, with per-strand `freq_limit` filtering.
+/// Supports exact global-`freq_limit` multi-slab streaming by restricting to a contiguous range
+/// of coarse hash/prefix partitions `[part_start .. part_end)` within `0..256`.
 #[derive(Debug, Clone)]
 pub struct RefIndex {
     pub word_length: usize,
@@ -144,6 +148,8 @@ pub struct RefIndex {
     pub ref_data_len: usize,
     pub total_kmers: usize,
     pub kept_entries: usize,
+    pub part_start: u16,
+    pub part_end: u16,
     pub(crate) kind: RefIndexKind,
 }
 
@@ -242,6 +248,87 @@ pub fn compute_slab_ranges(
     slabs
 }
 
+/// Partition the 256 coarse k-mer partitions (`0..256`) into disjoint contiguous ranges
+/// `[part_start .. part_end)` whose k-mer counts each stay within `max_kmers_per_slab`.
+///
+/// Because every occurrence of a canonical k-mer across the entire reference maps to the same
+/// coarse partition, per-strand `freq_limit` filtering inside each slab is **100% globally exact**,
+/// and query streaming skips `(S - 1) / S` of all k-mers in O(1) before touching CSR tables.
+pub fn compute_partition_slabs(
+    reference: &Genome,
+    word_length: usize,
+    soft_mask: bool,
+    max_kmers_per_slab: usize,
+) -> Vec<(u16, u16)> {
+    let total_kmers = count_valid_kmers(reference, word_length, soft_mask);
+    if total_kmers == 0 {
+        return Vec::new();
+    }
+    let cap = max_kmers_per_slab.max(1);
+    if total_kmers <= cap {
+        return vec![(0, NUM_PARTITIONS as u16)];
+    }
+
+    if !use_direct_csr(word_length, reference.total_bases) {
+        // Hash-CSR partitions by top 8 bits of `fmix64(canon)`, which is uniform to <0.2%.
+        let num_slabs = total_kmers.div_ceil(cap).clamp(1, NUM_PARTITIONS);
+        let mut slabs = Vec::with_capacity(num_slabs);
+        for s in 0..num_slabs {
+            let ps = (s * NUM_PARTITIONS / num_slabs) as u16;
+            let pe = ((s + 1) * NUM_PARTITIONS / num_slabs) as u16;
+            if ps < pe {
+                slabs.push((ps, pe));
+            }
+        }
+        return slabs;
+    }
+
+    // Direct-CSR partitions by top 8 bits of `min(kf, kr)` (non-uniform across 0..256),
+    // so compute the exact 256-bucket histogram and greedily pack contiguous ranges <= cap.
+    let seq = &reference.seq;
+    let sub_bits = (2 * word_length - 8) as u32;
+    let max_starts = seq.len.saturating_sub(word_length - 1);
+    let ranges = make_chunk_ranges(0, max_starts, seq.len, word_length);
+    let part_totals = ranges
+        .par_iter()
+        .map(|&(start, end)| {
+            let mut counts = [0usize; NUM_PARTITIONS];
+            for_each_canonical_kmer_2bit(seq, start, end, word_length, soft_mask, |canon, _, _| {
+                counts[(canon >> sub_bits) as usize] += 1;
+            });
+            counts
+        })
+        .reduce(
+            || [0usize; NUM_PARTITIONS],
+            |mut a, b| {
+                for i in 0..NUM_PARTITIONS {
+                    a[i] += b[i];
+                }
+                a
+            },
+        );
+
+    let mut slabs = Vec::new();
+    let mut p_start = 0usize;
+    let mut acc = 0usize;
+    for (p, &cnt) in part_totals.iter().enumerate() {
+        if cnt == 0 {
+            continue;
+        }
+        if acc > 0 && acc + cnt > cap {
+            slabs.push((p_start as u16, p as u16));
+            p_start = p;
+            acc = cnt;
+        } else {
+            acc += cnt;
+        }
+    }
+    if p_start < NUM_PARTITIONS {
+        slabs.push((p_start as u16, NUM_PARTITIONS as u16));
+    }
+    slabs
+}
+
 impl RefIndex {
     /// Estimate peak RAM in bytes for a known `total_kmers` count.
     fn estimate_bytes_for_kmers(
@@ -281,13 +368,15 @@ impl RefIndex {
             let p = choose_bucket_bits(total_kmers);
             let sub_buckets = 1usize << (p - 8);
             let offsets_bytes = NUM_PARTITIONS * (sub_buckets + 1) * std::mem::size_of::<u32>();
-            let keys_bytes = total_kmers.saturating_mul(std::mem::size_of::<u64>());
+            // Steady-state HashCsr stores 4-byte `tags: Vec<u32>`, while Pass 1b/2 holds transient
+            // per-partition `u64` keys (freed partition-by-partition as `tags` pages are written).
+            let peak_key_bytes = total_kmers.saturating_mul(std::mem::size_of::<u64>());
             let ps_total = total_kmers.saturating_mul(ps_bytes);
             let scratch_per_part =
                 (total_kmers / NUM_PARTITIONS).max(1) * (std::mem::size_of::<u64>() + ps_bytes);
             let scratch_bytes = threads.saturating_mul(scratch_per_part + sub_buckets * 8);
             offsets_bytes
-                .saturating_add(keys_bytes)
+                .saturating_add(peak_key_bytes)
                 .saturating_add(ps_total)
                 .saturating_add(scratch_bytes.max(rev_bytes))
         }
@@ -340,7 +429,8 @@ impl RefIndex {
         } else {
             8usize
         };
-        // Hash-CSR ~ (8 + ps_bytes) + ~1.5B offsets + scratch headroom; Direct CSR <= that.
+        // Peak build RAM per k-mer: Hash-CSR transient u64 keys (8 B, shrunk to 4 B tags) +
+        // pos_strand + offsets/scratch headroom; Direct-CSR <= that.
         let bytes_per_kmer = if use_direct_csr(word_length, reference.total_bases) {
             ps_bytes + 5
         } else {
@@ -362,11 +452,41 @@ impl RefIndex {
         freq_limit: u64,
         soft_mask: bool,
     ) -> Result<Self> {
+        Self::build_partitions(
+            reference,
+            0,
+            NUM_PARTITIONS as u16,
+            word_length,
+            freq_limit,
+            soft_mask,
+        )
+    }
+
+    /// Build a canonical reference index covering all valid k-mers of `reference` whose coarse
+    /// partition falls in `[part_start .. part_end)` (within `0..256`), guaranteeing globally exact
+    /// per-strand `freq_limit` filtering across multi-slab runs.
+    pub fn build_partitions(
+        reference: &Genome,
+        part_start: u16,
+        part_end: u16,
+        word_length: usize,
+        freq_limit: u64,
+        soft_mask: bool,
+    ) -> Result<Self> {
         let max_starts = reference
             .seq
             .len
             .saturating_sub(word_length.saturating_sub(1));
-        Self::build_range(reference, 0, max_starts, word_length, freq_limit, soft_mask)
+        Self::build_range_partitions(
+            reference,
+            0,
+            max_starts,
+            part_start as usize,
+            part_end as usize,
+            word_length,
+            freq_limit,
+            soft_mask,
+        )
     }
 
     /// Build a canonical reference index covering valid k-mers whose start positions lie in
@@ -379,9 +499,37 @@ impl RefIndex {
         freq_limit: u64,
         soft_mask: bool,
     ) -> Result<Self> {
+        Self::build_range_partitions(
+            reference,
+            slab_start,
+            slab_end,
+            0,
+            NUM_PARTITIONS,
+            word_length,
+            freq_limit,
+            soft_mask,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_range_partitions(
+        reference: &Genome,
+        slab_start: usize,
+        slab_end: usize,
+        part_start: usize,
+        part_end: usize,
+        word_length: usize,
+        freq_limit: u64,
+        soft_mask: bool,
+    ) -> Result<Self> {
         if !(4..=32).contains(&word_length) {
             return Err(GeckoError::InvalidParameter(format!(
                 "word_length must be between 4 and 32, got {word_length}"
+            )));
+        }
+        if part_start >= part_end || part_end > NUM_PARTITIONS {
+            return Err(GeckoError::InvalidParameter(format!(
+                "invalid partition range [{part_start}..{part_end})"
             )));
         }
 
@@ -392,6 +540,8 @@ impl RefIndex {
                     reference,
                     slab_start,
                     slab_end,
+                    part_start,
+                    part_end,
                     word_length,
                     freq_limit,
                     soft_mask,
@@ -401,6 +551,8 @@ impl RefIndex {
                     reference,
                     slab_start,
                     slab_end,
+                    part_start,
+                    part_end,
                     word_length,
                     freq_limit,
                     soft_mask,
@@ -411,6 +563,8 @@ impl RefIndex {
                 reference,
                 slab_start,
                 slab_end,
+                part_start,
+                part_end,
                 word_length,
                 freq_limit,
                 soft_mask,
@@ -420,6 +574,8 @@ impl RefIndex {
                 reference,
                 slab_start,
                 slab_end,
+                part_start,
+                part_end,
                 word_length,
                 freq_limit,
                 soft_mask,
@@ -437,12 +593,12 @@ impl RefIndex {
             } => offsets.capacity() * std::mem::size_of::<u32>() + pos_strand.heap_bytes(),
             RefIndexKind::HashCsr {
                 offsets,
-                keys,
+                tags,
                 pos_strand,
                 ..
             } => {
                 offsets.capacity() * std::mem::size_of::<u32>()
-                    + keys.capacity() * std::mem::size_of::<u64>()
+                    + tags.capacity() * std::mem::size_of::<u32>()
                     + pos_strand.heap_bytes()
             }
         }
@@ -454,21 +610,35 @@ impl RefIndex {
         matches!(self.kind, RefIndexKind::DirectCsr { .. })
     }
 
-    /// Compute the `offsets` index `b_idx` for a canonical k-mer key.
+    /// Compute the local `offsets` index `b_idx` for a canonical k-mer key, or `None` if the key
+    /// belongs to a partition outside `[self.part_start .. self.part_end)`.
     #[inline(always)]
-    pub(crate) fn bucket_index(&self, canon_key: u64) -> usize {
+    pub(crate) fn bucket_index(&self, canon_key: u64) -> Option<usize> {
+        let ps = self.part_start as usize;
+        let pe = self.part_end as usize;
         match &self.kind {
             RefIndexKind::DirectCsr { sub_bits, .. } => {
                 let b = canon_key as usize;
-                b + (b >> *sub_bits)
+                let p = b >> *sub_bits;
+                if p < ps || p >= pe {
+                    return None;
+                }
+                let b_local = b - (ps << *sub_bits);
+                Some(b_local + (b_local >> *sub_bits))
             }
             RefIndexKind::HashCsr {
                 sub_bits,
                 hash_shift,
                 ..
             } => {
-                let b = (fmix64(canon_key) >> *hash_shift) as usize;
-                b + (b >> *sub_bits)
+                let h = fmix64(canon_key);
+                let p = (h >> 56) as usize;
+                if p < ps || p >= pe {
+                    return None;
+                }
+                let b = (h >> *hash_shift) as usize;
+                let b_local = b - (ps << *sub_bits);
+                Some(b_local + (b_local >> *sub_bits))
             }
         }
     }
@@ -490,7 +660,7 @@ impl RefIndex {
     }
 
     /// Stage 3 probe: given bucket range `[start, end)` and `canon_key`, return the sub-range
-    /// `[lo, hi)` of exact matches in `pos_strand` (and reference to `pos_strand`).
+    /// `[lo, hi)` of matching entries in `pos_strand` (and reference to `pos_strand`).
     #[inline(always)]
     pub(crate) fn probe_bucket(
         &self,
@@ -502,9 +672,10 @@ impl RefIndex {
         match &self.kind {
             RefIndexKind::DirectCsr { pos_strand, .. } => (start, end, pos_strand),
             RefIndexKind::HashCsr {
-                keys, pos_strand, ..
+                tags, pos_strand, ..
             } => {
-                let (lo, hi) = probe_sorted_keys(keys, start, end, canon_key, use_avx2);
+                let tag = fmix64(canon_key) as u32;
+                let (lo, hi) = probe_sorted_tags(tags, start, end, tag, use_avx2);
                 (lo, hi, pos_strand)
             }
         }
@@ -512,7 +683,9 @@ impl RefIndex {
 
     /// Convenience single-key lookup returning all matching `(pos_y, strand_bit)` entries.
     pub fn lookup(&self, canon_key: u64) -> Vec<(u64, u8)> {
-        let b_idx = self.bucket_index(canon_key);
+        let Some(b_idx) = self.bucket_index(canon_key) else {
+            return Vec::new();
+        };
         let (start, end) = self.bucket_range(b_idx);
         if start == end {
             return Vec::new();
@@ -526,61 +699,64 @@ impl RefIndex {
     }
 }
 
-/// Probe a sorted bucket `keys[start..end]` for exact occurrences of `key`.
+/// Probe a sorted `u32` tag bucket `tags[start..end]` for exact occurrences of `tag`.
+///
+/// Requires `tags` to have at least 8 trailing padding elements past `end` when `use_avx2` is true
+/// (guaranteed by `build_hash_csr`, which allocates `total_kmers + 8` initialized elements).
 #[inline(always)]
-pub(crate) fn probe_sorted_keys(
-    keys: &[u64],
+pub(crate) fn probe_sorted_tags(
+    tags: &[u32],
     start: usize,
     end: usize,
-    key: u64,
+    tag: u32,
     use_avx2: bool,
 ) -> (usize, usize) {
     let len = end - start;
     if len == 0 {
         return (start, start);
     }
-    if len <= 16 {
+    if len <= 32 {
         #[cfg(target_arch = "x86_64")]
-        if use_avx2 && len >= 4 {
-            // Safety: `use_avx2` verified by `is_x86_feature_detected!("avx2")`.
-            return unsafe { probe_bucket_avx2(keys, start, end, key) };
+        if use_avx2 && start + 8 <= tags.len() {
+            // Safety: `use_avx2` verified by `is_x86_feature_detected!("avx2")` and `tags` padded.
+            return unsafe { probe_bucket_u32_avx2(tags, start, end, tag) };
         }
         let _ = use_avx2;
-        return probe_bucket_linear(keys, start, end, key);
+        return probe_bucket_linear_u32(tags, start, end, tag);
     }
 
-    probe_bucket_binary(keys, start, end, key)
+    probe_bucket_binary_u32(tags, start, end, tag)
 }
 
-/// Scalar sorted-bucket probe (`<= 16` linear with early-exit, `> 16` binary search).
+/// Scalar sorted `u32` tag bucket probe (`<= 16` linear with early-exit, `> 16` binary search).
 #[inline(always)]
-pub(crate) fn probe_sorted_keys_scalar(
-    keys: &[u64],
+pub(crate) fn probe_sorted_tags_scalar(
+    tags: &[u32],
     start: usize,
     end: usize,
-    key: u64,
+    tag: u32,
 ) -> (usize, usize) {
     let len = end - start;
     if len <= 16 {
-        probe_bucket_linear(keys, start, end, key)
+        probe_bucket_linear_u32(tags, start, end, tag)
     } else {
-        probe_bucket_binary(keys, start, end, key)
+        probe_bucket_binary_u32(tags, start, end, tag)
     }
 }
 
 #[inline(always)]
-fn probe_bucket_linear(keys: &[u64], start: usize, end: usize, key: u64) -> (usize, usize) {
-    let ptr = keys.as_ptr();
+fn probe_bucket_linear_u32(tags: &[u32], start: usize, end: usize, tag: u32) -> (usize, usize) {
+    let ptr = tags.as_ptr();
     let mut i = start;
     while i < end {
-        let k = unsafe { *ptr.add(i) };
-        if k >= key {
-            if k > key {
+        let t = unsafe { *ptr.add(i) };
+        if t >= tag {
+            if t > tag {
                 return (start, start);
             }
             let lo = i;
             i += 1;
-            while i < end && unsafe { *ptr.add(i) } == key {
+            while i < end && unsafe { *ptr.add(i) } == tag {
                 i += 1;
             }
             return (lo, i);
@@ -591,103 +767,113 @@ fn probe_bucket_linear(keys: &[u64], start: usize, end: usize, key: u64) -> (usi
 }
 
 #[inline(always)]
-pub(crate) fn probe_bucket_binary(
-    keys: &[u64],
+pub(crate) fn probe_bucket_binary_u32(
+    tags: &[u32],
     start: usize,
     end: usize,
-    key: u64,
+    tag: u32,
 ) -> (usize, usize) {
-    let ptr = keys.as_ptr();
+    let ptr = tags.as_ptr();
     let mut lo = start;
     let mut hi = end;
     while lo < hi {
         let mid = lo + ((hi - lo) >> 1);
-        if unsafe { *ptr.add(mid) } < key {
+        if unsafe { *ptr.add(mid) } < tag {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
-    if lo >= end || unsafe { *ptr.add(lo) } != key {
+    if lo >= end || unsafe { *ptr.add(lo) } != tag {
         return (start, start);
     }
     let mut r_hi = lo + 1;
-    while r_hi < end && unsafe { *ptr.add(r_hi) } == key {
+    while r_hi < end && unsafe { *ptr.add(r_hi) } == tag {
         r_hi += 1;
     }
     (lo, r_hi)
 }
 
-/// Inlineable AVX2 sorted-bucket probe with early-exit on first match or key overshoot.
+/// Inlineable AVX2 8-wide sorted `u32` tag probe.
+///
+/// For the common case (`len <= 8`, ~98% of all buckets), executes a single branchless 256-bit
+/// load + `vpcmpeqd` + `vmovmskps` + length mask.
 ///
 /// # Safety
 /// Caller must run in a `#[target_feature(enable = "avx2")]` context and guarantee
-/// `start <= end <= keys.len()`.
+/// `start <= end`, `end + 8 <= tags.len()` (or `start + 8 <= tags.len()` when `len <= 8`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-pub(crate) unsafe fn probe_sorted_keys_avx2_inline(
-    keys: &[u64],
+pub(crate) unsafe fn probe_sorted_tags_avx2_inline(
+    tags: &[u32],
     start: usize,
     end: usize,
-    key: u64,
+    tag: u32,
 ) -> (usize, usize) {
     use core::arch::x86_64::*;
 
     let len = end - start;
-    if len <= 16 {
-        let ptr = keys.as_ptr();
+    let ptr = tags.as_ptr();
+    if len <= 8 {
+        let vtag = _mm256_set1_epi32(tag as i32);
+        let vcand = unsafe { _mm256_loadu_si256(ptr.add(start) as *const __m256i) };
+        let cmp = _mm256_cmpeq_epi32(vcand, vtag);
+        let valid_mask = (1u32 << len) - 1;
+        let mask = (_mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u32) & valid_mask;
+        if mask == 0 {
+            return (start, start);
+        }
+        let lo = start + mask.trailing_zeros() as usize;
+        let hi = start + (32 - mask.leading_zeros()) as usize;
+        return (lo, hi);
+    }
+    if len <= 32 {
+        let vtag = _mm256_set1_epi32(tag as i32);
         let mut j = start;
-        if len >= 4 {
-            let vkey = _mm256_set1_epi64x(key as i64);
-            while j + 4 <= end {
-                let vcand = unsafe { _mm256_loadu_si256(ptr.add(j) as *const __m256i) };
-                let cmp = _mm256_cmpeq_epi64(vcand, vkey);
-                let mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp)) as u32;
-                if mask != 0 {
-                    let lo = j + mask.trailing_zeros() as usize;
-                    if (mask & 8) == 0 {
-                        let hi = j + (32 - mask.leading_zeros()) as usize;
-                        return (lo, hi);
-                    }
-                    let mut hi = j + 4;
-                    while hi < end && unsafe { *ptr.add(hi) } == key {
-                        hi += 1;
-                    }
+        while j + 8 <= end {
+            let vcand = unsafe { _mm256_loadu_si256(ptr.add(j) as *const __m256i) };
+            let cmp = _mm256_cmpeq_epi32(vcand, vtag);
+            let mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u32;
+            if mask != 0 {
+                let lo = j + mask.trailing_zeros() as usize;
+                if (mask & 0x80) == 0 {
+                    let hi = j + (32 - mask.leading_zeros()) as usize;
                     return (lo, hi);
                 }
-                if unsafe { *ptr.add(j + 3) } > key {
-                    return (start, start);
-                }
-                j += 4;
-            }
-        }
-        // Remaining `< 4` keys in bucket: simple sorted linear scan.
-        while j < end {
-            let k = unsafe { *ptr.add(j) };
-            if k >= key {
-                if k > key {
-                    return (start, start);
-                }
-                let lo = j;
-                let mut hi = j + 1;
-                while hi < end && unsafe { *ptr.add(hi) } == key {
+                let mut hi = j + 8;
+                while hi < end && unsafe { *ptr.add(hi) } == tag {
                     hi += 1;
                 }
                 return (lo, hi);
             }
-            j += 1;
+            if unsafe { *ptr.add(j + 7) } > tag {
+                return (start, start);
+            }
+            j += 8;
+        }
+        let rem = end - j;
+        if rem > 0 {
+            let vcand = unsafe { _mm256_loadu_si256(ptr.add(j) as *const __m256i) };
+            let cmp = _mm256_cmpeq_epi32(vcand, vtag);
+            let valid_mask = (1u32 << rem) - 1;
+            let mask = (_mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u32) & valid_mask;
+            if mask != 0 {
+                let lo = j + mask.trailing_zeros() as usize;
+                let hi = j + (32 - mask.leading_zeros()) as usize;
+                return (lo, hi);
+            }
         }
         return (start, start);
     }
 
-    probe_bucket_binary(keys, start, end, key)
+    probe_bucket_binary_u32(tags, start, end, tag)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn probe_bucket_avx2(keys: &[u64], start: usize, end: usize, key: u64) -> (usize, usize) {
-    unsafe { probe_sorted_keys_avx2_inline(keys, start, end, key) }
+unsafe fn probe_bucket_u32_avx2(tags: &[u32], start: usize, end: usize, tag: u32) -> (usize, usize) {
+    unsafe { probe_sorted_tags_avx2_inline(tags, start, end, tag) }
 }
 
 // ---------------------------------------------------------------------------
@@ -742,34 +928,36 @@ fn split_by_offsets_mut<'a, T>(slice: &'a mut [T], offsets: &[usize]) -> Vec<&'a
     out
 }
 
-/// Compute global partition offsets and per-chunk partition write offsets from chunk histograms.
+/// Compute global partition offsets, per-partition totals, and per-chunk partition write offsets
+/// for `n_parts` active partitions (`n_parts <= NUM_PARTITIONS`).
 fn compute_partition_layout(
     chunk_counts: &[[usize; NUM_PARTITIONS]],
-) -> (Vec<usize>, Vec<[usize; NUM_PARTITIONS]>, usize) {
-    let mut part_totals = [0usize; NUM_PARTITIONS];
+    n_parts: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<[usize; NUM_PARTITIONS]>, usize) {
+    let mut part_totals = vec![0usize; n_parts];
     for counts in chunk_counts {
-        for p in 0..NUM_PARTITIONS {
+        for p in 0..n_parts {
             part_totals[p] += counts[p];
         }
     }
 
-    let mut part_offsets = vec![0usize; NUM_PARTITIONS + 1];
-    for p in 0..NUM_PARTITIONS {
+    let mut part_offsets = vec![0usize; n_parts + 1];
+    for p in 0..n_parts {
         part_offsets[p + 1] = part_offsets[p] + part_totals[p];
     }
-    let total = part_offsets[NUM_PARTITIONS];
+    let total = part_offsets[n_parts];
 
     let mut chunk_write = vec![[0usize; NUM_PARTITIONS]; chunk_counts.len()];
     let mut running = [0usize; NUM_PARTITIONS];
-    running.copy_from_slice(&part_offsets[..NUM_PARTITIONS]);
+    running[..n_parts].copy_from_slice(&part_offsets[..n_parts]);
     for (c, counts) in chunk_counts.iter().enumerate() {
-        chunk_write[c].copy_from_slice(&running);
-        for p in 0..NUM_PARTITIONS {
+        chunk_write[c][..n_parts].copy_from_slice(&running[..n_parts]);
+        for p in 0..n_parts {
             running[p] += counts[p];
         }
     }
 
-    (part_offsets, chunk_write, total)
+    (part_offsets, part_totals, chunk_write, total)
 }
 
 #[inline(always)]
@@ -912,32 +1100,45 @@ impl PackedPs for u64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_direct_csr_u32(
     reference: &Genome,
     slab_start: usize,
     slab_end: usize,
+    part_start: usize,
+    part_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
-    build_direct_csr::<u32>(reference, slab_start, slab_end, wl, freq_limit, soft_mask)
+    build_direct_csr::<u32>(
+        reference, slab_start, slab_end, part_start, part_end, wl, freq_limit, soft_mask,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_direct_csr_u64(
     reference: &Genome,
     slab_start: usize,
     slab_end: usize,
+    part_start: usize,
+    part_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
-    build_direct_csr::<u64>(reference, slab_start, slab_end, wl, freq_limit, soft_mask)
+    build_direct_csr::<u64>(
+        reference, slab_start, slab_end, part_start, part_end, wl, freq_limit, soft_mask,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_direct_csr<P: PackedPs>(
     reference: &Genome,
     slab_start: usize,
     slab_end: usize,
+    part_start: usize,
+    part_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
@@ -946,6 +1147,8 @@ fn build_direct_csr<P: PackedPs>(
     let sub_bits = (2 * wl - 8) as u32;
     let sub_keys = 1usize << sub_bits;
     let sub_mask = sub_keys - 1;
+    let n_parts = part_end - part_start;
+    let full_parts = part_start == 0 && part_end == NUM_PARTITIONS;
 
     let ranges = make_chunk_ranges(slab_start, slab_end, seq.len, wl);
     if ranges.is_empty() {
@@ -956,27 +1159,39 @@ fn build_direct_csr<P: PackedPs>(
             ref_data_len: seq.len,
             total_kmers: 0,
             kept_entries: 0,
+            part_start: part_start as u16,
+            part_end: part_end as u16,
             kind: RefIndexKind::DirectCsr {
                 sub_bits,
-                offsets: vec![0u32; NUM_PARTITIONS * (sub_keys + 1)],
+                offsets: vec![0u32; n_parts * (sub_keys + 1)],
                 pos_strand: P::into_vec(Vec::new()),
             },
         });
     }
 
-    // Pass 1a: parallel count into 256 coarse partitions.
+    // Pass 1a: parallel count into active coarse partitions `[part_start .. part_end)`.
     let chunk_counts: Vec<[usize; NUM_PARTITIONS]> = ranges
         .par_iter()
         .map(|&(start, end)| {
             let mut counts = [0usize; NUM_PARTITIONS];
-            for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
-                counts[(canon >> sub_bits) as usize] += 1;
-            });
+            if full_parts {
+                for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
+                    counts[(canon >> sub_bits) as usize] += 1;
+                });
+            } else {
+                for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
+                    let p = (canon >> sub_bits) as usize;
+                    if p >= part_start && p < part_end {
+                        counts[p - part_start] += 1;
+                    }
+                });
+            }
             counts
         })
         .collect();
 
-    let (part_offsets, chunk_write, total_kmers) = compute_partition_layout(&chunk_counts);
+    let (part_offsets, _part_totals, chunk_write, total_kmers) =
+        compute_partition_layout(&chunk_counts, n_parts);
     if total_kmers >= u32::MAX as usize {
         return Err(GeckoError::InvalidParameter(
             "reference slab has >= 2^32 valid k-mers; use smaller --memory budget".into(),
@@ -984,7 +1199,6 @@ fn build_direct_csr<P: PackedPs>(
     }
 
     // Pass 1b: parallel scatter with L1/L2-resident per-thread staging buffers.
-    // Allocate without single-threaded zero-fill so threads fault pages in parallel.
     let mut coarse_keys: Vec<u32> = Vec::with_capacity(total_kmers);
     let mut pos_strand: Vec<P> = Vec::with_capacity(total_kmers);
     let keys_ptr = SendMutPtr(coarse_keys.as_mut_ptr());
@@ -1011,7 +1225,11 @@ fn build_direct_csr<P: PackedPs>(
             let mut buf_len = [0u8; NUM_PARTITIONS];
 
             for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, pos, strand| {
-                let p = (canon >> sub_bits) as usize;
+                let p_glob = (canon >> sub_bits) as usize;
+                if !full_parts && (p_glob < part_start || p_glob >= part_end) {
+                    return;
+                }
+                let p = if full_parts { p_glob } else { p_glob - part_start };
                 let idx = buf_len[p] as usize;
                 buf_k[p][idx] = (canon as usize & sub_mask) as u32;
                 buf_p[p][idx] = P::pack(pos, strand);
@@ -1037,7 +1255,7 @@ fn build_direct_csr<P: PackedPs>(
                 }
             });
 
-            for p in 0..NUM_PARTITIONS {
+            for p in 0..n_parts {
                 let rem = buf_len[p] as usize;
                 if rem > 0 {
                     let dst = write_pos[p];
@@ -1057,7 +1275,7 @@ fn build_direct_csr<P: PackedPs>(
     }
 
     // Pass 2: Rayon-parallel fine-bucketing + per-strand freq_limit filtering + in-place compaction.
-    let off_len = NUM_PARTITIONS * (sub_keys + 1);
+    let off_len = n_parts * (sub_keys + 1);
     let mut offsets: Vec<u32> = Vec::with_capacity(off_len);
     let part_k_slices = split_by_offsets_mut(&mut coarse_keys, &part_offsets);
     let part_p_slices = split_by_offsets_mut(&mut pos_strand, &part_offsets);
@@ -1065,19 +1283,19 @@ fn build_direct_csr<P: PackedPs>(
         .chunks_exact_mut(sub_keys + 1)
         .collect();
 
-    let kept_entries: usize = (0..NUM_PARTITIONS)
+    let kept_entries: usize = (0..n_parts)
         .into_par_iter()
         .zip(part_k_slices.into_par_iter())
         .zip(part_p_slices.into_par_iter())
         .zip(part_off_slices.into_par_iter())
         .map_init(
             || (vec![0u32; sub_keys], vec![0u32; sub_keys], Vec::<P>::new()),
-            |(sub_counts, sub_write, scratch_ps), (((p, pk), pp), poff)| {
-                let part_start = part_offsets[p];
+            |(sub_counts, sub_write, scratch_ps), (((lp, pk), pp), poff)| {
+                let part_off = part_offsets[lp];
                 let n = pk.len();
                 if n == 0 {
                     for slot in poff.iter_mut() {
-                        slot.write(part_start as u32);
+                        slot.write(part_off as u32);
                     }
                     return 0usize;
                 }
@@ -1109,12 +1327,10 @@ fn build_direct_csr<P: PackedPs>(
                     }
                 }
 
-                // Entries within each sub-bucket are already in ascending `pos` order because
-                // Pass 1 preserved chunk order and within-chunk scan order.
                 let mut write_idx = 0usize;
                 let mut sub_start = 0usize;
                 for (slot, &cnt_u32) in poff.iter_mut().zip(sub_counts.iter()) {
-                    slot.write((part_start + write_idx) as u32);
+                    slot.write((part_off + write_idx) as u32);
                     let cnt = cnt_u32 as usize;
                     if cnt == 0 {
                         continue;
@@ -1152,13 +1368,13 @@ fn build_direct_csr<P: PackedPs>(
                     }
                     sub_start = sub_end;
                 }
-                poff[sub_keys].write((part_start + write_idx) as u32);
+                poff[sub_keys].write((part_off + write_idx) as u32);
                 write_idx
             },
         )
         .sum();
 
-    // Safety: every partition wrote all `sub_keys + 1` elements of its `poff` slice.
+    // Safety: every active partition wrote all `sub_keys + 1` elements of its `poff` slice.
     unsafe { offsets.set_len(off_len) };
 
     drop(coarse_keys);
@@ -1170,6 +1386,8 @@ fn build_direct_csr<P: PackedPs>(
         ref_data_len: seq.len,
         total_kmers,
         kept_entries,
+        part_start: part_start as u16,
+        part_end: part_end as u16,
         kind: RefIndexKind::DirectCsr {
             sub_bits,
             offsets,
@@ -1179,40 +1397,55 @@ fn build_direct_csr<P: PackedPs>(
 }
 
 // ---------------------------------------------------------------------------
-// 2-Level Parallel Radix-Partitioned Hash-CSR builder
+// 2-Level Parallel Radix-Partitioned Hash-CSR builder (32-bit tag compressed)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn build_hash_csr_u32(
     reference: &Genome,
     slab_start: usize,
     slab_end: usize,
+    part_start: usize,
+    part_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
-    build_hash_csr::<u32>(reference, slab_start, slab_end, wl, freq_limit, soft_mask)
+    build_hash_csr::<u32>(
+        reference, slab_start, slab_end, part_start, part_end, wl, freq_limit, soft_mask,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_hash_csr_u64(
     reference: &Genome,
     slab_start: usize,
     slab_end: usize,
+    part_start: usize,
+    part_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
-    build_hash_csr::<u64>(reference, slab_start, slab_end, wl, freq_limit, soft_mask)
+    build_hash_csr::<u64>(
+        reference, slab_start, slab_end, part_start, part_end, wl, freq_limit, soft_mask,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_hash_csr<P: PackedPs>(
     reference: &Genome,
     slab_start: usize,
     slab_end: usize,
+    part_start: usize,
+    part_end: usize,
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
     let seq = &reference.seq;
+    let n_parts = part_end - part_start;
+    let full_parts = part_start == 0 && part_end == NUM_PARTITIONS;
 
     let ranges = make_chunk_ranges(slab_start, slab_end, seq.len, wl);
     if ranges.is_empty() {
@@ -1226,47 +1459,73 @@ fn build_hash_csr<P: PackedPs>(
             ref_data_len: seq.len,
             total_kmers: 0,
             kept_entries: 0,
+            part_start: part_start as u16,
+            part_end: part_end as u16,
             kind: RefIndexKind::HashCsr {
                 sub_bits,
                 hash_shift: 64 - bucket_bits,
-                offsets: vec![0u32; NUM_PARTITIONS * (sub_buckets + 1)],
-                keys: Vec::new(),
+                offsets: vec![0u32; n_parts * (sub_buckets + 1)],
+                tags: vec![0u32; 8],
                 pos_strand: P::into_vec(Vec::new()),
             },
         });
     }
 
-    // Pass 1a: parallel count into 256 coarse partitions (top 8 bits of fmix64).
+    // Pass 1a: parallel count into active coarse partitions `[part_start .. part_end)` (top 8 bits of fmix64).
     let chunk_counts: Vec<[usize; NUM_PARTITIONS]> = ranges
         .par_iter()
         .map(|&(start, end)| {
             let mut counts = [0usize; NUM_PARTITIONS];
-            for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
-                let p = (fmix64(canon) >> 56) as usize;
-                counts[p] += 1;
-            });
+            if full_parts {
+                for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
+                    let p = (fmix64(canon) >> 56) as usize;
+                    counts[p] += 1;
+                });
+            } else {
+                for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
+                    let p = (fmix64(canon) >> 56) as usize;
+                    if p >= part_start && p < part_end {
+                        counts[p - part_start] += 1;
+                    }
+                });
+            }
             counts
         })
         .collect();
 
-    let (part_offsets, chunk_write, total_kmers) = compute_partition_layout(&chunk_counts);
+    let (part_offsets, part_totals, chunk_write, total_kmers) =
+        compute_partition_layout(&chunk_counts, n_parts);
     if total_kmers >= u32::MAX as usize {
         return Err(GeckoError::InvalidParameter(
             "reference slab has >= 2^32 valid k-mers; use smaller --memory budget".into(),
         ));
     }
 
-    let bucket_bits = choose_bucket_bits(total_kmers);
+    // Scale `total_kmers` to its full-256-partition equivalent so per-sub-bucket load stays ~3-4
+    // entries even when building a subset of partitions for multi-slab streaming.
+    let equiv_total = total_kmers.saturating_mul(NUM_PARTITIONS) / n_parts.max(1);
+    let bucket_bits = choose_bucket_bits(equiv_total);
     let sub_bits = bucket_bits - 8;
     let sub_buckets = 1usize << sub_bits;
     let sub_mask = sub_buckets - 1;
     let hash_shift = 64 - bucket_bits;
 
-    // Pass 1b: parallel scatter into coarse partitions using per-thread 64-entry staging buffers.
-    // Allocate without single-threaded zero-fill so threads fault pages in parallel.
-    let mut keys: Vec<u64> = Vec::with_capacity(total_kmers);
+    let sub_shift_hi = 32 - bucket_bits;
+
+    // Pass 1b: scatter rotated 64-bit hashes `h_rot = fmix64(canon).rotate_left(32)` (with the
+    // 32-bit `tag` in the high 32 bits and bucket bits in the low 32 bits) into per-partition
+    // `Vec<u64>`s. Because `fmix64` + rotate is a 64-bit bijection, Pass 2 needs ZERO `fmix64`
+    // recomputations and only ONE sort per bucket to both enforce exact 64-bit `freq_limit` and
+    // emit entries already sorted by ascending `tag`.
+    let mut part_keys: Vec<Vec<u64>> = part_totals
+        .iter()
+        .map(|&n| Vec::with_capacity(n))
+        .collect();
+    let key_ptrs: Vec<SendMutPtr<u64>> = part_keys
+        .iter_mut()
+        .map(|v| SendMutPtr(v.as_mut_ptr()))
+        .collect();
     let mut pos_strand: Vec<P> = Vec::with_capacity(total_kmers);
-    let keys_ptr = SendMutPtr(keys.as_mut_ptr());
     let ps_ptr = SendMutPtr(pos_strand.as_mut_ptr());
 
     ranges.par_iter().zip(chunk_write.par_iter()).for_each_init(
@@ -1284,71 +1543,88 @@ fn build_hash_csr<P: PackedPs>(
             (buf_k, buf_p)
         },
         |(buf_k, buf_p), (&(start, end), &init_write)| {
-            let kptr = keys_ptr;
             let pptr = ps_ptr;
             let mut write_pos = init_write;
             let mut buf_len = [0u8; NUM_PARTITIONS];
 
             for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, pos, strand| {
-                let p = (fmix64(canon) >> 56) as usize;
-                let idx = buf_len[p] as usize;
-                buf_k[p][idx] = canon;
-                buf_p[p][idx] = P::pack(pos, strand);
+                let h = fmix64(canon);
+                let p_glob = (h >> 56) as usize;
+                if !full_parts && (p_glob < part_start || p_glob >= part_end) {
+                    return;
+                }
+                let lp = if full_parts {
+                    p_glob
+                } else {
+                    p_glob - part_start
+                };
+                let idx = buf_len[lp] as usize;
+                buf_k[lp][idx] = h.rotate_left(32);
+                buf_p[lp][idx] = P::pack(pos, strand);
                 let next_len = idx + 1;
                 if next_len == STAGE_CAP {
-                    let dst = write_pos[p];
+                    let dst = write_pos[lp];
+                    let local_dst = dst - part_offsets[lp];
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            buf_k[p].as_ptr(),
-                            kptr.0.add(dst),
+                            buf_k[lp].as_ptr(),
+                            key_ptrs[lp].0.add(local_dst),
                             STAGE_CAP,
                         );
                         std::ptr::copy_nonoverlapping(
-                            buf_p[p].as_ptr(),
+                            buf_p[lp].as_ptr(),
                             pptr.0.add(dst),
                             STAGE_CAP,
                         );
                     }
-                    write_pos[p] = dst + STAGE_CAP;
-                    buf_len[p] = 0;
+                    write_pos[lp] = dst + STAGE_CAP;
+                    buf_len[lp] = 0;
                 } else {
-                    buf_len[p] = next_len as u8;
+                    buf_len[lp] = next_len as u8;
                 }
             });
 
-            for p in 0..NUM_PARTITIONS {
-                let rem = buf_len[p] as usize;
+            for lp in 0..n_parts {
+                let rem = buf_len[lp] as usize;
                 if rem > 0 {
-                    let dst = write_pos[p];
+                    let dst = write_pos[lp];
+                    let local_dst = dst - part_offsets[lp];
                     unsafe {
-                        std::ptr::copy_nonoverlapping(buf_k[p].as_ptr(), kptr.0.add(dst), rem);
-                        std::ptr::copy_nonoverlapping(buf_p[p].as_ptr(), pptr.0.add(dst), rem);
+                        std::ptr::copy_nonoverlapping(
+                            buf_k[lp].as_ptr(),
+                            key_ptrs[lp].0.add(local_dst),
+                            rem,
+                        );
+                        std::ptr::copy_nonoverlapping(buf_p[lp].as_ptr(), pptr.0.add(dst), rem);
                     }
                 }
             }
         },
     );
 
-    // Safety: Pass 1b wrote every element in `0..total_kmers` across disjoint partition chunks.
-    unsafe {
-        keys.set_len(total_kmers);
-        pos_strand.set_len(total_kmers);
+    // Safety: Pass 1b wrote every element in every partition and in `0..total_kmers`.
+    for (pk, &n) in part_keys.iter_mut().zip(part_totals.iter()) {
+        unsafe { pk.set_len(n) };
     }
+    unsafe { pos_strand.set_len(total_kmers) };
 
-    // Pass 2: Rayon-parallel fine-bucketing, tiny-bucket sort, per-strand freq_limit filter,
-    // and in-place compaction per partition.
-    let off_len = NUM_PARTITIONS * (sub_buckets + 1);
+    // Pass 2: Rayon-parallel fine-bucketing, single sort by `(h_rot, ps)`, exact 64-bit
+    // per-strand freq_limit filtering, direct 32-bit tag compaction, and immediate drop of `pk`.
+    let off_len = n_parts * (sub_buckets + 1);
     let mut offsets: Vec<u32> = Vec::with_capacity(off_len);
-    let part_k_slices = split_by_offsets_mut(&mut keys, &part_offsets);
+    let mut tags: Vec<u32> = Vec::with_capacity(total_kmers + 8);
     let part_p_slices = split_by_offsets_mut(&mut pos_strand, &part_offsets);
+    let part_tag_slices =
+        split_by_offsets_mut(&mut tags.spare_capacity_mut()[..total_kmers], &part_offsets);
     let part_off_slices: Vec<&mut [MaybeUninit<u32>]> = offsets.spare_capacity_mut()[..off_len]
         .chunks_exact_mut(sub_buckets + 1)
         .collect();
 
-    let kept_entries: usize = (0..NUM_PARTITIONS)
+    let kept_entries: usize = (0..n_parts)
         .into_par_iter()
-        .zip(part_k_slices.into_par_iter())
+        .zip(part_keys.into_par_iter())
         .zip(part_p_slices.into_par_iter())
+        .zip(part_tag_slices.into_par_iter())
         .zip(part_off_slices.into_par_iter())
         .map_init(
             || {
@@ -1360,19 +1636,21 @@ fn build_hash_csr<P: PackedPs>(
                     Vec::<(u64, P)>::new(),
                 )
             },
-            |(sub_counts, sub_write, scratch_k, scratch_p, sort_buf), (((p, pk), pp), poff)| {
-                let part_start = part_offsets[p];
+            |(sub_counts, sub_write, scratch_k, scratch_p, sort_buf_k),
+             ((((lp, pk), pp), ptag), poff)| {
+                let part_off = part_offsets[lp];
                 let n = pk.len();
                 if n == 0 {
                     for slot in poff.iter_mut() {
-                        slot.write(part_start as u32);
+                        slot.write(part_off as u32);
                     }
+                    drop(pk);
                     return 0usize;
                 }
 
                 sub_counts.fill(0);
-                for &k in pk.iter() {
-                    let sub = ((fmix64(k) >> hash_shift) as usize) & sub_mask;
+                for &h_rot in pk.iter() {
+                    let sub = (((h_rot as u32) >> sub_shift_hi) as usize) & sub_mask;
                     unsafe {
                         *sub_counts.get_unchecked_mut(sub) += 1;
                     }
@@ -1393,19 +1671,23 @@ fn build_hash_csr<P: PackedPs>(
                 }
                 for i in 0..n {
                     unsafe {
-                        let k = *pk.get_unchecked(i);
-                        let sub = ((fmix64(k) >> hash_shift) as usize) & sub_mask;
+                        let h_rot = *pk.get_unchecked(i);
+                        let sub = (((h_rot as u32) >> sub_shift_hi) as usize) & sub_mask;
                         let dst = *sub_write.get_unchecked(sub) as usize;
-                        *scratch_k.get_unchecked_mut(dst) = k;
+                        *scratch_k.get_unchecked_mut(dst) = h_rot;
                         *scratch_p.get_unchecked_mut(dst) = *pp.get_unchecked(i);
                         *sub_write.get_unchecked_mut(sub) = (dst + 1) as u32;
                     }
                 }
 
+                // Release this partition's 64-bit hashes immediately before writing 32-bit tags.
+                drop(pk);
+
+                let tag_ptr = ptag.as_mut_ptr() as *mut u32;
                 let mut write_idx = 0usize;
                 let mut sub_start = 0usize;
                 for (slot, &cnt_u32) in poff.iter_mut().zip(sub_counts.iter()) {
-                    slot.write((part_start + write_idx) as u32);
+                    slot.write((part_off + write_idx) as u32);
                     let cnt = cnt_u32 as usize;
                     if cnt == 0 {
                         continue;
@@ -1414,8 +1696,8 @@ fn build_hash_csr<P: PackedPs>(
                     if cnt == 1 {
                         if freq_limit >= 1 {
                             unsafe {
-                                *pk.get_unchecked_mut(write_idx) =
-                                    *scratch_k.get_unchecked(sub_start);
+                                *tag_ptr.add(write_idx) =
+                                    (*scratch_k.get_unchecked(sub_start) >> 32) as u32;
                                 *pp.get_unchecked_mut(write_idx) =
                                     *scratch_p.get_unchecked(sub_start);
                             }
@@ -1425,44 +1707,47 @@ fn build_hash_csr<P: PackedPs>(
                         continue;
                     }
 
-                    // Sort bucket by (key, pos_strand).
+                    // Single sort by `(h_rot, pos_strand)` simultaneously groups identical 64-bit
+                    // keys contiguously AND orders kept entries by ascending 32-bit `tag`.
                     if cnt <= 24 {
                         insertion_sort_pair(
                             &mut scratch_k[sub_start..sub_end],
                             &mut scratch_p[sub_start..sub_end],
                         );
                     } else {
-                        sort_buf.clear();
-                        sort_buf.reserve(cnt);
+                        sort_buf_k.clear();
+                        sort_buf_k.reserve(cnt);
                         for idx in sub_start..sub_end {
                             unsafe {
-                                sort_buf.push((
+                                sort_buf_k.push((
                                     *scratch_k.get_unchecked(idx),
                                     *scratch_p.get_unchecked(idx),
                                 ));
                             }
                         }
-                        sort_buf.sort_unstable();
-                        for (off, &(k, ps)) in sort_buf.iter().enumerate() {
+                        sort_buf_k.sort_unstable();
+                        for (off, &(h_rot, ps)) in sort_buf_k.iter().enumerate() {
                             unsafe {
-                                *scratch_k.get_unchecked_mut(sub_start + off) = k;
+                                *scratch_k.get_unchecked_mut(sub_start + off) = h_rot;
                                 *scratch_p.get_unchecked_mut(sub_start + off) = ps;
                             }
                         }
                     }
 
-                    // Fast path: when total bucket size <= freq_limit, no key can exceed it.
                     if (cnt as u64) <= freq_limit {
-                        pk[write_idx..write_idx + cnt]
-                            .copy_from_slice(&scratch_k[sub_start..sub_end]);
-                        pp[write_idx..write_idx + cnt]
-                            .copy_from_slice(&scratch_p[sub_start..sub_end]);
-                        write_idx += cnt;
+                        for idx in sub_start..sub_end {
+                            unsafe {
+                                *tag_ptr.add(write_idx) =
+                                    (*scratch_k.get_unchecked(idx) >> 32) as u32;
+                                *pp.get_unchecked_mut(write_idx) = *scratch_p.get_unchecked(idx);
+                            }
+                            write_idx += 1;
+                        }
                     } else {
-                        // Per-strand freq_limit filtering across runs of identical keys.
+                        // Exact 64-bit per-strand freq_limit filtering across runs of identical `h_rot`.
                         let mut r = sub_start;
                         while r < sub_end {
-                            let key = unsafe { *scratch_k.get_unchecked(r) };
+                            let h_rot = unsafe { *scratch_k.get_unchecked(r) };
                             let mut r_end = r + 1;
                             let mut cnt0 = 0u64;
                             let mut cnt1 = 0u64;
@@ -1472,7 +1757,7 @@ fn build_hash_csr<P: PackedPs>(
                                 cnt1 += 1;
                             }
                             while r_end < sub_end
-                                && unsafe { *scratch_k.get_unchecked(r_end) } == key
+                                && unsafe { *scratch_k.get_unchecked(r_end) } == h_rot
                             {
                                 if unsafe { scratch_p.get_unchecked(r_end).strand_bit() } == 0 {
                                     cnt0 += 1;
@@ -1483,20 +1768,27 @@ fn build_hash_csr<P: PackedPs>(
                             }
                             let keep0 = cnt0 <= freq_limit;
                             let keep1 = cnt1 <= freq_limit;
-                            if keep0 && keep1 {
-                                let rlen = r_end - r;
-                                pk[write_idx..write_idx + rlen]
-                                    .copy_from_slice(&scratch_k[r..r_end]);
-                                pp[write_idx..write_idx + rlen]
-                                    .copy_from_slice(&scratch_p[r..r_end]);
-                                write_idx += rlen;
-                            } else if keep0 || keep1 {
-                                for &ps in &scratch_p[r..r_end] {
-                                    let is_keep = if ps.strand_bit() == 0 { keep0 } else { keep1 };
-                                    if is_keep {
-                                        pk[write_idx] = key;
-                                        pp[write_idx] = ps;
+                            if keep0 || keep1 {
+                                let tag = (h_rot >> 32) as u32;
+                                if keep0 && keep1 {
+                                    for &ps in &scratch_p[r..r_end] {
+                                        unsafe {
+                                            *tag_ptr.add(write_idx) = tag;
+                                            *pp.get_unchecked_mut(write_idx) = ps;
+                                        }
                                         write_idx += 1;
+                                    }
+                                } else {
+                                    for &ps in &scratch_p[r..r_end] {
+                                        let is_keep =
+                                            if ps.strand_bit() == 0 { keep0 } else { keep1 };
+                                        if is_keep {
+                                            unsafe {
+                                                *tag_ptr.add(write_idx) = tag;
+                                                *pp.get_unchecked_mut(write_idx) = ps;
+                                            }
+                                            write_idx += 1;
+                                        }
                                     }
                                 }
                             }
@@ -1506,14 +1798,29 @@ fn build_hash_csr<P: PackedPs>(
 
                     sub_start = sub_end;
                 }
-                poff[sub_buckets].write((part_start + write_idx) as u32);
+                poff[sub_buckets].write((part_off + write_idx) as u32);
+                // Zero-initialize any slack entries at the tail of this partition so `tags` is
+                // 100% initialized across `[0 .. total_kmers + 8)` for wide AVX2 loads.
+                for slot in &mut ptag[write_idx..n] {
+                    slot.write(0);
+                }
                 write_idx
             },
         )
         .sum();
 
-    // Safety: every partition wrote all `sub_buckets + 1` elements of its `poff` slice.
-    unsafe { offsets.set_len(off_len) };
+    // Initialize the 8 trailing SIMD padding slots past `total_kmers`.
+    let tail_spare = &mut tags.spare_capacity_mut()[total_kmers..total_kmers + 8];
+    for slot in tail_spare.iter_mut() {
+        slot.write(0);
+    }
+
+    // Safety: every partition wrote all `sub_buckets + 1` elements of its `poff` slice and all
+    // `n` slots of its `ptag` slice, plus the 8 trailing padding slots were initialized above.
+    unsafe {
+        offsets.set_len(off_len);
+        tags.set_len(total_kmers + 8);
+    }
 
     Ok(RefIndex {
         word_length: wl,
@@ -1522,11 +1829,13 @@ fn build_hash_csr<P: PackedPs>(
         ref_data_len: seq.len,
         total_kmers,
         kept_entries,
+        part_start: part_start as u16,
+        part_end: part_end as u16,
         kind: RefIndexKind::HashCsr {
             sub_bits,
             hash_shift,
             offsets,
-            keys,
+            tags,
             pos_strand: P::into_vec(pos_strand),
         },
     })
@@ -1632,23 +1941,26 @@ mod tests {
     }
 
     #[test]
-    fn hash_csr_probe_matches_linear_and_binary_search() {
-        // Test bucket probing across sizes 1..=30 including AVX2 path.
-        let mut keys = Vec::new();
-        for k in 0u64..10 {
+    fn hash_csr_tag_probe_matches_linear_and_binary_search() {
+        // Test bucket probing across sizes 1..=40 including branchless <=8 and looped <=32 AVX2 paths.
+        let mut tags = Vec::new();
+        for k in 0u32..14 {
             for _ in 0..3 {
-                keys.push(k * 100 + 7);
+                tags.push(k * 100 + 7);
             }
         }
+        let n_valid = tags.len();
+        tags.extend_from_slice(&[0u32; 8]); // SIMD padding
+
         #[cfg(target_arch = "x86_64")]
         let has_avx2 = std::is_x86_feature_detected!("avx2");
         #[cfg(not(target_arch = "x86_64"))]
         let has_avx2 = false;
 
-        for end in 1..=keys.len() {
-            for target in [7u64, 107, 407, 907, 50, 9999] {
-                let expected = probe_bucket_linear(&keys, 0, end, target);
-                let actual = probe_sorted_keys(&keys, 0, end, target, has_avx2);
+        for end in 1..=n_valid {
+            for target in [7u32, 107, 407, 907, 1307, 50, 9999] {
+                let expected = probe_bucket_linear_u32(&tags, 0, end, target);
+                let actual = probe_sorted_tags(&tags, 0, end, target, has_avx2);
                 assert_eq!(actual, expected, "mismatch for end={end}, target={target}");
             }
         }

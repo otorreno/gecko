@@ -91,6 +91,47 @@ static void free_gpu_seq(GpuSeqBuf &s) {
     memset(&s, 0, sizeof(s));
 }
 
+struct GeckoCudaScratch {
+    uint64_t *d_hits = nullptr;
+    uint64_t *d_hits_sorted = nullptr;
+    uint64_t *d_long_seeds = nullptr;
+    uint8_t *d_hit_flags = nullptr;
+    GpuFrag *d_out_frags = nullptr;
+    uint32_t *d_hit_count = nullptr;
+    uint32_t *d_filt_count = nullptr;
+    uint32_t *d_long_count = nullptr;
+    uint32_t *d_frag_count = nullptr;
+    bool allocated = false;
+};
+
+static int ensure_scratch(GeckoCudaScratch &sc) {
+    if (sc.allocated) return 0;
+    CUDA_CHECK(cudaMalloc(&sc.d_hits, GECKO_MAX_TILE_HITS * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&sc.d_hits_sorted, GECKO_MAX_TILE_HITS * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&sc.d_long_seeds, GECKO_MAX_TILE_HITS * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&sc.d_hit_flags, GECKO_MAX_TILE_HITS * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&sc.d_out_frags, GECKO_MAX_TILE_FRAGS * sizeof(GpuFrag)));
+    CUDA_CHECK(cudaMalloc(&sc.d_hit_count, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&sc.d_filt_count, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&sc.d_long_count, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&sc.d_frag_count, sizeof(uint32_t)));
+    sc.allocated = true;
+    return 0;
+}
+
+static void free_scratch(GeckoCudaScratch &sc) {
+    if (sc.d_hits) cudaFree(sc.d_hits);
+    if (sc.d_hits_sorted) cudaFree(sc.d_hits_sorted);
+    if (sc.d_long_seeds) cudaFree(sc.d_long_seeds);
+    if (sc.d_hit_flags) cudaFree(sc.d_hit_flags);
+    if (sc.d_out_frags) cudaFree(sc.d_out_frags);
+    if (sc.d_hit_count) cudaFree(sc.d_hit_count);
+    if (sc.d_filt_count) cudaFree(sc.d_filt_count);
+    if (sc.d_long_count) cudaFree(sc.d_long_count);
+    if (sc.d_frag_count) cudaFree(sc.d_frag_count);
+    sc = GeckoCudaScratch{};
+}
+
 struct GeckoCudaRefHandle {
     GpuSeqBuf seqY;
     GpuSeqBuf seqY_rc;
@@ -98,6 +139,7 @@ struct GeckoCudaRefHandle {
     bool soft_mask;
     bool compare_reverse;
     GpuRefIndex idx;
+    GeckoCudaScratch scratch;
 };
 
 struct GeckoCudaResult {
@@ -209,7 +251,7 @@ extern "C" GeckoCudaRefHandle *gecko_cuda_prepare_ref(
 }
 
 extern "C" int gecko_cuda_query_and_extend(
-    const GeckoCudaRefHandle *h,
+    GeckoCudaRefHandle *h,
     const GeckoPackedSeqHost *query_seq,
     uint32_t min_len,
     float sim_th,
@@ -224,26 +266,26 @@ extern "C" int gecko_cuda_query_and_extend(
     out->index_valid = h->idx.n_valid;
     out->bucket_bits = h->idx.bucket_bits;
 
+    if (ensure_scratch(h->scratch) != 0) {
+        free_scratch(h->scratch);
+        return -1;
+    }
+
     GpuSeqBuf seqX{};
     if (upload_packed_seq(query_seq, seqX) != 0) {
         free_gpu_seq(seqX);
         return -1;
     }
 
-    uint64_t *d_hits = nullptr, *d_hits_sorted = nullptr, *d_long_seeds = nullptr;
-    uint8_t *d_hit_flags = nullptr;
-    uint32_t *d_hit_count = nullptr, *d_filt_count = nullptr, *d_long_count = nullptr, *d_frag_count = nullptr;
-    GpuFrag *d_out_frags = nullptr;
-
-    CUDA_CHECK(cudaMalloc(&d_hits, GECKO_MAX_TILE_HITS * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_hits_sorted, GECKO_MAX_TILE_HITS * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_long_seeds, GECKO_MAX_TILE_HITS * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_hit_flags, GECKO_MAX_TILE_HITS * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMalloc(&d_out_frags, GECKO_MAX_TILE_FRAGS * sizeof(GpuFrag)));
-    CUDA_CHECK(cudaMalloc(&d_hit_count, sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_filt_count, sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_long_count, sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_frag_count, sizeof(uint32_t)));
+    uint64_t *d_hits = h->scratch.d_hits;
+    uint64_t *d_hits_sorted = h->scratch.d_hits_sorted;
+    uint64_t *d_long_seeds = h->scratch.d_long_seeds;
+    uint8_t *d_hit_flags = h->scratch.d_hit_flags;
+    GpuFrag *d_out_frags = h->scratch.d_out_frags;
+    uint32_t *d_hit_count = h->scratch.d_hit_count;
+    uint32_t *d_filt_count = h->scratch.d_filt_count;
+    uint32_t *d_long_count = h->scratch.d_long_count;
+    uint32_t *d_frag_count = h->scratch.d_frag_count;
 
     GpuSeqView viewX = seqX.view();
     GpuSeqView viewY = h->seqY.view();
@@ -322,15 +364,6 @@ extern "C" int gecko_cuda_query_and_extend(
     CUDA_CHECK(cudaDeviceSynchronize());
 
     free_gpu_seq(seqX);
-    CUDA_CHECK(cudaFree(d_hits));
-    CUDA_CHECK(cudaFree(d_hits_sorted));
-    CUDA_CHECK(cudaFree(d_long_seeds));
-    CUDA_CHECK(cudaFree(d_hit_flags));
-    CUDA_CHECK(cudaFree(d_out_frags));
-    CUDA_CHECK(cudaFree(d_hit_count));
-    CUDA_CHECK(cudaFree(d_filt_count));
-    CUDA_CHECK(cudaFree(d_long_count));
-    CUDA_CHECK(cudaFree(d_frag_count));
 
     if (!all_frags.empty()) {
         out->frags = (GpuFrag *)malloc(all_frags.size() * sizeof(GpuFrag));
@@ -343,6 +376,7 @@ extern "C" int gecko_cuda_query_and_extend(
 
 extern "C" void gecko_cuda_free_ref(GeckoCudaRefHandle *h) {
     if (!h) return;
+    free_scratch(h->scratch);
     gpu_free_ref_index(h->idx);
     free_gpu_seq(h->seqY);
     free_gpu_seq(h->seqY_rc);

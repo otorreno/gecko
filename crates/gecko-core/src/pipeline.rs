@@ -8,7 +8,7 @@ use crate::formats::csv::ComparisonMetadata;
 use crate::formats::frags::Fragment;
 use crate::hits::{HitOptions, generate_and_consume_hits, generate_and_consume_hits_from_index};
 use crate::kmer::{DictOptions, INDEX_WORD_SIZE, KmerDict, KmerIndex};
-use crate::ref_index::{RefIndex, compute_slab_ranges};
+use crate::ref_index::{RefIndex, compute_partition_slabs};
 use crate::seq::Genome;
 use crate::stream::{compare_streaming, dedup_fragments};
 
@@ -188,16 +188,19 @@ pub fn compare_genomes(
     compare_genomes_kmer_index(query, reference, config, cache_dir)
 }
 
-/// Zero-spill Reference-Slab Streaming: partitions `reference` into disjoint slabs of at most
-/// `max_kmers_per_slab` valid k-mers, builds one [`RefIndex`] per slab while keeping full 2-bit
-/// sequences in RAM so HSP extensions cross slab boundaries seamlessly, then deduplicates.
+/// Zero-spill Hash-Partitioned Reference-Slab Streaming: partitions the 256 coarse k-mer
+/// partitions (`0..256`) into disjoint contiguous ranges `[part_start .. part_end)` each holding
+/// at most `max_kmers_per_slab` valid k-mers. Because every occurrence of a canonical k-mer across
+/// the entire reference maps to the same coarse partition, per-strand `freq_limit` filtering is
+/// **100% globally exact** (bit-identical to single-slab runs), query streaming skips `(S - 1) / S`
+/// of k-mers before touching CSR tables, and full 2-bit sequences stay in RAM for exact extension.
 pub(crate) fn compare_genomes_slab_streaming(
     query: &Genome,
     reference: &Genome,
     config: &CompareConfig,
     max_kmers_per_slab: usize,
 ) -> Result<CompareResult> {
-    let slabs = compute_slab_ranges(
+    let slabs = compute_partition_slabs(
         reference,
         config.word_length,
         config.soft_mask,
@@ -223,11 +226,11 @@ pub(crate) fn compare_genomes_slab_streaming(
         stats: CompareStats::default(),
     };
 
-    for (slab_start, slab_end) in slabs {
-        let slab_index = RefIndex::build_range(
+    for (part_start, part_end) in slabs {
+        let slab_index = RefIndex::build_partitions(
             reference,
-            slab_start,
-            slab_end,
+            part_start,
+            part_end,
             config.word_length,
             config.freq_limit,
             config.soft_mask,
@@ -702,6 +705,83 @@ mod tests {
             assert!(
                 !f_stream.is_empty(),
                 "expected non-empty fragments for wl={wl}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_slab_streaming_preserves_exact_global_freq_limit() {
+        // Place 5 copies of `rep_block` spread far apart across `r`, plus 1 unique `uniq_block`.
+        // With `freq_limit = 2`, ALL 5 copies of `rep_block` must be masked globally — even when
+        // `r` is split into many partition slabs (`max_kmers_per_slab = 250`).
+        let mut seed = 0xfeed_face_cafe_beefu64;
+        let mut next_dna = |n: usize| -> String {
+            let bases = [b'A', b'C', b'G', b'T'];
+            let mut s = String::with_capacity(n);
+            for _ in 0..n {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                s.push(bases[((seed >> 33) & 3) as usize] as char);
+            }
+            s
+        };
+
+        let rep_block = next_dna(120);
+        let uniq_block = next_dna(140);
+        let q = Genome::from_records(
+            "q",
+            [(
+                "q0",
+                format!(
+                    "{}NNNNNNNN{rep_block}NNNNNNNN{}{uniq_block}{}",
+                    next_dna(200),
+                    next_dna(200),
+                    next_dna(200)
+                ),
+            )],
+        );
+        let r = Genome::from_records(
+            "r",
+            [(
+                "r0",
+                format!(
+                    "{}NNNNNNNN{rep_block}NNNNNNNN{}NNNNNNNN{rep_block}NNNNNNNN{}{uniq_block}{}NNNNNNNN{rep_block}NNNNNNNN{}NNNNNNNN{rep_block}NNNNNNNN{}NNNNNNNN{rep_block}NNNNNNNN{}",
+                    next_dna(300),
+                    next_dna(300),
+                    next_dna(300),
+                    next_dna(300),
+                    next_dna(300),
+                    next_dna(300),
+                    next_dna(300)
+                ),
+            )],
+        );
+
+        for wl in [8usize, 16, 32] {
+            let cfg = CompareConfig {
+                min_length: 80,
+                min_similarity: 85.0,
+                word_length: wl,
+                freq_limit: 2,
+                compare_reverse: true,
+                ..Default::default()
+            };
+            let single = compare_genomes(&q, &r, &cfg, None).unwrap();
+            let multi = compare_genomes_slab_streaming(&q, &r, &cfg, 250).unwrap();
+
+            let key = |f: &Fragment| (f.strand, f.seq_x, f.seq_y, f.diag, f.x_start, f.x_end);
+            let mut f_single = single.fragments.clone();
+            let mut f_multi = multi.fragments.clone();
+            f_single.sort_by_key(key);
+            f_multi.sort_by_key(key);
+
+            assert_eq!(
+                f_multi, f_single,
+                "multi-slab violated global freq_limit invariance for wl={wl}"
+            );
+            assert_eq!(
+                f_multi.len(),
+                1,
+                "expected only uniq_block HSP (rep_block masked by FL=2) for wl={wl}"
             );
         }
     }

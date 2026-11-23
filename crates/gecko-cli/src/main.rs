@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use backend::BackendArg;
+use backend::{BackendArg, SelectedBackend};
 use clap::{Parser, Subcommand, ValueEnum};
+use rayon::prelude::*;
 use gecko_core::formats::align::{write_alignments_path, write_borders_path};
 use gecko_core::formats::csv::{
     ComparisonMetadata, read_csv_path, write_csv_path, write_inf_path, write_mat_path,
@@ -378,6 +379,14 @@ struct AllVsAllArgs {
     /// Skip pairs whose primary output file already exists.
     #[arg(long)]
     skip_existing: bool,
+
+    /// Compute backend (`auto` prefers CUDA -> hardware WGPU -> fast CPU).
+    #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
+    backend: BackendArg,
+
+    /// Allow software-emulated WGPU adapters (e.g. Lavapipe/SwiftShader) when using `--backend wgpu`.
+    #[arg(long)]
+    allow_software_gpu: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -753,16 +762,21 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
     };
     config.validate()?;
 
-    // Load all genomes once; index one reference genome `j` at a time (one canonical RefIndex
-    // instead of 2 KmerDicts per genome) to minimize peak RAM while reusing the index across
-    // all queries `0..j`.
-    let mut genomes = Vec::with_capacity(files.len());
-    for path in &files {
-        genomes.push(Genome::from_fasta_path(path)?);
-    }
+    let selected = backend::resolve_backend(args.backend, args.allow_software_gpu, &config, None)?;
+
+    // Load all 2-bit packed genomes once in parallel (0.25 B/bp -> ~550 MiB for 10 mammalian chr1s).
+    let t_load = Instant::now();
+    let genomes: Vec<Genome> = files
+        .par_iter()
+        .map(Genome::from_fasta_path)
+        .collect::<Result<Vec<_>, _>>()?;
+    let load_secs = t_load.elapsed().as_secs_f64();
 
     let total_pairs = files.len() * (files.len() - 1) / 2;
     let mut done = 0usize;
+    let mut logged_backend = false;
+    let t_comp = Instant::now();
+
     for j in 1..files.len() {
         // Check if any pair `(i, j)` actually needs running before indexing `genomes[j]`.
         let needed_queries: Vec<usize> = (0..j)
@@ -781,66 +795,187 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
             continue;
         }
 
-        let use_ref_index = RefIndex::fits_in_budget(
-            &genomes[j],
-            config.word_length,
-            config.soft_mask,
-            config.compare_reverse,
-            config.memory_budget,
-        );
-
-        let cached_ref = if use_ref_index {
-            let idx = RefIndex::build(
-                &genomes[j],
-                config.word_length,
-                config.freq_limit,
-                config.soft_mask,
-            )?;
-            let rev = if config.compare_reverse {
-                Some(genomes[j].reverse_complement())
-            } else {
-                None
-            };
-            Some((idx, rev))
-        } else {
-            None
-        };
-
-        for i in 0..j {
-            done += 1;
-            let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
-            if args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists() {
-                eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
-                continue;
+        match selected {
+            SelectedBackend::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    let (mut cuda_ref, info) =
+                        gecko_cuda::CudaPreparedRef::build(&genomes[j], &config)?;
+                    if !logged_backend {
+                        eprintln!(
+                            "Backend: cuda ({}, SM {}.{}, VRAM-resident reference reuse; loaded {} genomes in {:.2}s)",
+                            info.name,
+                            info.sm_major,
+                            info.sm_minor,
+                            genomes.len(),
+                            load_secs,
+                        );
+                        logged_backend = true;
+                    }
+                    for i in 0..j {
+                        done += 1;
+                        let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
+                        if args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists()
+                        {
+                            eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
+                            continue;
+                        }
+                        let res = cuda_ref.query(&genomes[i], &config)?;
+                        let q_fname = files[i].file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        let r_fname = files[j].file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        let meta = res.metadata(q_fname, r_fname, &genomes[i], &genomes[j], &config);
+                        write_outputs(
+                            &args.outdir,
+                            &prefix,
+                            &formats,
+                            &genomes[i],
+                            &genomes[j],
+                            &meta,
+                            &res.fragments,
+                            Some(&res.coverage),
+                        )?;
+                        eprintln!(
+                            "[{done}/{total_pairs}] {prefix}: {} fragments",
+                            res.fragments.len()
+                        );
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    bail!("CUDA backend not compiled in (rebuild with `--features cuda`)");
+                }
             }
-            let res = if let Some((ref idx, ref rev)) = cached_ref {
-                compare_with_ref_index(&genomes[i], &genomes[j], idx, rev.as_ref(), &config)?
-            } else {
-                compare_genomes(&genomes[i], &genomes[j], &config, None)?
-            };
-            let q_fname = files[i].file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let r_fname = files[j].file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let meta = res.metadata(q_fname, r_fname, &genomes[i], &genomes[j], &config);
-            write_outputs(
-                &args.outdir,
-                &prefix,
-                &formats,
-                &genomes[i],
-                &genomes[j],
-                &meta,
-                &res.fragments,
-                Some(&res.coverage),
-            )?;
-            eprintln!(
-                "[{done}/{total_pairs}] {prefix}: {} fragments",
-                res.fragments.len()
-            );
+            SelectedBackend::Wgpu => {
+                #[cfg(feature = "wgpu")]
+                {
+                    for i in 0..j {
+                        done += 1;
+                        let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
+                        if args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists()
+                        {
+                            eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
+                            continue;
+                        }
+                        let (res, info) = gecko_wgpu::compare_wgpu(
+                            &genomes[i],
+                            &genomes[j],
+                            &config,
+                            args.allow_software_gpu,
+                        )?;
+                        if !logged_backend {
+                            eprintln!(
+                                "Backend: wgpu ({}, {}; loaded {} genomes in {:.2}s)",
+                                info.name,
+                                info.backend,
+                                genomes.len(),
+                                load_secs,
+                            );
+                            logged_backend = true;
+                        }
+                        let q_fname = files[i].file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        let r_fname = files[j].file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        let meta = res.metadata(q_fname, r_fname, &genomes[i], &genomes[j], &config);
+                        write_outputs(
+                            &args.outdir,
+                            &prefix,
+                            &formats,
+                            &genomes[i],
+                            &genomes[j],
+                            &meta,
+                            &res.fragments,
+                            Some(&res.coverage),
+                        )?;
+                        eprintln!(
+                            "[{done}/{total_pairs}] {prefix}: {} fragments",
+                            res.fragments.len()
+                        );
+                    }
+                }
+                #[cfg(not(feature = "wgpu"))]
+                {
+                    bail!("WGPU backend not compiled in (rebuild with `--features wgpu`)");
+                }
+            }
+            SelectedBackend::Cpu => {
+                if !logged_backend {
+                    eprintln!(
+                        "Backend: cpu ({} threads, reusable RefIndex; loaded {} genomes in {:.2}s)",
+                        rayon::current_num_threads(),
+                        genomes.len(),
+                        load_secs,
+                    );
+                    logged_backend = true;
+                }
+                let use_ref_index = RefIndex::fits_in_budget(
+                    &genomes[j],
+                    config.word_length,
+                    config.soft_mask,
+                    config.compare_reverse,
+                    config.memory_budget,
+                );
+
+                let cached_ref = if use_ref_index {
+                    let idx = RefIndex::build(
+                        &genomes[j],
+                        config.word_length,
+                        config.freq_limit,
+                        config.soft_mask,
+                    )?;
+                    let rev = if config.compare_reverse {
+                        Some(genomes[j].reverse_complement())
+                    } else {
+                        None
+                    };
+                    Some((idx, rev))
+                } else {
+                    None
+                };
+
+                for i in 0..j {
+                    done += 1;
+                    let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
+                    if args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists() {
+                        eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
+                        continue;
+                    }
+                    let res = if let Some((ref idx, ref rev)) = cached_ref {
+                        compare_with_ref_index(
+                            &genomes[i],
+                            &genomes[j],
+                            idx,
+                            rev.as_ref(),
+                            &config,
+                        )?
+                    } else {
+                        compare_genomes(&genomes[i], &genomes[j], &config, None)?
+                    };
+                    let q_fname = files[i].file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    let r_fname = files[j].file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    let meta = res.metadata(q_fname, r_fname, &genomes[i], &genomes[j], &config);
+                    write_outputs(
+                        &args.outdir,
+                        &prefix,
+                        &formats,
+                        &genomes[i],
+                        &genomes[j],
+                        &meta,
+                        &res.fragments,
+                        Some(&res.coverage),
+                    )?;
+                    eprintln!(
+                        "[{done}/{total_pairs}] {prefix}: {} fragments",
+                        res.fragments.len()
+                    );
+                }
+            }
         }
     }
 
     eprintln!(
-        "All-vs-all complete ({total_pairs} pairs) in {:.3}s -> {}",
+        "All-vs-all complete ({total_pairs} pairs) in {:.3}s (load {:.3}s, compute {:.3}s) -> {}",
         t0.elapsed().as_secs_f64(),
+        load_secs,
+        t_comp.elapsed().as_secs_f64(),
         args.outdir.display()
     );
     Ok(())

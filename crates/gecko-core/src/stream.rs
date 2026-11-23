@@ -13,8 +13,8 @@ use crate::formats::frags::Fragment;
 use crate::hits::Hit;
 use crate::pipeline::{CompareConfig, CompareResult, CompareStats};
 use crate::ref_index::{
-    PosStrandVec, RefIndex, RefIndexKind, fmix64, prefetch_t2, probe_bucket_binary,
-    probe_sorted_keys_scalar,
+    PosStrandVec, RefIndex, RefIndexKind, fmix64, prefetch_t2, probe_bucket_binary_u32,
+    probe_sorted_tags_scalar,
 };
 use crate::seq::Genome;
 
@@ -140,14 +140,14 @@ impl PsRead for *const u64 {
     }
 }
 
-/// 32-byte batch item storing both k-mer query metadata and Stage-2 bucket `[start, end)` range
-/// in place (eliminating any separate stack range buffer or per-batch `memset`).
+/// Compact 32-byte batch item storing query metadata, 32-bit hash tag, and in-place bucket /
+/// hit range `[start, end)` across all prefetch stages.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct QueryItem {
-    canon: u64,
     pos_x: u64,
     b_idx: u32,
+    tag: u32,
     start: u32,
     end: u32,
     /// `0` = forward canonical (`kf < kr`), `1` = revcomp canonical (`kr < kf`), `2` = palindrome (`kf == kr`).
@@ -375,83 +375,92 @@ pub fn compare_streaming(
     })
 }
 
-/// Inline AVX2 sorted-bucket probe expanded directly inside `flush_hash`'s Stage 3 loop so LLVM
-/// never inserts a function call or `vzeroupper` boundary between bucket probing and diagonal-cache
-/// filtering.
+/// Inline AVX2 8-wide sorted `u32` tag probe expanded directly inside `flush_hash`'s Stage 3a
+/// loop. For `len <= 8` (~98% of all buckets), executes a single branchless 256-bit load +
+/// `vpcmpeqd` + `vmovmskps` + length mask with ZERO `vzeroupper` transitions.
 #[cfg(target_arch = "x86_64")]
 macro_rules! probe_bucket_avx2_inline {
-    ($keys:expr, $keys_ptr:expr, $start:expr, $end:expr, $key:expr) => {{
+    ($tags:expr, $tags_ptr:expr, $start:expr, $end:expr, $tag:expr) => {{
         use core::arch::x86_64::*;
 
         let start = $start;
         let end = $end;
-        let key = $key;
+        let tag = $tag;
         let len = end - start;
+        let ptr = $tags_ptr;
         'probe: {
-            if len <= 16 {
-                let ptr = $keys_ptr;
+            if len <= 8 {
+                let vtag = _mm256_set1_epi32(tag as i32);
+                let vcand = unsafe { _mm256_loadu_si256(ptr.add(start) as *const __m256i) };
+                let cmp = _mm256_cmpeq_epi32(vcand, vtag);
+                let valid_mask = (1u32 << len) - 1;
+                let mask = (_mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u32) & valid_mask;
+                if mask == 0 {
+                    break 'probe (start, start);
+                }
+                let lo = start + mask.trailing_zeros() as usize;
+                let hi = start + (32 - mask.leading_zeros()) as usize;
+                break 'probe (lo, hi);
+            }
+            if len <= 32 {
+                let vtag = _mm256_set1_epi32(tag as i32);
                 let mut j = start;
-                if len >= 4 {
-                    let vkey = _mm256_set1_epi64x(key as i64);
-                    while j + 4 <= end {
-                        let vcand = unsafe { _mm256_loadu_si256(ptr.add(j) as *const __m256i) };
-                        let cmp = _mm256_cmpeq_epi64(vcand, vkey);
-                        let mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp)) as u32;
-                        if mask != 0 {
-                            let lo = j + mask.trailing_zeros() as usize;
-                            if (mask & 8) == 0 {
-                                let hi = j + (32 - mask.leading_zeros()) as usize;
-                                break 'probe (lo, hi);
-                            }
-                            let mut hi = j + 4;
-                            while hi < end && unsafe { *ptr.add(hi) } == key {
-                                hi += 1;
-                            }
+                while j + 8 <= end {
+                    let vcand = unsafe { _mm256_loadu_si256(ptr.add(j) as *const __m256i) };
+                    let cmp = _mm256_cmpeq_epi32(vcand, vtag);
+                    let mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u32;
+                    if mask != 0 {
+                        let lo = j + mask.trailing_zeros() as usize;
+                        if (mask & 0x80) == 0 {
+                            let hi = j + (32 - mask.leading_zeros()) as usize;
                             break 'probe (lo, hi);
                         }
-                        if unsafe { *ptr.add(j + 3) } > key {
-                            break 'probe (start, start);
-                        }
-                        j += 4;
-                    }
-                }
-                while j < end {
-                    let k = unsafe { *ptr.add(j) };
-                    if k >= key {
-                        if k > key {
-                            break 'probe (start, start);
-                        }
-                        let lo = j;
-                        let mut hi = j + 1;
-                        while hi < end && unsafe { *ptr.add(hi) } == key {
+                        let mut hi = j + 8;
+                        while hi < end && unsafe { *ptr.add(hi) } == tag {
                             hi += 1;
                         }
                         break 'probe (lo, hi);
                     }
-                    j += 1;
+                    if unsafe { *ptr.add(j + 7) } > tag {
+                        break 'probe (start, start);
+                    }
+                    j += 8;
+                }
+                let rem = end - j;
+                if rem > 0 {
+                    let vcand = unsafe { _mm256_loadu_si256(ptr.add(j) as *const __m256i) };
+                    let cmp = _mm256_cmpeq_epi32(vcand, vtag);
+                    let valid_mask = (1u32 << rem) - 1;
+                    let mask = (_mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u32) & valid_mask;
+                    if mask != 0 {
+                        let lo = j + mask.trailing_zeros() as usize;
+                        let hi = j + (32 - mask.leading_zeros()) as usize;
+                        break 'probe (lo, hi);
+                    }
                 }
                 break 'probe (start, start);
             }
-            probe_bucket_binary($keys, start, end, key)
+            probe_bucket_binary_u32($tags, start, end, tag)
         }
     }};
 }
 
 macro_rules! probe_bucket_scalar_inline {
-    ($keys:expr, $_keys_ptr:expr, $start:expr, $end:expr, $key:expr) => {
-        probe_sorted_keys_scalar($keys, $start, $end, $key)
+    ($tags:expr, $_tags_ptr:expr, $start:expr, $end:expr, $tag:expr) => {
+        probe_sorted_tags_scalar($tags, $start, $end, $tag)
     };
 }
 
-/// Generate a complete, single-ISA-domain chunk scanner + 3-stage prefetched batch flusher.
+/// Generate a complete, single-ISA-domain chunk scanner + 4-stage prefetched batch flusher.
 ///
 /// `flush_hash` / `flush_direct` are kept `#[inline(never)]` and monomorphized over `PsRead`
 /// (`*const u32` vs `*const u64`) so:
-/// 1. The k-mer generator loop stays compact and register-light.
-/// 2. Bucket probing (`vpcmpeqq` with early-exit) and the 2-tier diagonal-cache check
-///    (`is_covered`, which filters ~94% of raw hits) execute inline inside Stage 3 with ZERO
-///    function calls and ZERO `vzeroupper` transitions on the hot path.
-/// 3. Only the ~6% diagonal-cache misses call out to `miss_fwd` / `miss_rev`.
+/// 1. The k-mer generator loop stays compact and skips out-of-slab partitions in O(1).
+/// 2. Stage 3a probes compact 32-bit tags (8-wide `vpcmpeqd`) and prefetches `pos_strand[lo]`
+///    for all hitting items in parallel before Stage 3b unpacks `pos_strand`.
+/// 3. Stage 3b filters ~94% of raw hits via the inline 2-tier diagonal cache, dispatching only
+///    the ~6% uncovered hits to `miss_fwd` / `miss_rev` (which verify exact `wl`-bp seed equality
+///    in 2 cycles before extending, guaranteeing 100% bit-exactness with 32-bit hash tags).
 macro_rules! impl_stream_tier {
     (
         $scan_hash:ident,
@@ -466,15 +475,17 @@ macro_rules! impl_stream_tier {
     ) => {
         $(#[$attr])*
         #[allow(clippy::too_many_arguments)]
-        unsafe fn $scan_hash<const WL32: bool, P: PsRead>(
+        unsafe fn $scan_hash<const WL32: bool, const PART_FILTER: bool, P: PsRead>(
             query: &Genome,
             reference: &Genome,
             rev_ref: Option<&Genome>,
             offsets: &[u32],
-            keys: &[u64],
+            tags: &[u32],
             ps_ptr: P,
             sub_bits: u32,
             hash_shift: u32,
+            part_start: u32,
+            part_end: u32,
             chunk_start: usize,
             chunk_end: usize,
             wl: usize,
@@ -489,6 +500,7 @@ macro_rules! impl_stream_tier {
         ) {
             let seq_x = &query.seq;
             let scan_end = (chunk_end + wl - 1).min(seq_x.len);
+            let part_bucket_base = part_start << sub_bits;
             let mut batch = [QueryItem::default(); BATCH_SIZE];
             let mut batch_len = 0usize;
 
@@ -532,13 +544,25 @@ macro_rules! impl_stream_tier {
                         } else {
                             (kf, 2u8)
                         };
-                        let b_bucket = (fmix64(canon) >> hash_shift) as u32;
+                        let h = fmix64(canon);
+                        if PART_FILTER {
+                            let p = (h >> 56) as u32;
+                            if p < part_start || p >= part_end {
+                                continue;
+                            }
+                        }
+                        let b_global = (h >> hash_shift) as u32;
+                        let b_bucket = if PART_FILTER {
+                            b_global - part_bucket_base
+                        } else {
+                            b_global
+                        };
                         let b_idx = b_bucket + (b_bucket >> sub_bits);
                         unsafe {
                             *batch.get_unchecked_mut(batch_len) = QueryItem {
-                                canon,
                                 pos_x,
                                 b_idx,
+                                tag: h as u32,
                                 start: 0,
                                 end: 0,
                                 q_kind,
@@ -553,9 +577,10 @@ macro_rules! impl_stream_tier {
                                     reference,
                                     rev_ref,
                                     offsets,
-                                    keys,
+                                    tags,
                                     ps_ptr,
                                     wl as u64,
+                                    mask,
                                     ny,
                                     max_rep,
                                     fwd_opts,
@@ -578,9 +603,10 @@ macro_rules! impl_stream_tier {
                         reference,
                         rev_ref,
                         offsets,
-                        keys,
+                        tags,
                         ps_ptr,
                         wl as u64,
+                        mask,
                         ny,
                         max_rep,
                         fwd_opts,
@@ -593,13 +619,15 @@ macro_rules! impl_stream_tier {
 
         $(#[$attr])*
         #[allow(clippy::too_many_arguments)]
-        unsafe fn $scan_direct<P: PsRead>(
+        unsafe fn $scan_direct<const PART_FILTER: bool, P: PsRead>(
             query: &Genome,
             reference: &Genome,
             rev_ref: Option<&Genome>,
             offsets: &[u32],
             ps_ptr: P,
             sub_bits: u32,
+            part_start: u32,
+            part_end: u32,
             chunk_start: usize,
             chunk_end: usize,
             wl: usize,
@@ -614,6 +642,7 @@ macro_rules! impl_stream_tier {
         ) {
             let seq_x = &query.seq;
             let scan_end = (chunk_end + wl - 1).min(seq_x.len);
+            let part_bucket_base = part_start << sub_bits;
             let mut batch = [QueryItem::default(); BATCH_SIZE];
             let mut batch_len = 0usize;
 
@@ -657,13 +686,24 @@ macro_rules! impl_stream_tier {
                         } else {
                             (kf, 2u8)
                         };
-                        let b_bucket = canon as u32;
+                        let b_global = canon as u32;
+                        if PART_FILTER {
+                            let p = b_global >> sub_bits;
+                            if p < part_start || p >= part_end {
+                                continue;
+                            }
+                        }
+                        let b_bucket = if PART_FILTER {
+                            b_global - part_bucket_base
+                        } else {
+                            b_global
+                        };
                         let b_idx = b_bucket + (b_bucket >> sub_bits);
                         unsafe {
                             *batch.get_unchecked_mut(batch_len) = QueryItem {
-                                canon,
                                 pos_x,
                                 b_idx,
+                                tag: 0,
                                 start: 0,
                                 end: 0,
                                 q_kind,
@@ -680,6 +720,7 @@ macro_rules! impl_stream_tier {
                                     offsets,
                                     ps_ptr,
                                     wl as u64,
+                                    mask,
                                     ny,
                                     max_rep,
                                     fwd_opts,
@@ -704,6 +745,7 @@ macro_rules! impl_stream_tier {
                         offsets,
                         ps_ptr,
                         wl as u64,
+                        mask,
                         ny,
                         max_rep,
                         fwd_opts,
@@ -723,9 +765,10 @@ macro_rules! impl_stream_tier {
             reference: &Genome,
             rev_ref: Option<&Genome>,
             offsets: &[u32],
-            keys: &[u64],
+            tags: &[u32],
             ps_ptr: P,
             wl: u64,
+            seed_mask: u64,
             ny: u64,
             max_rep: usize,
             fwd_opts: ExtendOptions,
@@ -733,14 +776,14 @@ macro_rules! impl_stream_tier {
             state: &mut WorkerState,
         ) {
             let off_ptr = offsets.as_ptr();
-            let keys_ptr = keys.as_ptr();
+            let tags_ptr = tags.as_ptr();
 
             // Stage 1: L3/L2 prefetch `offsets[b_idx]` for all items in the batch.
             for item in batch.iter() {
                 prefetch_t2(unsafe { off_ptr.add(item.b_idx as usize) });
             }
 
-            // Stage 2: load `[start, end)` in place and prefetch `keys[start]`.
+            // Stage 2: load `[start, end)` in place and prefetch `tags[start]`.
             for item in batch.iter_mut() {
                 let b_idx = item.b_idx as usize;
                 let s = unsafe { *off_ptr.add(b_idx) };
@@ -748,19 +791,37 @@ macro_rules! impl_stream_tier {
                 item.start = s;
                 item.end = e;
                 if s < e {
-                    prefetch_t2(unsafe { keys_ptr.add(s as usize) });
+                    prefetch_t2(unsafe { tags_ptr.add(s as usize) });
                 }
             }
 
-            // Stage 3: probe buckets inline, filter ~94% of raw hits via inline diagonal cache,
-            // and dispatch only the ~6% uncovered hits to the out-of-line extender.
-            for item in batch.iter() {
+            // Stage 3a: probe 32-bit tag buckets (8-wide AVX2) and prefetch `pos_strand[lo]` for
+            // all hitting items in parallel so Stage 3b does not stall on cold DRAM hits.
+            let mut any_hit = false;
+            for item in batch.iter_mut() {
                 let s = item.start as usize;
                 let e = item.end as usize;
                 if s == e {
                     continue;
                 }
-                let (lo, hi) = $probe_macro!(keys, keys_ptr, s, e, item.canon);
+                let (lo, hi) = $probe_macro!(tags, tags_ptr, s, e, item.tag);
+                item.start = lo as u32;
+                item.end = hi as u32;
+                if lo < hi {
+                    any_hit = true;
+                    unsafe { ps_ptr.prefetch_at(lo) };
+                }
+            }
+
+            if !any_hit {
+                return;
+            }
+
+            // Stage 3b: unpack now-prefetched `pos_strand[lo..hi]`, filter ~94% of hits via the
+            // inline 2-tier diagonal cache, and dispatch uncovered hits to `miss_fwd` / `miss_rev`.
+            for item in batch.iter() {
+                let lo = item.start as usize;
+                let hi = item.end as usize;
                 if lo == hi {
                     continue;
                 }
@@ -786,7 +847,10 @@ macro_rules! impl_stream_tier {
                         let diag_f = pos_x as i64 - pos_y as i64;
                         if !state.fwd_cache.is_covered(diag_f, pos_x) {
                             unsafe {
-                                $miss_fwd(diag_f, pos_x, pos_y, query, reference, fwd_opts, state);
+                                $miss_fwd(
+                                    diag_f, pos_x, pos_y, seed_mask, query, reference, fwd_opts,
+                                    state,
+                                );
                             }
                         }
                         if let Some(rr) = rev_ref {
@@ -795,7 +859,10 @@ macro_rules! impl_stream_tier {
                             let diag_r = pos_x as i64 - rev_pos_y as i64;
                             if !state.rev_cache.as_ref().unwrap().is_covered(diag_r, pos_x) {
                                 unsafe {
-                                    $miss_rev(diag_r, pos_x, rev_pos_y, query, rr, rev_opts, state);
+                                    $miss_rev(
+                                        diag_r, pos_x, rev_pos_y, seed_mask, query, rr, rev_opts,
+                                        state,
+                                    );
                                 }
                             }
                         }
@@ -805,7 +872,10 @@ macro_rules! impl_stream_tier {
                         let diag_f = pos_x as i64 - pos_y as i64;
                         if !state.fwd_cache.is_covered(diag_f, pos_x) {
                             unsafe {
-                                $miss_fwd(diag_f, pos_x, pos_y, query, reference, fwd_opts, state);
+                                $miss_fwd(
+                                    diag_f, pos_x, pos_y, seed_mask, query, reference, fwd_opts,
+                                    state,
+                                );
                             }
                         }
                     } else if let Some(rr) = rev_ref {
@@ -815,7 +885,10 @@ macro_rules! impl_stream_tier {
                         let diag_r = pos_x as i64 - rev_pos_y as i64;
                         if !state.rev_cache.as_ref().unwrap().is_covered(diag_r, pos_x) {
                             unsafe {
-                                $miss_rev(diag_r, pos_x, rev_pos_y, query, rr, rev_opts, state);
+                                $miss_rev(
+                                    diag_r, pos_x, rev_pos_y, seed_mask, query, rr, rev_opts,
+                                    state,
+                                );
                             }
                         }
                     }
@@ -838,6 +911,7 @@ macro_rules! impl_stream_tier {
             offsets: &[u32],
             ps_ptr: P,
             wl: u64,
+            seed_mask: u64,
             ny: u64,
             max_rep: usize,
             fwd_opts: ExtendOptions,
@@ -888,7 +962,10 @@ macro_rules! impl_stream_tier {
                         let diag_f = pos_x as i64 - pos_y as i64;
                         if !state.fwd_cache.is_covered(diag_f, pos_x) {
                             unsafe {
-                                $miss_fwd(diag_f, pos_x, pos_y, query, reference, fwd_opts, state);
+                                $miss_fwd(
+                                    diag_f, pos_x, pos_y, seed_mask, query, reference, fwd_opts,
+                                    state,
+                                );
                             }
                         }
                         if let Some(rr) = rev_ref {
@@ -897,7 +974,10 @@ macro_rules! impl_stream_tier {
                             let diag_r = pos_x as i64 - rev_pos_y as i64;
                             if !state.rev_cache.as_ref().unwrap().is_covered(diag_r, pos_x) {
                                 unsafe {
-                                    $miss_rev(diag_r, pos_x, rev_pos_y, query, rr, rev_opts, state);
+                                    $miss_rev(
+                                        diag_r, pos_x, rev_pos_y, seed_mask, query, rr, rev_opts,
+                                        state,
+                                    );
                                 }
                             }
                         }
@@ -907,7 +987,10 @@ macro_rules! impl_stream_tier {
                         let diag_f = pos_x as i64 - pos_y as i64;
                         if !state.fwd_cache.is_covered(diag_f, pos_x) {
                             unsafe {
-                                $miss_fwd(diag_f, pos_x, pos_y, query, reference, fwd_opts, state);
+                                $miss_fwd(
+                                    diag_f, pos_x, pos_y, seed_mask, query, reference, fwd_opts,
+                                    state,
+                                );
                             }
                         }
                     } else if let Some(rr) = rev_ref {
@@ -917,7 +1000,10 @@ macro_rules! impl_stream_tier {
                         let diag_r = pos_x as i64 - rev_pos_y as i64;
                         if !state.rev_cache.as_ref().unwrap().is_covered(diag_r, pos_x) {
                             unsafe {
-                                $miss_rev(diag_r, pos_x, rev_pos_y, query, rr, rev_opts, state);
+                                $miss_rev(
+                                    diag_r, pos_x, rev_pos_y, seed_mask, query, rr, rev_opts,
+                                    state,
+                                );
                             }
                         }
                     }
@@ -936,11 +1022,20 @@ macro_rules! impl_stream_tier {
             diag: i64,
             pos_x: u64,
             pos_y: u64,
+            seed_mask: u64,
             query: &Genome,
             reference: &Genome,
             opts: ExtendOptions,
             state: &mut WorkerState,
         ) {
+            // Verify exact `wl`-bp 2-bit seed equality to eliminate any theoretical 32-bit tag
+            // hash collision (probability < 2^-46 .. 2^-58), guaranteeing 100% bit-exactness.
+            if ((query.seq.load_32(pos_x as usize) ^ reference.seq.load_32(pos_y as usize))
+                & seed_mask)
+                != 0
+            {
+                return;
+            }
             state.hits_used += 1;
             let cx_x = state.sp_x_cursor_for(&query.seq.special_runs, pos_x);
             let outcome = ($extend_call)(
@@ -980,11 +1075,18 @@ macro_rules! impl_stream_tier {
             diag: i64,
             pos_x: u64,
             pos_y: u64,
+            seed_mask: u64,
             query: &Genome,
             rev_ref: &Genome,
             opts: ExtendOptions,
             state: &mut WorkerState,
         ) {
+            if ((query.seq.load_32(pos_x as usize) ^ rev_ref.seq.load_32(pos_y as usize))
+                & seed_mask)
+                != 0
+            {
+                return;
+            }
             state.hits_used += 1;
             let cx_x = state.sp_x_cursor_for(&query.seq.special_runs, pos_x);
             let outcome = ($extend_call)(
@@ -1060,6 +1162,116 @@ impl_stream_tier!(
     |h, gx, gy, opts, _cx_x, cov| extend_single_hit_outcome(h, gx, gy, opts, false, false, cov)
 );
 
+macro_rules! dispatch_hash_tier {
+    (
+        $fn_name:ident, $wl32:expr, $part_filter:expr, $ps:expr,
+        $query:expr, $reference:expr, $rev_ref:expr, $offsets:expr, $tags:expr,
+        $sub_bits:expr, $hash_shift:expr, $p_start:expr, $p_end:expr,
+        $chunk_start:expr, $chunk_end:expr, $wl:expr, $ny:expr, $mask:expr,
+        $rc_shift:expr, $soft_mask:expr, $max_rep:expr, $fwd_opts:expr, $rev_opts:expr, $state:expr
+    ) => {
+        match ($wl32, $part_filter, $ps) {
+            (true, false, PosStrandVec::U32(v)) => unsafe {
+                $fn_name::<true, false, *const u32>(
+                    $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
+                    $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
+                    32, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+            (true, true, PosStrandVec::U32(v)) => unsafe {
+                $fn_name::<true, true, *const u32>(
+                    $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
+                    $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
+                    32, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+            (false, false, PosStrandVec::U32(v)) => unsafe {
+                $fn_name::<false, false, *const u32>(
+                    $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
+                    $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
+                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+            (false, true, PosStrandVec::U32(v)) => unsafe {
+                $fn_name::<false, true, *const u32>(
+                    $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
+                    $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
+                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+            (true, false, PosStrandVec::U64(v)) => unsafe {
+                $fn_name::<true, false, *const u64>(
+                    $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
+                    $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
+                    32, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+            (true, true, PosStrandVec::U64(v)) => unsafe {
+                $fn_name::<true, true, *const u64>(
+                    $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
+                    $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
+                    32, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+            (false, false, PosStrandVec::U64(v)) => unsafe {
+                $fn_name::<false, false, *const u64>(
+                    $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
+                    $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
+                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+            (false, true, PosStrandVec::U64(v)) => unsafe {
+                $fn_name::<false, true, *const u64>(
+                    $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
+                    $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
+                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+        }
+    };
+}
+
+macro_rules! dispatch_direct_tier {
+    (
+        $fn_name:ident, $part_filter:expr, $ps:expr,
+        $query:expr, $reference:expr, $rev_ref:expr, $offsets:expr,
+        $sub_bits:expr, $p_start:expr, $p_end:expr,
+        $chunk_start:expr, $chunk_end:expr, $wl:expr, $ny:expr, $mask:expr,
+        $rc_shift:expr, $soft_mask:expr, $max_rep:expr, $fwd_opts:expr, $rev_opts:expr, $state:expr
+    ) => {
+        match ($part_filter, $ps) {
+            (false, PosStrandVec::U32(v)) => unsafe {
+                $fn_name::<false, *const u32>(
+                    $query, $reference, $rev_ref, $offsets, v.as_ptr(),
+                    $sub_bits, $p_start, $p_end, $chunk_start, $chunk_end,
+                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+            (true, PosStrandVec::U32(v)) => unsafe {
+                $fn_name::<true, *const u32>(
+                    $query, $reference, $rev_ref, $offsets, v.as_ptr(),
+                    $sub_bits, $p_start, $p_end, $chunk_start, $chunk_end,
+                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+            (false, PosStrandVec::U64(v)) => unsafe {
+                $fn_name::<false, *const u64>(
+                    $query, $reference, $rev_ref, $offsets, v.as_ptr(),
+                    $sub_bits, $p_start, $p_end, $chunk_start, $chunk_end,
+                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+            (true, PosStrandVec::U64(v)) => unsafe {
+                $fn_name::<true, *const u64>(
+                    $query, $reference, $rev_ref, $offsets, v.as_ptr(),
+                    $sub_bits, $p_start, $p_end, $chunk_start, $chunk_end,
+                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                );
+            },
+        }
+    };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_query_chunk(
     query: &Genome,
@@ -1079,6 +1291,10 @@ fn scan_query_chunk(
     isa: IsaTier,
     state: &mut WorkerState,
 ) {
+    let p_start = ref_index.part_start as u32;
+    let p_end = ref_index.part_end as u32;
+    let part_filter = p_start != 0 || p_end != 256;
+
     match (&ref_index.kind, isa) {
         #[cfg(target_arch = "x86_64")]
         (
@@ -1086,311 +1302,50 @@ fn scan_query_chunk(
                 sub_bits,
                 hash_shift,
                 offsets,
-                keys,
+                tags,
                 pos_strand,
             },
             IsaTier::Avx2Bmi2Popcnt,
-        ) => match (wl == 32, pos_strand) {
-            (true, PosStrandVec::U32(v)) => unsafe {
-                scan_hash_avx2_bmi2::<true, *const u32>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    32,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            (false, PosStrandVec::U32(v)) => unsafe {
-                scan_hash_avx2_bmi2::<false, *const u32>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            (true, PosStrandVec::U64(v)) => unsafe {
-                scan_hash_avx2_bmi2::<true, *const u64>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    32,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            (false, PosStrandVec::U64(v)) => unsafe {
-                scan_hash_avx2_bmi2::<false, *const u64>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-        },
+        ) => dispatch_hash_tier!(
+            scan_hash_avx2_bmi2, wl == 32, part_filter, pos_strand,
+            query, reference, rev_ref, offsets, tags,
+            *sub_bits, *hash_shift, p_start, p_end,
+            chunk_start, chunk_end, wl, ny, mask,
+            rc_shift, soft_mask, max_rep, fwd_opts, rev_opts, state
+        ),
         #[cfg(target_arch = "x86_64")]
         (
             RefIndexKind::HashCsr {
                 sub_bits,
                 hash_shift,
                 offsets,
-                keys,
+                tags,
                 pos_strand,
             },
             IsaTier::Avx2Popcnt,
-        ) => match (wl == 32, pos_strand) {
-            (true, PosStrandVec::U32(v)) => unsafe {
-                scan_hash_avx2_swar::<true, *const u32>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    32,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            (false, PosStrandVec::U32(v)) => unsafe {
-                scan_hash_avx2_swar::<false, *const u32>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            (true, PosStrandVec::U64(v)) => unsafe {
-                scan_hash_avx2_swar::<true, *const u64>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    32,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            (false, PosStrandVec::U64(v)) => unsafe {
-                scan_hash_avx2_swar::<false, *const u64>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-        },
+        ) => dispatch_hash_tier!(
+            scan_hash_avx2_swar, wl == 32, part_filter, pos_strand,
+            query, reference, rev_ref, offsets, tags,
+            *sub_bits, *hash_shift, p_start, p_end,
+            chunk_start, chunk_end, wl, ny, mask,
+            rc_shift, soft_mask, max_rep, fwd_opts, rev_opts, state
+        ),
         (
             RefIndexKind::HashCsr {
                 sub_bits,
                 hash_shift,
                 offsets,
-                keys,
+                tags,
                 pos_strand,
             },
             IsaTier::Portable,
-        ) => match (wl == 32, pos_strand) {
-            (true, PosStrandVec::U32(v)) => unsafe {
-                scan_hash_portable::<true, *const u32>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    32,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            (false, PosStrandVec::U32(v)) => unsafe {
-                scan_hash_portable::<false, *const u32>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            (true, PosStrandVec::U64(v)) => unsafe {
-                scan_hash_portable::<true, *const u64>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    32,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            (false, PosStrandVec::U64(v)) => unsafe {
-                scan_hash_portable::<false, *const u64>(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    keys,
-                    v.as_ptr(),
-                    *sub_bits,
-                    *hash_shift,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-        },
+        ) => dispatch_hash_tier!(
+            scan_hash_portable, wl == 32, part_filter, pos_strand,
+            query, reference, rev_ref, offsets, tags,
+            *sub_bits, *hash_shift, p_start, p_end,
+            chunk_start, chunk_end, wl, ny, mask,
+            rc_shift, soft_mask, max_rep, fwd_opts, rev_opts, state
+        ),
         #[cfg(target_arch = "x86_64")]
         (
             RefIndexKind::DirectCsr {
@@ -1399,50 +1354,13 @@ fn scan_query_chunk(
                 pos_strand,
             },
             IsaTier::Avx2Bmi2Popcnt,
-        ) => match pos_strand {
-            PosStrandVec::U32(v) => unsafe {
-                scan_direct_avx2_bmi2(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    v.as_ptr(),
-                    *sub_bits,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            PosStrandVec::U64(v) => unsafe {
-                scan_direct_avx2_bmi2(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    v.as_ptr(),
-                    *sub_bits,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-        },
+        ) => dispatch_direct_tier!(
+            scan_direct_avx2_bmi2, part_filter, pos_strand,
+            query, reference, rev_ref, offsets,
+            *sub_bits, p_start, p_end,
+            chunk_start, chunk_end, wl, ny, mask,
+            rc_shift, soft_mask, max_rep, fwd_opts, rev_opts, state
+        ),
         #[cfg(target_arch = "x86_64")]
         (
             RefIndexKind::DirectCsr {
@@ -1451,50 +1369,13 @@ fn scan_query_chunk(
                 pos_strand,
             },
             IsaTier::Avx2Popcnt,
-        ) => match pos_strand {
-            PosStrandVec::U32(v) => unsafe {
-                scan_direct_avx2_swar(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    v.as_ptr(),
-                    *sub_bits,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            PosStrandVec::U64(v) => unsafe {
-                scan_direct_avx2_swar(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    v.as_ptr(),
-                    *sub_bits,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-        },
+        ) => dispatch_direct_tier!(
+            scan_direct_avx2_swar, part_filter, pos_strand,
+            query, reference, rev_ref, offsets,
+            *sub_bits, p_start, p_end,
+            chunk_start, chunk_end, wl, ny, mask,
+            rc_shift, soft_mask, max_rep, fwd_opts, rev_opts, state
+        ),
         (
             RefIndexKind::DirectCsr {
                 sub_bits,
@@ -1502,50 +1383,13 @@ fn scan_query_chunk(
                 pos_strand,
             },
             IsaTier::Portable,
-        ) => match pos_strand {
-            PosStrandVec::U32(v) => unsafe {
-                scan_direct_portable(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    v.as_ptr(),
-                    *sub_bits,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-            PosStrandVec::U64(v) => unsafe {
-                scan_direct_portable(
-                    query,
-                    reference,
-                    rev_ref,
-                    offsets,
-                    v.as_ptr(),
-                    *sub_bits,
-                    chunk_start,
-                    chunk_end,
-                    wl,
-                    ny,
-                    mask,
-                    rc_shift,
-                    soft_mask,
-                    max_rep,
-                    fwd_opts,
-                    rev_opts,
-                    state,
-                );
-            },
-        },
+        ) => dispatch_direct_tier!(
+            scan_direct_portable, part_filter, pos_strand,
+            query, reference, rev_ref, offsets,
+            *sub_bits, p_start, p_end,
+            chunk_start, chunk_end, wl, ny, mask,
+            rc_shift, soft_mask, max_rep, fwd_opts, rev_opts, state
+        ),
     }
 }
 

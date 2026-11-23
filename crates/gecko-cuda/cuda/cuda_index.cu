@@ -249,15 +249,19 @@ static __global__ void mark_dropped_bitmap_kernel(
     }
 }
 
-static __global__ void mark_bucket_starts_kernel(
+static __global__ void mark_bucket_starts_and_tags_kernel(
     const uint64_t * __restrict__ keys,
     uint32_t n,
     int shift_bits,
-    uint32_t * __restrict__ bucket_off
+    int tag_shift,
+    uint32_t * __restrict__ bucket_off,
+    uint32_t * __restrict__ out_tags
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    uint32_t b = (uint32_t)(keys[i] >> shift_bits);
+    uint64_t k = keys[i];
+    out_tags[i] = (uint32_t)(k >> tag_shift);
+    uint32_t b = (uint32_t)(k >> shift_bits);
     if (i == 0 || b != (uint32_t)(keys[i - 1] >> shift_bits)) {
         bucket_off[b] = i;
     }
@@ -428,14 +432,22 @@ GpuRefIndex gpu_build_ref_index(
     while (bucket_bits < 25 && (1ULL << bucket_bits) * 4ULL < idx.n_kept) bucket_bits++;
     uint32_t num_buckets = 1U << bucket_bits;
     int shift_bits = 64 - bucket_bits;
+    int tag_shift = shift_bits - 32; /* always >= 7 since bucket_bits <= 25 */
 
     uint32_t *d_bucket_off = nullptr;
     CUDA_CHECK_VOID(cudaMalloc(&d_bucket_off, (size_t)(num_buckets + 1) * sizeof(uint32_t)));
     CUDA_CHECK_VOID(cudaMemset(d_bucket_off, 0xFF, (size_t)num_buckets * sizeof(uint32_t)));
     CUDA_CHECK_VOID(cudaMemcpy(d_bucket_off + num_buckets, &idx.n_kept, sizeof(uint32_t), cudaMemcpyHostToDevice));
 
+    uint32_t *d_tags = nullptr;
+    size_t tag_alloc = (idx.n_kept > 0) ? (size_t)idx.n_kept : 1;
+    CUDA_CHECK_VOID(cudaMalloc(&d_tags, tag_alloc * sizeof(uint32_t)));
+
     if (idx.n_kept > 0) {
-        mark_bucket_starts_kernel<<<(idx.n_kept + 255) / 256, 256>>>(d_sorted_keys, idx.n_kept, shift_bits, d_bucket_off);
+        mark_bucket_starts_and_tags_kernel<<<(idx.n_kept + 255) / 256, 256>>>(
+            d_sorted_keys, idx.n_kept, shift_bits, tag_shift, d_bucket_off, d_tags);
+        CUDA_CHECK_VOID(cudaGetLastError());
+
         uint32_t n_b_blocks = (num_buckets + 1 + 255) / 256;
         uint32_t *d_block_mins = nullptr;
         CUDA_CHECK_VOID(cudaMalloc(&d_block_mins, (size_t)n_b_blocks * sizeof(uint32_t)));
@@ -453,16 +465,20 @@ GpuRefIndex gpu_build_ref_index(
         CUDA_CHECK_VOID(cudaMemset(d_bucket_off, 0, (size_t)(num_buckets + 1) * sizeof(uint32_t)));
     }
 
-    idx.d_keys = d_sorted_keys;
+    /* Free 64-bit keys immediately — steady-state VRAM stores only 32-bit tags (~50% smaller) */
+    CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+
+    idx.d_tags = d_tags;
     idx.d_vals = d_sorted_vals;
     idx.d_bucket_off = d_bucket_off;
     idx.bucket_bits = bucket_bits;
     idx.shift_bits = shift_bits;
+    idx.tag_shift = tag_shift;
     return idx;
 }
 
 void gpu_free_ref_index(GpuRefIndex &idx) {
-    if (idx.d_keys) CUDA_CHECK_VOID(cudaFree(idx.d_keys));
+    if (idx.d_tags) CUDA_CHECK_VOID(cudaFree(idx.d_tags));
     if (idx.d_vals) CUDA_CHECK_VOID(cudaFree(idx.d_vals));
     if (idx.d_bucket_off) CUDA_CHECK_VOID(cudaFree(idx.d_bucket_off));
     if (idx.d_dropped_bitmap) CUDA_CHECK_VOID(cudaFree(idx.d_dropped_bitmap));

@@ -13,10 +13,11 @@ static __global__ void query_left_maximal_kernel(
     GpuSeqView seqX,
     GpuSeqView seqY,
     const uint32_t * __restrict__ bucket_off,
-    const uint64_t * __restrict__ idx_keys,
+    const uint32_t * __restrict__ idx_tags,
     const uint32_t * __restrict__ idx_vals,
     const uint32_t * __restrict__ dropped_bitmap,
     int shift_bits,
+    int tag_shift,
     int wl,
     bool compare_reverse,
     uint64_t tile_start,
@@ -34,6 +35,7 @@ static __global__ void query_left_maximal_kernel(
 
     uint64_t mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
     int rc_shift = 2 * (wl - 1);
+    int rev_rshift = 64 - 2 * wl;
     uint64_t scan_from = (t_start >= (uint64_t)(wl - 1)) ? (t_start - (uint64_t)(wl - 1)) : 0ULL;
 
     uint64_t kf = 0, kr = 0;
@@ -73,66 +75,75 @@ static __global__ void query_left_maximal_kernel(
                     uint32_t en = __ldg(&bucket_off[bkt + 1]);
                     if (st == en) continue;
 
+                    uint32_t tag = (uint32_t)(h >> tag_shift);
                     uint32_t j = st;
                     if (en - st <= 16U) {
-                        while (j < en && __ldg(&idx_keys[j]) < h) j++;
+                        while (j < en && __ldg(&idx_tags[j]) < tag) j++;
                     } else {
                         uint32_t lo = st, hi = en;
                         while (lo < hi) {
                             uint32_t mid = lo + ((hi - lo) >> 1);
-                            if (__ldg(&idx_keys[mid]) < h) lo = mid + 1;
+                            if (__ldg(&idx_tags[mid]) < tag) lo = mid + 1;
                             else hi = mid;
                         }
                         j = lo;
                     }
+                    if (j >= en || __ldg(&idx_tags[j]) != tag) continue;
 
+                    uint64_t x_seed_lsb = load_32_2bit(seqX.bits, posX) & mask;
                     bool prev_x_valid = (posX > 0U) && !is_bit_set(seqX.invalid_bm, posX - 1U);
                     uint32_t prev_x_2bit = prev_x_valid ? base_2bit_dev(seqX.bits, posX - 1U) : 4U;
                     bool next_x_valid = ((uint64_t)posX + (uint64_t)wl < seqX.len) &&
                                         !is_bit_set(seqX.invalid_bm, posX + (uint32_t)wl);
                     uint32_t next_x_2bit = next_x_valid ? base_2bit_dev(seqX.bits, posX + (uint32_t)wl) : 4U;
 
-                    while (j < en && __ldg(&idx_keys[j]) == h) {
+                    while (j < en && __ldg(&idx_tags[j]) == tag) {
                         uint32_t ps = __ldg(&idx_vals[j]);
                         uint32_t posY_orig = ps >> 1;
                         uint32_t y_strand = ps & 1U;
+                        uint64_t y_word = load_32_2bit(seqY.bits, posY_orig);
 
                         if (is_pal || (x_strand == y_strand)) {
-                            bool left_ext = prev_x_valid && (posY_orig > 0U) &&
-                                            !is_bit_set(seqY.invalid_bm, posY_orig - 1U) &&
-                                            (base_2bit_dev(seqY.bits, posY_orig - 1U) == prev_x_2bit) &&
-                                            !is_bit_set(dropped_bitmap, posY_orig - 1U);
-                            bool right_ext = next_x_valid && ((uint64_t)posY_orig + (uint64_t)wl < seqY.len) &&
-                                             !is_bit_set(seqY.invalid_bm, posY_orig + (uint32_t)wl) &&
-                                             (base_2bit_dev(seqY.bits, posY_orig + (uint32_t)wl) == next_x_2bit) &&
-                                             !is_bit_set(dropped_bitmap, posY_orig + 1U);
-                            if (!left_ext || !right_ext) {
-                                if (*hit_count <= max_hits) {
-                                    uint32_t slot = atomicAdd(hit_count, 1U);
-                                    if (slot < max_hits) {
-                                        out_hits[slot] = pack_hit_key(0U, posX, posY_orig);
+                            if (((y_word ^ x_seed_lsb) & mask) == 0ULL) {
+                                bool left_ext = prev_x_valid && (posY_orig > 0U) &&
+                                                !is_bit_set(seqY.invalid_bm, posY_orig - 1U) &&
+                                                (base_2bit_dev(seqY.bits, posY_orig - 1U) == prev_x_2bit) &&
+                                                !is_bit_set(dropped_bitmap, posY_orig - 1U);
+                                bool right_ext = next_x_valid && ((uint64_t)posY_orig + (uint64_t)wl < seqY.len) &&
+                                                 !is_bit_set(seqY.invalid_bm, posY_orig + (uint32_t)wl) &&
+                                                 (base_2bit_dev(seqY.bits, posY_orig + (uint32_t)wl) == next_x_2bit) &&
+                                                 !is_bit_set(dropped_bitmap, posY_orig + 1U);
+                                if (!left_ext || !right_ext) {
+                                    if (*hit_count <= max_hits) {
+                                        uint32_t slot = atomicAdd(hit_count, 1U);
+                                        if (slot < max_hits) {
+                                            out_hits[slot] = pack_hit_key(0U, posX, posY_orig);
+                                        }
                                     }
                                 }
                             }
                         }
                         if (compare_reverse && (is_pal || (x_strand != y_strand))) {
-                            /* Check mirrored neighbors directly in seqY (avoids storing/reading seqY_rc.invalid_bm):
-                             * Y_rc[posY_rc - 1]  == comp(Y[posY_orig + wl])
-                             * Y_rc[posY_rc + wl] == comp(Y[posY_orig - 1]) */
-                            uint32_t posY_rc = (uint32_t)(seqY.len - (uint64_t)posY_orig - (uint64_t)wl);
-                            bool left_ext = prev_x_valid && (posY_rc > 0U) &&
-                                            !is_bit_set(seqY.invalid_bm, posY_orig + (uint32_t)wl) &&
-                                            ((base_2bit_dev(seqY.bits, posY_orig + (uint32_t)wl) ^ 3U) == prev_x_2bit) &&
-                                            !is_bit_set(dropped_bitmap, posY_orig + 1U);
-                            bool right_ext = next_x_valid && (posY_orig > 0U) &&
-                                             !is_bit_set(seqY.invalid_bm, posY_orig - 1U) &&
-                                             ((base_2bit_dev(seqY.bits, posY_orig - 1U) ^ 3U) == next_x_2bit) &&
-                                             !is_bit_set(dropped_bitmap, posY_orig - 1U);
-                            if (!left_ext || !right_ext) {
-                                if (*hit_count <= max_hits) {
-                                    uint32_t slot = atomicAdd(hit_count, 1U);
-                                    if (slot < max_hits) {
-                                        out_hits[slot] = pack_hit_key(1U, posX, posY_rc);
+                            uint64_t y_rc_lsb = (~reverse_32_2bit_dev(y_word)) >> rev_rshift;
+                            if (((y_rc_lsb ^ x_seed_lsb) & mask) == 0ULL) {
+                                /* Check mirrored neighbors directly in seqY (avoids storing/reading seqY_rc.invalid_bm):
+                                 * Y_rc[posY_rc - 1]  == comp(Y[posY_orig + wl])
+                                 * Y_rc[posY_rc + wl] == comp(Y[posY_orig - 1]) */
+                                uint32_t posY_rc = (uint32_t)(seqY.len - (uint64_t)posY_orig - (uint64_t)wl);
+                                bool left_ext = prev_x_valid && (posY_rc > 0U) &&
+                                                !is_bit_set(seqY.invalid_bm, posY_orig + (uint32_t)wl) &&
+                                                ((base_2bit_dev(seqY.bits, posY_orig + (uint32_t)wl) ^ 3U) == prev_x_2bit) &&
+                                                !is_bit_set(dropped_bitmap, posY_orig + 1U);
+                                bool right_ext = next_x_valid && (posY_orig > 0U) &&
+                                                 !is_bit_set(seqY.invalid_bm, posY_orig - 1U) &&
+                                                 ((base_2bit_dev(seqY.bits, posY_orig - 1U) ^ 3U) == next_x_2bit) &&
+                                                 !is_bit_set(dropped_bitmap, posY_orig - 1U);
+                                if (!left_ext || !right_ext) {
+                                    if (*hit_count <= max_hits) {
+                                        uint32_t slot = atomicAdd(hit_count, 1U);
+                                        if (slot < max_hits) {
+                                            out_hits[slot] = pack_hit_key(1U, posX, posY_rc);
+                                        }
                                     }
                                 }
                             }
@@ -213,7 +224,7 @@ uint32_t gpu_query_tile_left_maximal(
     uint32_t grid = (uint32_t)((n_threads + 255) / 256);
     query_left_maximal_kernel<<<grid, 256>>>(
         seqX, seqY,
-        idx.d_bucket_off, idx.d_keys, idx.d_vals, idx.d_dropped_bitmap, idx.shift_bits, wl,
+        idx.d_bucket_off, idx.d_tags, idx.d_vals, idx.d_dropped_bitmap, idx.shift_bits, idx.tag_shift, wl,
         compare_reverse,
         tile_start, tile_end, d_hits, d_hit_count, max_hits);
     CUDA_CHECK_VOID(cudaGetLastError());

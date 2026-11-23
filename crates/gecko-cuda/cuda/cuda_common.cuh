@@ -96,7 +96,7 @@ struct GpuSeqBuf {
 };
 
 struct GpuRefIndex {
-    uint64_t *d_keys;
+    uint32_t *d_tags;           /* 32-bit hash tags: (uint32_t)(h >> tag_shift), sorted per bucket */
     uint32_t *d_vals;
     uint32_t *d_bucket_off;
     uint32_t *d_dropped_bitmap;
@@ -104,6 +104,7 @@ struct GpuRefIndex {
     uint32_t n_kept;
     int bucket_bits;
     int shift_bits;
+    int tag_shift;
 };
 
 struct GpuFrag {

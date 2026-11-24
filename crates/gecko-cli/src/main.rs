@@ -875,6 +875,21 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
             SelectedBackend::Wgpu => {
                 #[cfg(feature = "wgpu")]
                 {
+                    let (wgpu_ref, info) = gecko_wgpu::WgpuPreparedRef::build(
+                        &genomes[j],
+                        &config,
+                        args.allow_software_gpu,
+                    )?;
+                    if !logged_backend {
+                        eprintln!(
+                            "Backend: wgpu ({}, {}, GPU-resident reference reuse; loaded {} genomes in {:.2}s)",
+                            info.name,
+                            info.backend,
+                            genomes.len(),
+                            load_secs,
+                        );
+                        logged_backend = true;
+                    }
                     for i in 0..j {
                         done += 1;
                         let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
@@ -883,22 +898,7 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
                             eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
                             continue;
                         }
-                        let (res, info) = gecko_wgpu::compare_wgpu(
-                            &genomes[i],
-                            &genomes[j],
-                            &config,
-                            args.allow_software_gpu,
-                        )?;
-                        if !logged_backend {
-                            eprintln!(
-                                "Backend: wgpu ({}, {}; loaded {} genomes in {:.2}s)",
-                                info.name,
-                                info.backend,
-                                genomes.len(),
-                                load_secs,
-                            );
-                            logged_backend = true;
-                        }
+                        let res = wgpu_ref.query(&genomes[i], &config)?;
                         let q_fname = files[i].file_name().and_then(|s| s.to_str()).unwrap_or("");
                         let r_fname = files[j].file_name().and_then(|s| s.to_str()).unwrap_or("");
                         let meta = res.metadata(q_fname, r_fname, &genomes[i], &genomes[j], &config);

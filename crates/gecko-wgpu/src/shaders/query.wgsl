@@ -1,8 +1,8 @@
 // query.wgsl
-// Tiled 2-bit PackedSeq WGSL compute shader for canonical k-mer lookup against
-// a Hash-CSR index with bit-exact 64-bit MurmurHash3 fmix64 emulation (vec2<u32>),
-// 1-bit invalid-seed and freq_limit dropped-position bitmaps, and lock-free
-// Left/Right-Maximal Seed Filtering.
+// Tiled 2-bit PackedSeq WGSL compute shader for canonical k-mer / spaced-seed lookup
+// against a 32-bit hash-tag compressed Hash-CSR index (exact 64-bit MurmurHash3 fmix64
+// emulation + 32-bit tag probe + exact 2-bit seed verification), 1-bit invalid-seed and
+// freq_limit dropped-position bitmaps, and lock-free Left/Right-Maximal Seed Filtering.
 
 struct QueryParams {
     len_x: u32,
@@ -13,15 +13,10 @@ struct QueryParams {
     tile_end: u32,
     max_hits: u32,
     stride: u32,
-    flags: u32,        // bit 0: compare_reverse, bit 1: has_dropped, bit 2: has_inv_x, bit 3: has_inv_y
+    flags: u32,        // bit 0: compare_reverse, bit 1: has_dropped, bit 2: has_inv_x, bit 3: has_inv_y, bit 4: is_spaced
     inv_y_word_off: u32,
-    _pad0: u32,
-    _pad1: u32,
-};
-
-struct KeyPair {
-    lo: u32,
-    hi: u32,
+    seed_mask_lo: u32,
+    seed_mask_hi: u32,
 };
 
 struct HitRec {
@@ -36,7 +31,7 @@ struct HitRec {
 @group(0) @binding(2) var<storage, read> seq_y_bits: array<u32>;
 @group(0) @binding(3) var<storage, read> invalid_bm: array<u32>;
 @group(0) @binding(4) var<storage, read> bucket_off: array<u32>;
-@group(0) @binding(5) var<storage, read> idx_keys: array<KeyPair>;
+@group(0) @binding(5) var<storage, read> idx_tags: array<u32>;
 @group(0) @binding(6) var<storage, read> idx_vals: array<u32>;
 @group(0) @binding(7) var<storage, read_write> out_hits: array<HitRec>;
 @group(0) @binding(8) var<storage, read_write> hit_count: atomic<u32>;
@@ -48,6 +43,57 @@ fn base_2bit_x(pos: u32) -> u32 {
 
 fn base_2bit_y(pos: u32) -> u32 {
     return (seq_y_bits[pos >> 4u] >> ((pos & 15u) * 2u)) & 3u;
+}
+
+fn load_16_2bit_x(pos: u32) -> u32 {
+    let w = pos >> 4u;
+    let sh = (pos & 15u) * 2u;
+    let lo = seq_x_bits[w];
+    if (sh == 0u) {
+        return lo;
+    }
+    return (lo >> sh) | (seq_x_bits[w + 1u] << (32u - sh));
+}
+
+fn load_16_2bit_y(pos: u32) -> u32 {
+    let w = pos >> 4u;
+    let sh = (pos & 15u) * 2u;
+    let lo = seq_y_bits[w];
+    if (sh == 0u) {
+        return lo;
+    }
+    return (lo >> sh) | (seq_y_bits[w + 1u] << (32u - sh));
+}
+
+fn load_32_2bit_x(pos: u32) -> vec2<u32> {
+    return vec2<u32>(load_16_2bit_x(pos), load_16_2bit_x(pos + 16u));
+}
+
+fn load_32_2bit_y(pos: u32) -> vec2<u32> {
+    return vec2<u32>(load_16_2bit_y(pos), load_16_2bit_y(pos + 16u));
+}
+
+fn reverse_16_2bit(v_in: u32) -> u32 {
+    var v = ((v_in & 0x0000FFFFu) << 16u) | ((v_in >> 16u) & 0x0000FFFFu);
+    v = ((v & 0x00FF00FFu) << 8u) | ((v >> 8u) & 0x00FF00FFu);
+    v = ((v & 0x0F0F0F0Fu) << 4u) | ((v >> 4u) & 0x0F0F0F0Fu);
+    v = ((v & 0x33333333u) << 2u) | ((v >> 2u) & 0x33333333u);
+    return v;
+}
+
+fn revcomp_word_lsb(y_word: vec2<u32>, wl: u32) -> vec2<u32> {
+    let r_lo = ~reverse_16_2bit(y_word.y);
+    let r_hi = ~reverse_16_2bit(y_word.x);
+    let rshift = 64u - 2u * wl;
+    if (rshift == 0u) {
+        return vec2<u32>(r_lo, r_hi);
+    } else if (rshift < 32u) {
+        return vec2<u32>((r_lo >> rshift) | (r_hi << (32u - rshift)), r_hi >> rshift);
+    } else if (rshift == 32u) {
+        return vec2<u32>(r_hi, 0u);
+    } else {
+        return vec2<u32>(r_hi >> (rshift - 32u), 0u);
+    }
 }
 
 fn is_invalid_x(pos: u32, has_inv_x: bool) -> bool {
@@ -101,10 +147,6 @@ fn fmix64(x_in: vec2<u32>) -> vec2<u32> {
     return x;
 }
 
-fn lt64(a: vec2<u32>, b: vec2<u32>) -> bool {
-    return (a.y < b.y) || (a.y == b.y && a.x < b.x);
-}
-
 fn le64(a: vec2<u32>, b: vec2<u32>) -> bool {
     return (a.y < b.y) || (a.y == b.y && a.x <= b.x);
 }
@@ -143,6 +185,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let has_dropped = (params.flags & 2u) != 0u;
     let has_inv_x = (params.flags & 4u) != 0u;
     let has_inv_y = (params.flags & 8u) != 0u;
+    let is_spaced = (params.flags & 16u) != 0u;
+
     let bits = 2u * wl;
     var mask_lo: u32 = 0xFFFFFFFFu;
     var mask_hi: u32 = 0xFFFFFFFFu;
@@ -156,8 +200,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         mask_lo = 0xFFFFFFFFu;
         mask_hi = (1u << (bits - 32u)) - 1u;
     }
+    let eff_mask_lo = select(mask_lo, params.seed_mask_lo, is_spaced);
+    let eff_mask_hi = select(mask_hi, params.seed_mask_hi, is_spaced);
+
     let rc_shift = 2u * (wl - 1u);
-    let hi_shift = params.shift_bits - 32u;
+    let hi_shift = params.shift_bits - 32u; // also equals tag_shift (in [8..20])
 
     var scan_from: u32 = 0u;
     if (t_start >= wl - 1u) {
@@ -177,9 +224,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             if (valid >= wl && i >= t_start) {
                 let pos_x = i + 1u - wl;
-                let x_strand = select(1u, 0u, le64(kf, kr));
-                let canon = select(kr, kf, x_strand == 0u);
-                let is_pal = eq64(kf, kr);
+                let sf = vec2<u32>(kf.x & eff_mask_lo, kf.y & eff_mask_hi);
+                let sr = vec2<u32>(kr.x & eff_mask_lo, kr.y & eff_mask_hi);
+                let x_strand = select(1u, 0u, le64(sf, sr));
+                let canon = select(sr, sf, x_strand == 0u);
+                let is_pal = eq64(sf, sr);
 
                 let h = fmix64(canon);
                 let bkt = h.y >> hi_shift;
@@ -189,12 +238,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     continue;
                 }
 
+                let tag = (h.x >> hi_shift) | (h.y << (32u - hi_shift));
                 var j = st;
                 if (en - st <= 16u) {
                     loop {
-                        if (j >= en) { break; }
-                        let kp = idx_keys[j];
-                        if (!lt64(vec2<u32>(kp.lo, kp.hi), h)) { break; }
+                        if (j >= en || idx_tags[j] >= tag) { break; }
                         j = j + 1u;
                     }
                 } else {
@@ -203,14 +251,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     loop {
                         if (lo >= hi) { break; }
                         let mid = lo + ((hi - lo) >> 1u);
-                        let kp = idx_keys[mid];
-                        if (lt64(vec2<u32>(kp.lo, kp.hi), h)) {
+                        if (idx_tags[mid] < tag) {
                             lo = mid + 1u;
                         } else {
                             hi = mid;
                         }
                     }
                     j = lo;
+                }
+                if (j >= en || idx_tags[j] != tag) {
+                    continue;
                 }
 
                 var prev_x_2bit: u32 = 4u;
@@ -226,10 +276,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     next_x_2bit = base_2bit_x(pos_x + wl);
                 }
 
+                var x_seed_loaded = false;
+                var x_span = vec2<u32>(0u, 0u);
+                var x_seed = vec2<u32>(0u, 0u);
+
                 loop {
-                    if (j >= en) { break; }
-                    let kp = idx_keys[j];
-                    if (!eq64(vec2<u32>(kp.lo, kp.hi), h)) { break; }
+                    if (j >= en || idx_tags[j] != tag) { break; }
 
                     let ps = idx_vals[j];
                     let pos_y_orig = ps >> 1u;
@@ -248,10 +300,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 && (base_2bit_y(pos_y_orig + wl) == next_x_2bit)
                                 && !is_dropped_pos(pos_y_orig + 1u, has_dropped);
                         }
-                        if (!left_ext || !right_ext) {
-                            let slot = atomicAdd(&hit_count, 1u);
-                            if (slot < params.max_hits) {
-                                out_hits[slot] = HitRec(pos_x, pos_y_orig, 0u, 0u);
+                        if (is_spaced || !left_ext || !right_ext) {
+                            if (!x_seed_loaded) {
+                                let xr = load_32_2bit_x(pos_x);
+                                x_span = vec2<u32>(xr.x & mask_lo, xr.y & mask_hi);
+                                x_seed = vec2<u32>(xr.x & eff_mask_lo, xr.y & eff_mask_hi);
+                                x_seed_loaded = true;
+                            }
+                            let y_word = load_32_2bit_y(pos_y_orig);
+                            let y_fwd = vec2<u32>(y_word.x & eff_mask_lo, y_word.y & eff_mask_hi);
+                            if (eq64(y_fwd, x_seed)) {
+                                // For spaced seeds, an exact (wl+2)-bp run guarantees both shifted
+                                // neighbors also match the spaced seed and are present in the index.
+                                var skip_spaced = false;
+                                if (is_spaced && left_ext && right_ext) {
+                                    let y_span = vec2<u32>(y_word.x & mask_lo, y_word.y & mask_hi);
+                                    skip_spaced = eq64(y_span, x_span);
+                                }
+                                if (!skip_spaced) {
+                                    let slot = atomicAdd(&hit_count, 1u);
+                                    if (slot < params.max_hits) {
+                                        out_hits[slot] = HitRec(pos_x, pos_y_orig, 0u, 0u);
+                                    }
+                                }
                             }
                         }
                     }
@@ -269,10 +340,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 && ((base_2bit_y(pos_y_orig - 1u) ^ 3u) == next_x_2bit)
                                 && !is_dropped_pos(pos_y_orig - 1u, has_dropped);
                         }
-                        if (!left_ext || !right_ext) {
-                            let slot = atomicAdd(&hit_count, 1u);
-                            if (slot < params.max_hits) {
-                                out_hits[slot] = HitRec(pos_x, pos_y_rc, 1u, 0u);
+                        if (is_spaced || !left_ext || !right_ext) {
+                            if (!x_seed_loaded) {
+                                let xr = load_32_2bit_x(pos_x);
+                                x_span = vec2<u32>(xr.x & mask_lo, xr.y & mask_hi);
+                                x_seed = vec2<u32>(xr.x & eff_mask_lo, xr.y & eff_mask_hi);
+                                x_seed_loaded = true;
+                            }
+                            let y_word = load_32_2bit_y(pos_y_orig);
+                            let y_rc_raw = revcomp_word_lsb(y_word, wl);
+                            let y_rc = vec2<u32>(y_rc_raw.x & eff_mask_lo, y_rc_raw.y & eff_mask_hi);
+                            if (eq64(y_rc, x_seed)) {
+                                var skip_spaced = false;
+                                if (is_spaced && left_ext && right_ext) {
+                                    let y_span = vec2<u32>(y_rc_raw.x & mask_lo, y_rc_raw.y & mask_hi);
+                                    skip_spaced = eq64(y_span, x_span);
+                                }
+                                if (!skip_spaced) {
+                                    let slot = atomicAdd(&hit_count, 1u);
+                                    if (slot < params.max_hits) {
+                                        out_hits[slot] = HitRec(pos_x, pos_y_rc, 1u, 0u);
+                                    }
+                                }
                             }
                         }
                     }

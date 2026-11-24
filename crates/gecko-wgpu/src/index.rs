@@ -1,37 +1,38 @@
 //! Parallel canonical k-mer Hash-CSR reference index builder for WGPU.
-//! Stores bijective MurmurHash3 fmix64(canonical_kmer) keys split into `[lo, hi]` u32 pairs
-//! so WGSL compute shaders can probe exact 64-bit keys with zero hash collisions.
+//! Stores 32-bit hash tags (`(fmix64(canon) >> tag_shift) as u32`, sorted within each bucket),
+//! halving GPU storage buffer size vs 64-bit keys (doubling max chromosome size under WGPU
+//! `max_storage_buffer_binding_size` limits), while `query.wgsl` verifies exact 2-bit seed
+//! equality on every tag match for zero false positives.
 
-use bytemuck::{Pod, Zeroable};
 use gecko_core::ref_index::fmix64;
 use gecko_core::seq::Genome;
 use rayon::prelude::*;
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct KeyU64Pair {
-    pub lo: u32,
-    pub hi: u32,
-}
-
 pub struct WgpuRefIndex {
     pub shift_bits: u32,
     pub bucket_off: Vec<u32>,
-    pub keys: Vec<KeyU64Pair>,
+    pub tags: Vec<u32>,
     pub vals: Vec<u32>,
     pub has_dropped: bool,
     pub dropped_bitmap: Vec<u32>,
 }
 
 impl WgpuRefIndex {
-    pub fn build(reference: &Genome, wl: usize, freq_limit: u32, soft_mask: bool) -> Self {
+    pub fn build(
+        reference: &Genome,
+        wl: usize,
+        spaced_mask: Option<u64>,
+        freq_limit: u32,
+        soft_mask: bool,
+    ) -> Self {
         let seq = &reference.seq;
         let len = seq.len;
-        let mask: u64 = if wl == 32 {
+        let span_mask: u64 = if wl == 32 {
             u64::MAX
         } else {
             (1u64 << (2 * wl)) - 1
         };
+        let eff_mask = spaced_mask.unwrap_or(span_mask);
         let rc_shift = 2 * (wl - 1);
 
         let max_starts = len.saturating_sub(wl - 1);
@@ -67,7 +68,7 @@ impl WgpuRefIndex {
                         for _ in 0..avail {
                             let b = word & 3;
                             word >>= 2;
-                            kf = ((kf << 2) | b) & mask;
+                            kf = ((kf << 2) | b) & span_mask;
                             kr = (kr >> 2) | ((b ^ 3) << rc_shift);
                         }
                         idx += avail;
@@ -81,10 +82,12 @@ impl WgpuRefIndex {
                         for pos in start_pos..start_pos + avail as u32 {
                             let b = word & 3;
                             word >>= 2;
-                            kf = ((kf << 2) | b) & mask;
+                            kf = ((kf << 2) | b) & span_mask;
                             kr = (kr >> 2) | ((b ^ 3) << rc_shift);
-                            let strand: u32 = if kf <= kr { 0 } else { 1 };
-                            let key = if strand == 1 { kr } else { kf };
+                            let sf = kf & eff_mask;
+                            let sr = kr & eff_mask;
+                            let strand: u32 = if sf <= sr { 0 } else { 1 };
+                            let key = if strand == 1 { sr } else { sf };
                             let h = fmix64(key);
                             let p = (h >> 56) as usize;
                             parts[p].push((h, (pos << 1) | strand));
@@ -181,8 +184,10 @@ impl WgpuRefIndex {
         }
         let num_buckets = 1usize << bucket_bits;
         let shift_bits = 64 - bucket_bits;
+        // Always in 8..=20 so `(h >> tag_shift) as u32` preserves exact ascending order inside buckets.
+        let tag_shift = shift_bits - 32;
 
-        let mut keys = Vec::with_capacity(n_kept.max(1) as usize);
+        let mut tags = Vec::with_capacity(n_kept.max(1) as usize);
         let mut vals = Vec::with_capacity(n_kept.max(1) as usize);
         let mut bucket_off = vec![0u32; num_buckets + 1];
 
@@ -190,25 +195,22 @@ impl WgpuRefIndex {
             for (h, ps) in v {
                 let b = (h >> shift_bits) as usize;
                 bucket_off[b + 1] += 1;
-                keys.push(KeyU64Pair {
-                    lo: h as u32,
-                    hi: (h >> 32) as u32,
-                });
+                tags.push((h >> tag_shift) as u32);
                 vals.push(ps);
             }
         }
         for b in 1..=num_buckets {
             bucket_off[b] += bucket_off[b - 1];
         }
-        if keys.is_empty() {
-            keys.push(KeyU64Pair { lo: 0, hi: 0 });
+        if tags.is_empty() {
+            tags.push(0);
             vals.push(0);
         }
 
         Self {
             shift_bits,
             bucket_off,
-            keys,
+            tags,
             vals,
             has_dropped: any_dropped && len > 0,
             dropped_bitmap,

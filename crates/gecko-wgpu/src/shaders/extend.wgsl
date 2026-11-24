@@ -1,6 +1,7 @@
 // extend.wgsl
 // 2-bit PackedSeq WGSL compute shader for exact GECKO bidirectional ungapped extension
-// supporting configurable scoring, 'N' penalties, multi-FASTA SEQ_SEP, and rare IUPAC codes.
+// supporting configurable scoring, 'N' penalties, multi-FASTA SEQ_SEP, rare IUPAC codes,
+// palindromic spaced seeds, and 16-bp word-at-a-time exact-match fast paths.
 
 struct ExtendParams {
     len_x: u32,
@@ -28,7 +29,7 @@ struct ExtendParams {
     iupac_y_len: u32,
     iupac_yrc_off: u32,
     iupac_yrc_len: u32,
-    _pad0: u32,
+    is_spaced: u32,
     _pad1: u32,
     _pad2: u32,
 };
@@ -77,11 +78,53 @@ fn base_2bit_y(pos: u32, is_rev: u32) -> u32 {
     return (word >> ((pos & 15u) * 2u)) & 3u;
 }
 
+fn load_16_2bit_x(pos: u32) -> u32 {
+    let w = pos >> 4u;
+    let sh = (pos & 15u) * 2u;
+    let lo = seq_x_bits[w];
+    if (sh == 0u) {
+        return lo;
+    }
+    return (lo >> sh) | (seq_x_bits[w + 1u] << (32u - sh));
+}
+
+fn load_16_2bit_y(pos: u32, is_rev: u32) -> u32 {
+    let w = pos >> 4u;
+    let sh = (pos & 15u) * 2u;
+    if (is_rev == 0u) {
+        let lo = seq_y_bits[w];
+        if (sh == 0u) {
+            return lo;
+        }
+        return (lo >> sh) | (seq_y_bits[w + 1u] << (32u - sh));
+    } else {
+        let lo = seq_y_rc_bits[w];
+        if (sh == 0u) {
+            return lo;
+        }
+        return (lo >> sh) | (seq_y_rc_bits[w + 1u] << (32u - sh));
+    }
+}
+
 fn is_special(bm_off: u32, pos: u32) -> bool {
     if (bm_off == NONE_OFF) {
         return false;
     }
     return ((special_bm[bm_off + (pos >> 5u)] >> (pos & 31u)) & 1u) != 0u;
+}
+
+fn load_16_special(bm_off: u32, pos: u32) -> u32 {
+    if (bm_off == NONE_OFF) {
+        return 0u;
+    }
+    let w = bm_off + (pos >> 5u);
+    let sh = pos & 31u;
+    let lo = special_bm[w];
+    if (sh <= 16u) {
+        return (lo >> sh) & 0xFFFFu;
+    }
+    let hi = special_bm[w + 1u];
+    return ((lo >> sh) | (hi << (32u - sh))) & 0xFFFFu;
 }
 
 fn base_2bit_to_ascii(b: u32) -> u32 {
@@ -150,21 +193,92 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let iupac_y_off = select(params.iupac_y_off, params.iupac_yrc_off, is_rev != 0u);
     let iupac_y_len = select(params.iupac_y_len, params.iupac_yrc_len, is_rev != 0u);
 
-    // Forward pass
+    // Initial seed identity and score (exact for both contiguous and spaced seeds)
+    var n_ident: u32 = wl;
+    var fscore: i32 = match_sc * i32(wl);
+    if (params.is_spaced != 0u) {
+        let bits = 2u * wl;
+        var m_lo: u32 = 0xFFFFFFFFu;
+        var m_hi: u32 = 0xFFFFFFFFu;
+        if (bits < 32u) {
+            m_lo = (1u << bits) - 1u;
+            m_hi = 0u;
+        } else if (bits == 32u) {
+            m_lo = 0xFFFFFFFFu;
+            m_hi = 0u;
+        } else if (bits < 64u) {
+            m_lo = 0xFFFFFFFFu;
+            m_hi = (1u << (bits - 32u)) - 1u;
+        }
+        let d_lo = (load_16_2bit_x(pos_x) ^ load_16_2bit_y(pos_y, is_rev)) & m_lo;
+        let d_hi = (load_16_2bit_x(pos_x + 16u) ^ load_16_2bit_y(pos_y + 16u, is_rev)) & m_hi;
+        let mm_lo = (d_lo | (d_lo >> 1u)) & 0x55555555u;
+        let mm_hi = (d_hi | (d_hi >> 1u)) & 0x55555555u;
+        let mm = countOneBits(mm_lo) + countOneBits(mm_hi);
+        n_ident = wl - mm;
+        fscore = i32(n_ident) * match_sc - i32(mm) * mm_pen;
+    }
+
+    // Forward pass with 16-bp exact-match word fast path
     let xfil = pos_x + wl;
     let ycol = pos_y + wl;
     let rem_fwd = min(params.len_x - xfil, params.len_y - ycol);
 
     var xfilmax = pos_x + wl - 1u;
     var ycolmax = pos_y + wl - 1u;
-    var fscore: i32 = match_sc * i32(wl);
     var fscore_max: i32 = fscore;
-    var n_ident: u32 = wl;
-    var max_ident: u32 = wl;
+    var max_ident: u32 = n_ident;
 
-    for (var step: u32 = 0u; step < rem_fwd; step = step + 1u) {
+    var step: u32 = 0u;
+    loop {
+        if (step >= rem_fwd) { break; }
         let px = xfil + step;
         let py = ycol + step;
+
+        if (step + 16u <= rem_fwd) {
+            let sp16 = load_16_special(sp_x_off, px) | load_16_special(sp_y_off, py);
+            if (sp16 == 0u) {
+                let wx = load_16_2bit_x(px);
+                let wy = load_16_2bit_y(py, is_rev);
+                if (wx == wy) {
+                    fscore = fscore + 16 * match_sc;
+                    n_ident = n_ident + 16u;
+                    if (fscore_max < fscore) {
+                        fscore_max = fscore;
+                        xfilmax = px + 15u;
+                        ycolmax = py + 15u;
+                        max_ident = n_ident;
+                    }
+                    step = step + 16u;
+                    continue;
+                }
+                var diff = wx ^ wy;
+                var terminated = false;
+                for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+                    if ((diff & 3u) == 0u) {
+                        fscore = fscore + match_sc;
+                        n_ident = n_ident + 1u;
+                        if (fscore_max < fscore) {
+                            fscore_max = fscore;
+                            xfilmax = px + k;
+                            ycolmax = py + k;
+                            max_ident = n_ident;
+                        }
+                    } else {
+                        fscore = fscore - mm_pen;
+                        if (fscore < 0) {
+                            terminated = true;
+                            break;
+                        }
+                    }
+                    diff = diff >> 2u;
+                }
+                if (terminated) { break; }
+                step = step + 16u;
+                continue;
+            }
+        }
+
         let sp_x = is_special(sp_x_off, px);
         let sp_y = is_special(sp_y_off, py);
         if (!sp_x && !sp_y) {
@@ -212,6 +326,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (fscore < 0) {
             break;
         }
+        step = step + 1u;
     }
 
     // Backward pass: starts with fscore = fscore_max (exact GECKO FragHits.c semantics)
@@ -221,9 +336,58 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     fscore = fscore_max;
     n_ident = max_ident;
 
-    for (var step: u32 = 1u; step <= rem_bwd; step = step + 1u) {
-        let px = pos_x - step;
-        let py = pos_y - step;
+    var bstep: u32 = 1u;
+    loop {
+        if (bstep > rem_bwd) { break; }
+
+        if (bstep + 15u <= rem_bwd) {
+            let px_lo = pos_x - bstep - 15u;
+            let py_lo = pos_y - bstep - 15u;
+            let sp16 = load_16_special(sp_x_off, px_lo) | load_16_special(sp_y_off, py_lo);
+            if (sp16 == 0u) {
+                let wx = load_16_2bit_x(px_lo);
+                let wy = load_16_2bit_y(py_lo, is_rev);
+                if (wx == wy) {
+                    fscore = fscore + 16 * match_sc;
+                    n_ident = n_ident + 16u;
+                    if (fscore_max < fscore) {
+                        fscore_max = fscore;
+                        xfilmax2 = px_lo;
+                        ycolmax2 = py_lo;
+                        max_ident = n_ident;
+                    }
+                    bstep = bstep + 16u;
+                    continue;
+                }
+                var diff = wx ^ wy;
+                var terminated = false;
+                for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+                    let lane = 15u - k;
+                    if (((diff >> (lane * 2u)) & 3u) == 0u) {
+                        fscore = fscore + match_sc;
+                        n_ident = n_ident + 1u;
+                        if (fscore_max < fscore) {
+                            fscore_max = fscore;
+                            xfilmax2 = px_lo + lane;
+                            ycolmax2 = py_lo + lane;
+                            max_ident = n_ident;
+                        }
+                    } else {
+                        fscore = fscore - mm_pen;
+                        if (fscore < 0) {
+                            terminated = true;
+                            break;
+                        }
+                    }
+                }
+                if (terminated) { break; }
+                bstep = bstep + 16u;
+                continue;
+            }
+        }
+
+        let px = pos_x - bstep;
+        let py = pos_y - bstep;
         let sp_x = is_special(sp_x_off, px);
         let sp_y = is_special(sp_y_off, py);
         if (!sp_x && !sp_y) {
@@ -271,20 +435,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (fscore < 0) {
             break;
         }
+        bstep = bstep + 1u;
     }
 
     let length = xfilmax - xfilmax2 + 1u;
-    if (length > params.min_len) {
-        let sim = (f32(fscore_max) * 100.0) / f32(length * u32(match_sc));
-        let sim_th = f32(params.sim_th_x100) / 100.0;
-        if (sim > sim_th) {
-            let slot = atomicAdd(&frag_count, 1u);
-            if (slot < params.max_frags) {
-                out_frags[slot] = FragOut(
-                    xfilmax2, ycolmax2, xfilmax, ycolmax,
-                    max_ident, u32(fscore_max), is_rev, 0u
-                );
-            }
+    // Strict `>` matches GECKO CPU/CUDA filter semantics.
+    let lhs = u32(max(fscore_max, 0)) * 10000u;
+    let rhs = length * u32(match_sc) * params.sim_th_x100;
+    if (length > params.min_len && lhs > rhs) {
+        let slot = atomicAdd(&frag_count, 1u);
+        if (slot < params.max_frags) {
+            out_frags[slot] = FragOut(
+                xfilmax2,
+                ycolmax2,
+                xfilmax,
+                ycolmax,
+                max_ident,
+                u32(fscore_max),
+                is_rev,
+                0u
+            );
         }
     }
 }

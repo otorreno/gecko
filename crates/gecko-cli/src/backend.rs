@@ -135,9 +135,6 @@ pub fn resolve_backend(
             if let Err(e) = probe_wgpu_info(allow_software_gpu) {
                 bail!("WGPU backend requested but unavailable: {e}");
             }
-            if config.spaced_mask_2bit().is_some() {
-                bail!("WGPU backend does not yet support --spaced-seed; use --backend cuda or --backend cpu");
-            }
             if !(8..=32).contains(&config.word_length) {
                 bail!(
                     "WGPU backend requires word_length in 8..=32 (got {}); use --backend cpu",
@@ -151,7 +148,7 @@ pub fn resolve_backend(
                 if probe_cuda_info().is_ok() {
                     return Ok(SelectedBackend::Cuda);
                 }
-                if config.spaced_mask_2bit().is_none() && probe_wgpu_info(allow_software_gpu).is_ok() {
+                if probe_wgpu_info(allow_software_gpu).is_ok() {
                     return Ok(SelectedBackend::Wgpu);
                 }
             }

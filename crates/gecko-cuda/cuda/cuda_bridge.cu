@@ -9,6 +9,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -244,6 +245,8 @@ struct GeckoCudaRefHandle {
     GpuSeqBuf seqY_rc;
     int wl;
     uint64_t seed_mask;
+    uint32_t freq_limit;
+    uint32_t num_slabs;
     bool is_spaced;
     bool soft_mask;
     bool compare_reverse;
@@ -260,6 +263,39 @@ struct GeckoCudaResult {
     uint32_t index_valid;
     int32_t bucket_bits;
 };
+
+static uint32_t choose_cuda_slab_count(uint64_t total_valid_kmers) {
+    if (total_valid_kmers == 0ULL) return 1U;
+
+    uint64_t max_kmers_per_slab = 0ULL;
+    if (const char *env = std::getenv("GECKO_CUDA_MAX_SLAB_KMERS")) {
+        unsigned long long parsed = std::strtoull(env, nullptr, 10);
+        if (parsed >= 100000ULL) {
+            max_kmers_per_slab = (uint64_t)parsed;
+        }
+    }
+
+    if (max_kmers_per_slab == 0ULL) {
+        size_t free_vram = 0, total_vram = 0;
+        if (cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess) {
+            /* Reserve VRAM for query sequence, tile scratch (~460 MiB), and bucket table headroom. */
+            size_t reserve = std::max<size_t>(768ULL << 20, free_vram / 5ULL);
+            size_t avail = (free_vram > reserve) ? (free_vram - reserve) : (256ULL << 20);
+            /* Peak GPU build footprint: d_keys_a/b (16 B) + d_vals_a/b (8 B) + CUB temp + keep (~6 B) = ~30 B/k-mer */
+            max_kmers_per_slab = (uint64_t)(avail / 30ULL);
+            if (max_kmers_per_slab < 10000000ULL) max_kmers_per_slab = 10000000ULL;
+            if (max_kmers_per_slab > 0x7FFFFFFFULL) max_kmers_per_slab = 0x7FFFFFFFULL;
+        } else {
+            return 1U;
+        }
+    }
+
+    if (total_valid_kmers <= max_kmers_per_slab) return 1U;
+    uint64_t slabs = (total_valid_kmers + max_kmers_per_slab - 1ULL) / max_kmers_per_slab;
+    if (slabs < 2ULL) slabs = 2ULL;
+    if (slabs > 256ULL) slabs = 256ULL;
+    return (uint32_t)slabs;
+}
 
 extern "C" int gecko_cuda_probe(
     char *name_buf,
@@ -304,6 +340,8 @@ extern "C" GeckoCudaRefHandle *gecko_cuda_prepare_ref(
     h->wl = wl;
     uint64_t span_mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
     h->seed_mask = (seed_mask != 0ULL) ? seed_mask : span_mask;
+    h->freq_limit = freq_limit;
+    h->num_slabs = 1U;
     h->is_spaced = (h->seed_mask != span_mask);
     h->soft_mask = (soft_mask != 0);
     h->compare_reverse = (compare_reverse != 0);
@@ -360,7 +398,11 @@ extern "C" GeckoCudaRefHandle *gecko_cuda_prepare_ref(
         }
     }
 
-    h->idx = gpu_build_ref_index(h->seqY.view(), wl, h->seed_mask, freq_limit);
+    uint64_t total_valid = gpu_count_valid_kmers(h->seqY.view(), wl);
+    h->num_slabs = choose_cuda_slab_count(total_valid);
+    if (h->num_slabs == 1U) {
+        h->idx = gpu_build_ref_index(h->seqY.view(), wl, h->seed_mask, freq_limit, 0U, 256U);
+    }
     return h;
 }
 
@@ -376,9 +418,6 @@ extern "C" int gecko_cuda_query_and_extend(
 ) {
     if (!h || !query_seq || !out) return -1;
     memset(out, 0, sizeof(*out));
-    out->index_kept = h->idx.n_kept;
-    out->index_valid = h->idx.n_valid;
-    out->bucket_bits = h->idx.bucket_bits;
 
     if (ensure_scratch(h->scratch) != 0) {
         free_scratch(h->scratch);
@@ -421,65 +460,88 @@ extern "C" int gecko_cuda_query_and_extend(
     }
 
     uint64_t lenX = query_seq->len;
-    std::vector<std::pair<uint64_t, uint64_t>> tile_stack;
+    std::vector<std::pair<uint64_t, uint64_t>> base_tiles;
     for (uint64_t ts = 0; ts < lenX; ts += init_tile_bp) {
         uint64_t te = std::min<uint64_t>(ts + init_tile_bp, lenX);
-        tile_stack.push_back({ts, te});
+        base_tiles.push_back({ts, te});
     }
-    std::reverse(tile_stack.begin(), tile_stack.end());
+    std::reverse(base_tiles.begin(), base_tiles.end());
 
-    while (!tile_stack.empty()) {
-        uint64_t tile_start = tile_stack.back().first;
-        uint64_t tile_end = tile_stack.back().second;
-        tile_stack.pop_back();
-
-        uint32_t raw_leftmax = 0;
-        bool hit_overflow = false;
-        uint32_t n_filt = gpu_query_tile_left_maximal(
-            viewX, viewY, h->idx,
-            h->wl, h->seed_mask, h->compare_reverse,
-            tile_start, tile_end,
-            d_hits, d_hits_sorted, d_hit_flags, d_hit_count, d_filt_count,
-            h->scratch.d_cub_temp, h->scratch.cub_temp_cap,
-            (uint32_t)GECKO_MAX_TILE_HITS, raw_leftmax, hit_overflow);
-        if (hit_overflow && (tile_end - tile_start) > 1) {
-            uint64_t mid = tile_start + (tile_end - tile_start) / 2;
-            tile_stack.push_back({mid, tile_end});
-            tile_stack.push_back({tile_start, mid});
-            continue;
-        }
-        if (n_filt == 0) {
-            out->leftmax_hits += raw_leftmax;
-            continue;
+    for (uint32_t slab = 0; slab < h->num_slabs; slab++) {
+        GpuRefIndex transient_idx{};
+        const GpuRefIndex *active_idx = &h->idx;
+        if (h->num_slabs > 1U) {
+            uint32_t part_start = (slab * 256U) / h->num_slabs;
+            uint32_t part_end = ((slab + 1U) * 256U) / h->num_slabs;
+            if (part_start >= part_end) continue;
+            transient_idx = gpu_build_ref_index(
+                viewY, h->wl, h->seed_mask, h->freq_limit, part_start, part_end);
+            active_idx = &transient_idx;
         }
 
-        bool frag_overflow = false;
-        uint32_t n_frags = gpu_extend_tile_two_tier(
-            d_hits, n_filt, viewX, viewY, viewY_rc,
-            h->wl, h->is_spaced, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
-            d_long_seeds, d_long_count, d_out_frags, d_frag_count,
-            (uint32_t)GECKO_MAX_TILE_FRAGS, frag_overflow);
-        if (frag_overflow && (tile_end - tile_start) > 1) {
-            uint64_t mid = tile_start + (tile_end - tile_start) / 2;
-            tile_stack.push_back({mid, tile_end});
-            tile_stack.push_back({tile_start, mid});
-            continue;
-        }
+        out->index_kept += active_idx->n_kept;
+        out->index_valid += active_idx->n_valid;
+        out->bucket_bits = active_idx->bucket_bits;
 
-        out->leftmax_hits += raw_leftmax;
-        out->extended_hits += n_filt;
+        std::vector<std::pair<uint64_t, uint64_t>> tile_stack = base_tiles;
+        while (!tile_stack.empty()) {
+            uint64_t tile_start = tile_stack.back().first;
+            uint64_t tile_end = tile_stack.back().second;
+            tile_stack.pop_back();
 
-        if (n_frags > 0) {
-            size_t old_n = all_frags.size();
-            all_frags.resize(old_n + n_frags);
-            if (download_d2h_staged(
-                    all_frags.data() + old_n,
-                    d_out_frags,
-                    (size_t)n_frags * sizeof(GpuFrag),
-                    &h->scratch) != 0) {
-                free_gpu_seq(seqX);
-                return -1;
+            uint32_t raw_leftmax = 0;
+            bool hit_overflow = false;
+            uint32_t n_filt = gpu_query_tile_left_maximal(
+                viewX, viewY, *active_idx,
+                h->wl, h->seed_mask, h->compare_reverse,
+                tile_start, tile_end,
+                d_hits, d_hits_sorted, d_hit_flags, d_hit_count, d_filt_count,
+                h->scratch.d_cub_temp, h->scratch.cub_temp_cap,
+                (uint32_t)GECKO_MAX_TILE_HITS, raw_leftmax, hit_overflow);
+            if (hit_overflow && (tile_end - tile_start) > 1) {
+                uint64_t mid = tile_start + (tile_end - tile_start) / 2;
+                tile_stack.push_back({mid, tile_end});
+                tile_stack.push_back({tile_start, mid});
+                continue;
             }
+            if (n_filt == 0) {
+                out->leftmax_hits += raw_leftmax;
+                continue;
+            }
+
+            bool frag_overflow = false;
+            uint32_t n_frags = gpu_extend_tile_two_tier(
+                d_hits, n_filt, viewX, viewY, viewY_rc,
+                h->wl, h->is_spaced, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
+                d_long_seeds, d_long_count, d_out_frags, d_frag_count,
+                (uint32_t)GECKO_MAX_TILE_FRAGS, frag_overflow);
+            if (frag_overflow && (tile_end - tile_start) > 1) {
+                uint64_t mid = tile_start + (tile_end - tile_start) / 2;
+                tile_stack.push_back({mid, tile_end});
+                tile_stack.push_back({tile_start, mid});
+                continue;
+            }
+
+            out->leftmax_hits += raw_leftmax;
+            out->extended_hits += n_filt;
+
+            if (n_frags > 0) {
+                size_t old_n = all_frags.size();
+                all_frags.resize(old_n + n_frags);
+                if (download_d2h_staged(
+                        all_frags.data() + old_n,
+                        d_out_frags,
+                        (size_t)n_frags * sizeof(GpuFrag),
+                        &h->scratch) != 0) {
+                    if (h->num_slabs > 1U) gpu_free_ref_index(transient_idx);
+                    free_gpu_seq(seqX);
+                    return -1;
+                }
+            }
+        }
+
+        if (h->num_slabs > 1U) {
+            gpu_free_ref_index(transient_idx);
         }
     }
     CUDA_CHECK(cudaDeviceSynchronize());

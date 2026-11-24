@@ -18,6 +18,9 @@ static __global__ void query_left_maximal_kernel(
     const uint32_t * __restrict__ dropped_bitmap,
     int shift_bits,
     int tag_shift,
+    uint32_t part_start,
+    uint32_t part_end,
+    uint32_t bucket_base,
     int wl,
     uint64_t seed_mask,
     bool compare_reverse,
@@ -37,6 +40,8 @@ static __global__ void query_left_maximal_kernel(
     uint64_t mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
     uint64_t eff_mask = (seed_mask != 0ULL) ? seed_mask : mask;
     bool is_spaced = (eff_mask != mask);
+    bool part_filter = (part_start != 0U || part_end != 256U);
+    bool skip_lr = is_spaced || part_filter;
     int rc_shift = 2 * (wl - 1);
     int rev_rshift = 64 - 2 * wl;
     uint64_t scan_from = (t_start >= (uint64_t)(wl - 1)) ? (t_start - (uint64_t)(wl - 1)) : 0ULL;
@@ -75,7 +80,11 @@ static __global__ void query_left_maximal_kernel(
                     bool is_pal = (sf == sr);
 
                     uint64_t h = fmix64(canon);
-                    uint32_t bkt = (uint32_t)(h >> shift_bits);
+                    if (part_filter) {
+                        uint32_t p = (uint32_t)(h >> 56);
+                        if (p < part_start || p >= part_end) continue;
+                    }
+                    uint32_t bkt = (uint32_t)(h >> shift_bits) - bucket_base;
                     uint32_t st = __ldg(&bucket_off[bkt]);
                     uint32_t en = __ldg(&bucket_off[bkt + 1]);
                     if (st == en) continue;
@@ -96,9 +105,9 @@ static __global__ void query_left_maximal_kernel(
                     if (j >= en || __ldg(&idx_tags[j]) != tag) continue;
 
                     uint64_t x_seed_lsb = load_32_2bit(seqX.bits, posX) & eff_mask;
-                    bool prev_x_valid = !is_spaced && (posX > 0U) && !is_bit_set(seqX.invalid_bm, posX - 1U);
+                    bool prev_x_valid = !skip_lr && (posX > 0U) && !is_bit_set(seqX.invalid_bm, posX - 1U);
                     uint32_t prev_x_2bit = prev_x_valid ? base_2bit_dev(seqX.bits, posX - 1U) : 4U;
-                    bool next_x_valid = !is_spaced && ((uint64_t)posX + (uint64_t)wl < seqX.len) &&
+                    bool next_x_valid = !skip_lr && ((uint64_t)posX + (uint64_t)wl < seqX.len) &&
                                         !is_bit_set(seqX.invalid_bm, posX + (uint32_t)wl);
                     uint32_t next_x_2bit = next_x_valid ? base_2bit_dev(seqX.bits, posX + (uint32_t)wl) : 4U;
 
@@ -118,7 +127,7 @@ static __global__ void query_left_maximal_kernel(
                                                  !is_bit_set(seqY.invalid_bm, posY_orig + (uint32_t)wl) &&
                                                  (base_2bit_dev(seqY.bits, posY_orig + (uint32_t)wl) == next_x_2bit) &&
                                                  !is_bit_set(dropped_bitmap, posY_orig + 1U);
-                                if (is_spaced || !left_ext || !right_ext) {
+                                if (skip_lr || !left_ext || !right_ext) {
                                     if (*hit_count <= max_hits) {
                                         uint32_t slot = atomicAdd(hit_count, 1U);
                                         if (slot < max_hits) {
@@ -143,7 +152,7 @@ static __global__ void query_left_maximal_kernel(
                                                  !is_bit_set(seqY.invalid_bm, posY_orig - 1U) &&
                                                  ((base_2bit_dev(seqY.bits, posY_orig - 1U) ^ 3U) == next_x_2bit) &&
                                                  !is_bit_set(dropped_bitmap, posY_orig - 1U);
-                                if (is_spaced || !left_ext || !right_ext) {
+                                if (skip_lr || !left_ext || !right_ext) {
                                     if (*hit_count <= max_hits) {
                                         uint32_t slot = atomicAdd(hit_count, 1U);
                                         if (slot < max_hits) {
@@ -230,8 +239,9 @@ uint32_t gpu_query_tile_left_maximal(
     uint32_t grid = (uint32_t)((n_threads + 255) / 256);
     query_left_maximal_kernel<<<grid, 256>>>(
         seqX, seqY,
-        idx.d_bucket_off, idx.d_tags, idx.d_vals, idx.d_dropped_bitmap, idx.shift_bits, idx.tag_shift, wl,
-        seed_mask, compare_reverse,
+        idx.d_bucket_off, idx.d_tags, idx.d_vals, idx.d_dropped_bitmap,
+        idx.shift_bits, idx.tag_shift, idx.part_start, idx.part_end, idx.bucket_base,
+        wl, seed_mask, compare_reverse,
         tile_start, tile_end, d_hits, d_hit_count, max_hits);
     CUDA_CHECK_VOID(cudaGetLastError());
 

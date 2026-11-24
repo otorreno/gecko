@@ -105,6 +105,9 @@ struct GpuRefIndex {
     int bucket_bits;
     int shift_bits;
     int tag_shift;
+    uint32_t part_start;        /* active coarse hash partition range [part_start .. part_end) in 0..256 */
+    uint32_t part_end;
+    uint32_t bucket_base;       /* part_start << (bucket_bits - 8) */
 };
 
 struct GpuFrag {
@@ -224,11 +227,18 @@ void gpu_build_revcomp_2bit(
     uint64_t len
 );
 
+uint64_t gpu_count_valid_kmers(
+    const GpuSeqView &seqY,
+    int wl
+);
+
 GpuRefIndex gpu_build_ref_index(
     const GpuSeqView &seqY,
     int wl,
     uint64_t seed_mask,
-    uint32_t freq_limit
+    uint32_t freq_limit,
+    uint32_t part_start = 0U,
+    uint32_t part_end = 256U
 );
 
 void gpu_free_ref_index(GpuRefIndex &idx);

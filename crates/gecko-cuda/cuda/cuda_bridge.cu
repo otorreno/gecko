@@ -243,6 +243,8 @@ struct GeckoCudaRefHandle {
     GpuSeqBuf seqY;
     GpuSeqBuf seqY_rc;
     int wl;
+    uint64_t seed_mask;
+    bool is_spaced;
     bool soft_mask;
     bool compare_reverse;
     GpuRefIndex idx;
@@ -287,6 +289,7 @@ extern "C" int gecko_cuda_probe(
 extern "C" GeckoCudaRefHandle *gecko_cuda_prepare_ref(
     const GeckoPackedSeqHost *ref_seq,
     int wl,
+    uint64_t seed_mask,
     uint32_t freq_limit,
     int soft_mask,
     int compare_reverse
@@ -299,6 +302,9 @@ extern "C" GeckoCudaRefHandle *gecko_cuda_prepare_ref(
 
     auto *h = new GeckoCudaRefHandle{};
     h->wl = wl;
+    uint64_t span_mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
+    h->seed_mask = (seed_mask != 0ULL) ? seed_mask : span_mask;
+    h->is_spaced = (h->seed_mask != span_mask);
     h->soft_mask = (soft_mask != 0);
     h->compare_reverse = (compare_reverse != 0);
 
@@ -354,7 +360,7 @@ extern "C" GeckoCudaRefHandle *gecko_cuda_prepare_ref(
         }
     }
 
-    h->idx = gpu_build_ref_index(h->seqY.view(), wl, freq_limit);
+    h->idx = gpu_build_ref_index(h->seqY.view(), wl, h->seed_mask, freq_limit);
     return h;
 }
 
@@ -431,7 +437,7 @@ extern "C" int gecko_cuda_query_and_extend(
         bool hit_overflow = false;
         uint32_t n_filt = gpu_query_tile_left_maximal(
             viewX, viewY, h->idx,
-            h->wl, h->compare_reverse,
+            h->wl, h->seed_mask, h->compare_reverse,
             tile_start, tile_end,
             d_hits, d_hits_sorted, d_hit_flags, d_hit_count, d_filt_count,
             h->scratch.d_cub_temp, h->scratch.cub_temp_cap,
@@ -450,7 +456,7 @@ extern "C" int gecko_cuda_query_and_extend(
         bool frag_overflow = false;
         uint32_t n_frags = gpu_extend_tile_two_tier(
             d_hits, n_filt, viewX, viewY, viewY_rc,
-            h->wl, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
+            h->wl, h->is_spaced, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
             d_long_seeds, d_long_count, d_out_frags, d_frag_count,
             (uint32_t)GECKO_MAX_TILE_FRAGS, frag_overflow);
         if (frag_overflow && (tile_end - tile_start) > 1) {

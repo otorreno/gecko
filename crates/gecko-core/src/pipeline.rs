@@ -8,8 +8,9 @@ use crate::formats::csv::ComparisonMetadata;
 use crate::formats::frags::Fragment;
 use crate::hits::{HitOptions, generate_and_consume_hits, generate_and_consume_hits_from_index};
 use crate::kmer::{DictOptions, INDEX_WORD_SIZE, KmerDict, KmerIndex};
-use crate::ref_index::{RefIndex, compute_partition_slabs};
+use crate::ref_index::{RefIndex, compute_partition_slabs_with_mask};
 use crate::seq::Genome;
+use crate::spaced::SpacedSeed;
 use crate::stream::{compare_streaming, dedup_fragments};
 
 /// Full configuration for a pairwise GECKO comparison.
@@ -20,7 +21,10 @@ pub struct CompareConfig {
     /// Minimum similarity percentage threshold (`0.0 ..= 100.0`).
     pub min_similarity: f32,
     /// Seed k-mer length (`4..=32`; no longer limited to multiples of 4).
+    /// When `spaced_seed` is set, this must equal `spaced_seed.span`.
     pub word_length: usize,
+    /// Optional palindromic spaced-seed pattern (`None` for contiguous seeds).
+    pub spaced_seed: Option<SpacedSeed>,
     /// Skip reference words occurring more than `freq_limit` times per strand (default `1000`).
     pub freq_limit: u64,
     /// Subsampling cap per word list (default `10_000`).
@@ -43,6 +47,7 @@ impl Default for CompareConfig {
             min_length: 40,
             min_similarity: 60.0,
             word_length: 12,
+            spaced_seed: None,
             freq_limit: 1000,
             max_rep: 10_000,
             fixed_length: true,
@@ -55,11 +60,27 @@ impl Default for CompareConfig {
 }
 
 impl CompareConfig {
+    /// Return the active 2-bit spaced-seed mask if a gapped spaced seed is configured, else `None`.
+    #[inline]
+    pub fn spaced_mask_2bit(&self) -> Option<u64> {
+        self.spaced_seed
+            .as_ref()
+            .and_then(|s| s.gapped_mask_2bit())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !(4..=32).contains(&self.word_length) {
             return Err(GeckoError::InvalidParameter(format!(
                 "word_length must be between 4 and 32, got {}",
                 self.word_length
+            )));
+        }
+        if let Some(ref sp) = self.spaced_seed
+            && sp.span != self.word_length
+        {
+            return Err(GeckoError::InvalidParameter(format!(
+                "spaced_seed span ({}) must match word_length ({})",
+                sp.span, self.word_length
             )));
         }
         if !(0.0..=100.0).contains(&self.min_similarity) {
@@ -152,18 +173,21 @@ pub fn compare_genomes(
     cache_dir: Option<&Path>,
 ) -> Result<CompareResult> {
     config.validate()?;
+    let spaced_mask = config.spaced_mask_2bit();
 
-    if cache_dir.is_none() {
-        if RefIndex::fits_in_budget(
+    if cache_dir.is_none() || spaced_mask.is_some() {
+        if RefIndex::fits_in_budget_with_mask(
             reference,
             config.word_length,
+            spaced_mask,
             config.soft_mask,
             config.compare_reverse,
             config.memory_budget,
         ) {
-            let ref_index = RefIndex::build(
+            let ref_index = RefIndex::build_with_mask(
                 reference,
                 config.word_length,
+                spaced_mask,
                 config.freq_limit,
                 config.soft_mask,
             )?;
@@ -175,13 +199,19 @@ pub fn compare_genomes(
             return compare_streaming(query, reference, &ref_index, rev_ref.as_ref(), config);
         }
 
-        if let Some(max_kmers_per_slab) = RefIndex::max_kmers_per_slab_for_budget(
+        if let Some(max_kmers_per_slab) = RefIndex::max_kmers_per_slab_for_budget_with_mask(
             reference,
             config.word_length,
+            spaced_mask,
             config.compare_reverse,
             config.memory_budget,
         ) {
             return compare_genomes_slab_streaming(query, reference, config, max_kmers_per_slab);
+        }
+
+        if spaced_mask.is_some() {
+            // Spaced seeds use Hash-CSR slab streaming even under tight memory budgets.
+            return compare_genomes_slab_streaming(query, reference, config, 4_000_000);
         }
     }
 
@@ -200,9 +230,11 @@ pub(crate) fn compare_genomes_slab_streaming(
     config: &CompareConfig,
     max_kmers_per_slab: usize,
 ) -> Result<CompareResult> {
-    let slabs = compute_partition_slabs(
+    let spaced_mask = config.spaced_mask_2bit();
+    let slabs = compute_partition_slabs_with_mask(
         reference,
         config.word_length,
+        spaced_mask,
         config.soft_mask,
         max_kmers_per_slab,
     );
@@ -227,11 +259,12 @@ pub(crate) fn compare_genomes_slab_streaming(
     };
 
     for (part_start, part_end) in slabs {
-        let slab_index = RefIndex::build_partitions(
+        let slab_index = RefIndex::build_partitions_with_mask(
             reference,
             part_start,
             part_end,
             config.word_length,
+            spaced_mask,
             config.freq_limit,
             config.soft_mask,
         )?;
@@ -367,6 +400,7 @@ fn run_strand(
         fixed_length: config.fixed_length,
         strand,
         scoring: config.scoring,
+        spaced_seed: false,
     };
 
     let mut strand_frags: u64 = 0;
@@ -406,6 +440,7 @@ fn run_strand_index(
         fixed_length: config.fixed_length,
         strand,
         scoring: config.scoring,
+        spaced_seed: false,
     };
 
     let mut strand_frags: u64 = 0;
@@ -784,5 +819,113 @@ mod tests {
                 "expected only uniq_block HSP (rep_block masked by FL=2) for wl={wl}"
             );
         }
+    }
+
+    #[test]
+    fn spaced_seed_discovers_divergent_homologs_on_both_strands() {
+        let mut rng = 0x5A17_C0DE_BEEF_1234u64;
+        let bases = *b"ACGT";
+        let mut next_dna = |len: usize| -> String {
+            let mut s = Vec::with_capacity(len);
+            for _ in 0..len {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                s.push(bases[((rng >> 33) & 3) as usize]);
+            }
+            String::from_utf8(s).unwrap()
+        };
+        let mutate_every_8 = |src: &str| -> String {
+            src.bytes()
+                .enumerate()
+                .map(|(i, b)| {
+                    if i % 8 == 3 {
+                        match b {
+                            b'A' => b'C',
+                            b'C' => b'G',
+                            b'G' => b'T',
+                            _ => b'A',
+                        }
+                    } else {
+                        b
+                    }
+                })
+                .map(|b| b as char)
+                .collect()
+        };
+        let revcomp = |src: &str| -> String {
+            src.bytes()
+                .rev()
+                .map(|b| match b {
+                    b'A' => 'T',
+                    b'C' => 'G',
+                    b'G' => 'C',
+                    _ => 'A',
+                })
+                .collect()
+        };
+
+        let fwd_orig = next_dna(180);
+        let rev_orig = next_dna(180);
+        // Every 8th base is mutated (87.5% identity, max contiguous run is 7 bp!):
+        // contiguous k=12 finds 0 hits, while spaced seed `1110111110111` (w=11/s=13) or `w12s18`
+        // finds BOTH forward and reverse homologs!
+        let fwd_mut = mutate_every_8(&fwd_orig);
+        let rev_mut_rc = revcomp(&mutate_every_8(&rev_orig));
+
+        let q = Genome::from_records(
+            "q",
+            [(
+                "q0",
+                format!("{}{}{}{}{}", next_dna(200), fwd_orig, next_dna(200), rev_orig, next_dna(200)),
+            )],
+        );
+        let r = Genome::from_records(
+            "r",
+            [(
+                "r0",
+                format!("{}{}{}{}{}", next_dna(200), fwd_mut, next_dna(200), rev_mut_rc, next_dna(200)),
+            )],
+        );
+
+        let cfg_contig = CompareConfig {
+            min_length: 100,
+            min_similarity: 70.0,
+            word_length: 12,
+            spaced_seed: None,
+            ..Default::default()
+        };
+        let res_contig = compare_genomes(&q, &r, &cfg_contig, None).unwrap();
+        assert_eq!(res_contig.fragments.len(), 0, "contiguous k=12 must miss 7-bp-capped matches");
+
+        // Pattern `111011110111`? Check period-8 alignment: positions i%8==3 are mutated (distance 8).
+        // `111011111110111` has don't-care at indices 3 and 11 (distance 8, palindromic, w=13/s=15)!
+        let sp = SpacedSeed::parse("111011111110111").unwrap();
+        let cfg_spaced = CompareConfig {
+            min_length: 100,
+            min_similarity: 70.0,
+            word_length: sp.span,
+            spaced_seed: Some(sp),
+            ..Default::default()
+        };
+        let res_spaced = compare_genomes(&q, &r, &cfg_spaced, None).unwrap();
+        assert_eq!(res_spaced.fragments.len(), 2, "spaced seed must recover both fwd & rev HSPs");
+        assert!(res_spaced.fragments.iter().any(|f| f.strand == 'f'));
+        assert!(res_spaced.fragments.iter().any(|f| f.strand == 'r'));
+        for f in &res_spaced.fragments {
+            assert!(
+                f.length >= 160 && f.ident >= 150 && f.similarity > 72.0,
+                "unexpected frag: {f:?}"
+            );
+        }
+
+        // Verify multi-slab partition streaming matches single-slab bit-for-bit with spaced seeds.
+        let res_slab = compare_genomes_slab_streaming(&q, &r, &cfg_spaced, 150).unwrap();
+        let key = |f: &Fragment| (f.strand, f.seq_x, f.seq_y, f.diag, f.x_start, f.x_end);
+        let mut a = res_spaced.fragments.clone();
+        let mut b = res_slab.fragments.clone();
+        a.sort_by_key(key);
+        b.sort_by_key(key);
+        assert_eq!(a, b);
     }
 }

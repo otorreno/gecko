@@ -227,6 +227,7 @@ void gpu_build_revcomp_2bit(
 GpuRefIndex gpu_build_ref_index(
     const GpuSeqView &seqY,
     int wl,
+    uint64_t seed_mask,
     uint32_t freq_limit
 );
 
@@ -237,6 +238,7 @@ uint32_t gpu_query_tile_left_maximal(
     const GpuSeqView &seqY,
     const GpuRefIndex &idx,
     int wl,
+    uint64_t seed_mask,
     bool compare_reverse,
     uint64_t tile_start,
     uint64_t tile_end,
@@ -259,6 +261,7 @@ uint32_t gpu_extend_tile_two_tier(
     const GpuSeqView &seqY,
     const GpuSeqView &seqY_rc,
     int wl,
+    bool is_spaced,
     uint32_t min_len,
     float sim_th,
     int match_score,

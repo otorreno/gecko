@@ -145,6 +145,8 @@ pub struct RefIndex {
     pub word_length: usize,
     pub freq_limit: u64,
     pub soft_mask: bool,
+    /// Optional 2-bit palindromic spaced-seed mask (`None` for contiguous seeds).
+    pub spaced_mask: Option<u64>,
     pub ref_data_len: usize,
     pub total_kmers: usize,
     pub kept_entries: usize,
@@ -159,6 +161,11 @@ pub fn use_direct_csr(word_length: usize, ref_total_bases: u64) -> bool {
     word_length <= 10
         || (word_length <= 12
             && (1u64 << (2 * word_length)) <= 2u64.saturating_mul(ref_total_bases))
+}
+
+#[inline]
+fn use_direct_csr_for(word_length: usize, ref_total_bases: u64, spaced_mask: Option<u64>) -> bool {
+    spaced_mask.is_none() && use_direct_csr(word_length, ref_total_bases)
 }
 
 /// Choose Hash-CSR bucket bits `P` in `14..=26` targeting ~3–4 entries per bucket.
@@ -260,6 +267,17 @@ pub fn compute_partition_slabs(
     soft_mask: bool,
     max_kmers_per_slab: usize,
 ) -> Vec<(u16, u16)> {
+    compute_partition_slabs_with_mask(reference, word_length, None, soft_mask, max_kmers_per_slab)
+}
+
+/// Partition the 256 coarse k-mer partitions (`0..256`) with optional spaced-seed mask.
+pub fn compute_partition_slabs_with_mask(
+    reference: &Genome,
+    word_length: usize,
+    spaced_mask: Option<u64>,
+    soft_mask: bool,
+    max_kmers_per_slab: usize,
+) -> Vec<(u16, u16)> {
     let total_kmers = count_valid_kmers(reference, word_length, soft_mask);
     if total_kmers == 0 {
         return Vec::new();
@@ -269,7 +287,7 @@ pub fn compute_partition_slabs(
         return vec![(0, NUM_PARTITIONS as u16)];
     }
 
-    if !use_direct_csr(word_length, reference.total_bases) {
+    if !use_direct_csr_for(word_length, reference.total_bases, spaced_mask) {
         // Hash-CSR partitions by top 8 bits of `fmix64(canon)`, which is uniform to <0.2%.
         let num_slabs = total_kmers.div_ceil(cap).clamp(1, NUM_PARTITIONS);
         let mut slabs = Vec::with_capacity(num_slabs);
@@ -335,6 +353,7 @@ impl RefIndex {
         reference: &Genome,
         total_kmers: usize,
         word_length: usize,
+        spaced_mask: Option<u64>,
         compare_reverse: bool,
     ) -> usize {
         if total_kmers >= u32::MAX as usize {
@@ -352,7 +371,7 @@ impl RefIndex {
         };
         let threads = rayon::current_num_threads().max(1);
 
-        if use_direct_csr(word_length, reference.total_bases) {
+        if use_direct_csr_for(word_length, reference.total_bases, spaced_mask) {
             let sub_keys = 1usize << (2 * word_length - 8);
             let offsets_bytes = NUM_PARTITIONS * (sub_keys + 1) * std::mem::size_of::<u32>();
             let ps_total = total_kmers.saturating_mul(ps_bytes);
@@ -390,8 +409,24 @@ impl RefIndex {
         soft_mask: bool,
         compare_reverse: bool,
     ) -> usize {
+        Self::estimate_bytes_with_mask(reference, word_length, None, soft_mask, compare_reverse)
+    }
+
+    pub fn estimate_bytes_with_mask(
+        reference: &Genome,
+        word_length: usize,
+        spaced_mask: Option<u64>,
+        soft_mask: bool,
+        compare_reverse: bool,
+    ) -> usize {
         let total_kmers = count_valid_kmers(reference, word_length, soft_mask);
-        Self::estimate_bytes_for_kmers(reference, total_kmers, word_length, compare_reverse)
+        Self::estimate_bytes_for_kmers(
+            reference,
+            total_kmers,
+            word_length,
+            spaced_mask,
+            compare_reverse,
+        )
     }
 
     /// Check whether a single-slab `RefIndex` fits within `memory_budget`.
@@ -402,7 +437,31 @@ impl RefIndex {
         compare_reverse: bool,
         memory_budget: usize,
     ) -> bool {
-        Self::estimate_bytes(reference, word_length, soft_mask, compare_reverse) <= memory_budget
+        Self::fits_in_budget_with_mask(
+            reference,
+            word_length,
+            None,
+            soft_mask,
+            compare_reverse,
+            memory_budget,
+        )
+    }
+
+    pub fn fits_in_budget_with_mask(
+        reference: &Genome,
+        word_length: usize,
+        spaced_mask: Option<u64>,
+        soft_mask: bool,
+        compare_reverse: bool,
+        memory_budget: usize,
+    ) -> bool {
+        Self::estimate_bytes_with_mask(
+            reference,
+            word_length,
+            spaced_mask,
+            soft_mask,
+            compare_reverse,
+        ) <= memory_budget
     }
 
     /// Compute the maximum number of valid k-mers per reference slab that fits comfortably inside
@@ -411,6 +470,22 @@ impl RefIndex {
     pub fn max_kmers_per_slab_for_budget(
         reference: &Genome,
         word_length: usize,
+        compare_reverse: bool,
+        memory_budget: usize,
+    ) -> Option<usize> {
+        Self::max_kmers_per_slab_for_budget_with_mask(
+            reference,
+            word_length,
+            None,
+            compare_reverse,
+            memory_budget,
+        )
+    }
+
+    pub fn max_kmers_per_slab_for_budget_with_mask(
+        reference: &Genome,
+        word_length: usize,
+        spaced_mask: Option<u64>,
         compare_reverse: bool,
         memory_budget: usize,
     ) -> Option<usize> {
@@ -431,11 +506,12 @@ impl RefIndex {
         };
         // Peak build RAM per k-mer: Hash-CSR transient u64 keys (8 B, shrunk to 4 B tags) +
         // pos_strand + offsets/scratch headroom; Direct-CSR <= that.
-        let bytes_per_kmer = if use_direct_csr(word_length, reference.total_bases) {
-            ps_bytes + 5
-        } else {
-            8 + ps_bytes + 3
-        };
+        let bytes_per_kmer =
+            if use_direct_csr_for(word_length, reference.total_bases, spaced_mask) {
+                ps_bytes + 5
+            } else {
+                8 + ps_bytes + 3
+            };
         let usable = slab_budget * 7 / 10;
         let max_kmers = (usable / bytes_per_kmer).min((u32::MAX as usize) - 1);
         if max_kmers < 1_000_000 {
@@ -452,11 +528,23 @@ impl RefIndex {
         freq_limit: u64,
         soft_mask: bool,
     ) -> Result<Self> {
-        Self::build_partitions(
+        Self::build_with_mask(reference, word_length, None, freq_limit, soft_mask)
+    }
+
+    /// Build a canonical reference index with an optional 2-bit palindromic spaced-seed mask.
+    pub fn build_with_mask(
+        reference: &Genome,
+        word_length: usize,
+        spaced_mask: Option<u64>,
+        freq_limit: u64,
+        soft_mask: bool,
+    ) -> Result<Self> {
+        Self::build_partitions_with_mask(
             reference,
             0,
             NUM_PARTITIONS as u16,
             word_length,
+            spaced_mask,
             freq_limit,
             soft_mask,
         )
@@ -473,6 +561,28 @@ impl RefIndex {
         freq_limit: u64,
         soft_mask: bool,
     ) -> Result<Self> {
+        Self::build_partitions_with_mask(
+            reference,
+            part_start,
+            part_end,
+            word_length,
+            None,
+            freq_limit,
+            soft_mask,
+        )
+    }
+
+    /// Build a partition-slab canonical reference index with an optional 2-bit spaced-seed mask.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_partitions_with_mask(
+        reference: &Genome,
+        part_start: u16,
+        part_end: u16,
+        word_length: usize,
+        spaced_mask: Option<u64>,
+        freq_limit: u64,
+        soft_mask: bool,
+    ) -> Result<Self> {
         let max_starts = reference
             .seq
             .len
@@ -484,6 +594,7 @@ impl RefIndex {
             part_start as usize,
             part_end as usize,
             word_length,
+            spaced_mask,
             freq_limit,
             soft_mask,
         )
@@ -506,6 +617,7 @@ impl RefIndex {
             0,
             NUM_PARTITIONS,
             word_length,
+            None,
             freq_limit,
             soft_mask,
         )
@@ -519,6 +631,7 @@ impl RefIndex {
         part_start: usize,
         part_end: usize,
         word_length: usize,
+        spaced_mask: Option<u64>,
         freq_limit: u64,
         soft_mask: bool,
     ) -> Result<Self> {
@@ -534,7 +647,7 @@ impl RefIndex {
         }
 
         let use_u32_ps = reference.seq.len < (1usize << 31);
-        if use_direct_csr(word_length, reference.total_bases) {
+        if use_direct_csr_for(word_length, reference.total_bases, spaced_mask) {
             if use_u32_ps {
                 build_direct_csr_u32(
                     reference,
@@ -566,6 +679,7 @@ impl RefIndex {
                 part_start,
                 part_end,
                 word_length,
+                spaced_mask,
                 freq_limit,
                 soft_mask,
             )
@@ -577,6 +691,7 @@ impl RefIndex {
                 part_start,
                 part_end,
                 word_length,
+                spaced_mask,
                 freq_limit,
                 soft_mask,
             )
@@ -990,6 +1105,88 @@ fn for_each_canonical_kmer_2bit<F>(
 }
 
 #[inline(always)]
+fn for_each_canonical_kmer_2bit_opt<F>(
+    seq: &PackedSeq,
+    start: usize,
+    end: usize,
+    wl: usize,
+    spaced_mask: Option<u64>,
+    soft_mask: bool,
+    f: F,
+) where
+    F: FnMut(u64, u64, u64),
+{
+    if let Some(sm) = spaced_mask {
+        for_each_canonical_spaced_kmer_2bit(seq, start, end, wl, sm, soft_mask, f);
+    } else {
+        for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, f);
+    }
+}
+
+/// Iterate canonical spaced-seed k-mers using a palindromic 2-bit `spaced_mask`.
+#[inline(always)]
+fn for_each_canonical_spaced_kmer_2bit<F>(
+    seq: &PackedSeq,
+    start: usize,
+    end: usize,
+    wl: usize,
+    spaced_mask: u64,
+    soft_mask: bool,
+    mut f: F,
+) where
+    F: FnMut(u64, u64, u64),
+{
+    let span_mask = if wl == 32 { u64::MAX } else { kmer_mask(wl) };
+    let rc_shift = (2 * (wl - 1)) as u32;
+    let scan_end = (end + wl - 1).min(seq.len);
+
+    seq.for_each_valid_run(start, scan_end, soft_mask, |rs, re| {
+        if re - rs < wl {
+            return;
+        }
+        let mut kf = 0u64;
+        let mut kr = 0u64;
+        let mut idx = rs;
+        let prime_end = rs + wl - 1;
+        while idx < prime_end {
+            let w_idx = idx >> 5;
+            let lane = idx & 31;
+            let avail = (32 - lane).min(prime_end - idx);
+            let mut word = unsafe { *seq.bits.get_unchecked(w_idx) } >> (lane << 1);
+            for _ in 0..avail {
+                let b = word & 3;
+                word >>= 2;
+                kf = ((kf << 2) | b) & span_mask;
+                kr = (kr >> 2) | ((b ^ 3) << rc_shift);
+            }
+            idx += avail;
+        }
+
+        while idx < re {
+            let w_idx = idx >> 5;
+            let lane = idx & 31;
+            let avail = (32 - lane).min(re - idx);
+            let mut word = unsafe { *seq.bits.get_unchecked(w_idx) } >> (lane << 1);
+            let start_pos = (idx + 1 - wl) as u64;
+            for pos in start_pos..start_pos + avail as u64 {
+                let b = word & 3;
+                word >>= 2;
+                kf = ((kf << 2) | b) & span_mask;
+                kr = (kr >> 2) | ((b ^ 3) << rc_shift);
+                let sf = kf & spaced_mask;
+                let sr = kr & spaced_mask;
+                if sr < sf {
+                    f(sr, pos, 1);
+                } else {
+                    f(sf, pos, 0);
+                }
+            }
+            idx += avail;
+        }
+    });
+}
+
+#[inline(always)]
 fn for_each_canonical_kmer_2bit_impl<const WL32: bool, F>(
     seq: &PackedSeq,
     start: usize,
@@ -1156,6 +1353,7 @@ fn build_direct_csr<P: PackedPs>(
             word_length: wl,
             freq_limit,
             soft_mask,
+            spaced_mask: None,
             ref_data_len: seq.len,
             total_kmers: 0,
             kept_entries: 0,
@@ -1383,6 +1581,7 @@ fn build_direct_csr<P: PackedPs>(
         word_length: wl,
         freq_limit,
         soft_mask,
+        spaced_mask: None,
         ref_data_len: seq.len,
         total_kmers,
         kept_entries,
@@ -1408,11 +1607,20 @@ fn build_hash_csr_u32(
     part_start: usize,
     part_end: usize,
     wl: usize,
+    spaced_mask: Option<u64>,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
     build_hash_csr::<u32>(
-        reference, slab_start, slab_end, part_start, part_end, wl, freq_limit, soft_mask,
+        reference,
+        slab_start,
+        slab_end,
+        part_start,
+        part_end,
+        wl,
+        spaced_mask,
+        freq_limit,
+        soft_mask,
     )
 }
 
@@ -1424,11 +1632,20 @@ fn build_hash_csr_u64(
     part_start: usize,
     part_end: usize,
     wl: usize,
+    spaced_mask: Option<u64>,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
     build_hash_csr::<u64>(
-        reference, slab_start, slab_end, part_start, part_end, wl, freq_limit, soft_mask,
+        reference,
+        slab_start,
+        slab_end,
+        part_start,
+        part_end,
+        wl,
+        spaced_mask,
+        freq_limit,
+        soft_mask,
     )
 }
 
@@ -1440,6 +1657,7 @@ fn build_hash_csr<P: PackedPs>(
     part_start: usize,
     part_end: usize,
     wl: usize,
+    spaced_mask: Option<u64>,
     freq_limit: u64,
     soft_mask: bool,
 ) -> Result<RefIndex> {
@@ -1456,6 +1674,7 @@ fn build_hash_csr<P: PackedPs>(
             word_length: wl,
             freq_limit,
             soft_mask,
+            spaced_mask,
             ref_data_len: seq.len,
             total_kmers: 0,
             kept_entries: 0,
@@ -1477,17 +1696,33 @@ fn build_hash_csr<P: PackedPs>(
         .map(|&(start, end)| {
             let mut counts = [0usize; NUM_PARTITIONS];
             if full_parts {
-                for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
-                    let p = (fmix64(canon) >> 56) as usize;
-                    counts[p] += 1;
-                });
+                for_each_canonical_kmer_2bit_opt(
+                    seq,
+                    start,
+                    end,
+                    wl,
+                    spaced_mask,
+                    soft_mask,
+                    |canon, _, _| {
+                        let p = (fmix64(canon) >> 56) as usize;
+                        counts[p] += 1;
+                    },
+                );
             } else {
-                for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
-                    let p = (fmix64(canon) >> 56) as usize;
-                    if p >= part_start && p < part_end {
-                        counts[p - part_start] += 1;
-                    }
-                });
+                for_each_canonical_kmer_2bit_opt(
+                    seq,
+                    start,
+                    end,
+                    wl,
+                    spaced_mask,
+                    soft_mask,
+                    |canon, _, _| {
+                        let p = (fmix64(canon) >> 56) as usize;
+                        if p >= part_start && p < part_end {
+                            counts[p - part_start] += 1;
+                        }
+                    },
+                );
             }
             counts
         })
@@ -1547,7 +1782,14 @@ fn build_hash_csr<P: PackedPs>(
             let mut write_pos = init_write;
             let mut buf_len = [0u8; NUM_PARTITIONS];
 
-            for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, pos, strand| {
+            for_each_canonical_kmer_2bit_opt(
+                seq,
+                start,
+                end,
+                wl,
+                spaced_mask,
+                soft_mask,
+                |canon, pos, strand| {
                 let h = fmix64(canon);
                 let p_glob = (h >> 56) as usize;
                 if !full_parts && (p_glob < part_start || p_glob >= part_end) {
@@ -1826,6 +2068,7 @@ fn build_hash_csr<P: PackedPs>(
         word_length: wl,
         freq_limit,
         soft_mask,
+        spaced_mask,
         ref_data_len: seq.len,
         total_kmers,
         kept_entries,

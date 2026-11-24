@@ -182,6 +182,7 @@ mod ffi {
         fn gecko_cuda_prepare_ref(
             ref_seq: *const GeckoPackedSeqHost,
             wl: c_int,
+            seed_mask: u64,
             freq_limit: u32,
             soft_mask: c_int,
             compare_reverse: c_int,
@@ -381,6 +382,7 @@ mod ffi {
                     gecko_cuda_prepare_ref(
                         &ref_ffi,
                         config.word_length as c_int,
+                        config.spaced_mask_2bit().unwrap_or(0),
                         config.freq_limit as u32,
                         c_int::from(config.soft_mask),
                         c_int::from(config.compare_reverse),
@@ -485,6 +487,7 @@ mod ffi {
                     gecko_cuda_prepare_ref(
                         &ref_ffi,
                         config.word_length as c_int,
+                        config.spaced_mask_2bit().unwrap_or(0),
                         config.freq_limit as u32,
                         c_int::from(config.soft_mask),
                         c_int::from(config.compare_reverse),

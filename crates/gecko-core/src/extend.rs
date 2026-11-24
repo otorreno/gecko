@@ -45,6 +45,9 @@ pub struct ExtendOptions {
     pub strand: char,
     /// Alignment scoring scheme.
     pub scoring: Scoring,
+    /// If true, the seed window `[pos_x .. pos_x + word_length)` may contain mismatches at
+    /// don't-care positions of a spaced seed, so initial identity/score is computed from 2-bit words.
+    pub spaced_seed: bool,
 }
 
 /// 1000 x 100 length-by-similarity coverage histogram (matching GECKO's `.MAT` file,
@@ -355,6 +358,31 @@ fn finalize_extend_outcome(
     }
 }
 
+#[inline(always)]
+fn seed_init_stats(
+    seq_x: &PackedSeq,
+    seq_y: &PackedSeq,
+    pos_x: u64,
+    pos_y: u64,
+    wl: u64,
+    scoring: Scoring,
+    spaced_seed: bool,
+) -> (u64, i64) {
+    if !spaced_seed {
+        return (wl, wl as i64 * scoring.match_score);
+    }
+    let span_mask = if wl >= 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * wl)) - 1
+    };
+    let diff = (seq_x.load_32(pos_x as usize) ^ seq_y.load_32(pos_y as usize)) & span_mask;
+    let mm = ((diff | (diff >> 1)) & 0x5555_5555_5555_5555).count_ones() as u64;
+    let ident = wl - mm;
+    let score = ident as i64 * scoring.match_score - mm as i64 * scoring.mismatch_penalty;
+    (ident, score)
+}
+
 /// Bidirectional ungapped extension from a single seed hit, faithful to GECKO's `FragFromHit`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -383,25 +411,39 @@ pub(crate) fn extend_single_hit_outcome(
         };
     }
 
+    let (seed_ident, seed_score) = seed_init_stats(
+        seq_x_pack,
+        seq_y_pack,
+        pos_x,
+        pos_y,
+        wl,
+        opts.scoring,
+        opts.spaced_seed,
+    );
+
     let (fwd, bwd) = if use_avx2 && opts.scoring.is_default_gecko() {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             let cx = sp_cursor_for(&seq_x_pack.special_runs, pos_x);
             let cy = sp_cursor_for(&seq_y_pack.special_runs, pos_y);
             if use_bmi2 && has_popcnt() {
-                let f =
-                    extend_forward_2bit_avx2_bmi2(seq_x_pack, seq_y_pack, pos_x, pos_y, wl, cx, cy);
+                let f = extend_forward_2bit_avx2_bmi2(
+                    seq_x_pack, seq_y_pack, pos_x, pos_y, wl, seed_ident, seed_score, cx, cy,
+                );
                 let b =
                     extend_backward_2bit_avx2_bmi2(seq_x_pack, seq_y_pack, pos_x, pos_y, f, cx, cy);
                 (f, b)
             } else if has_popcnt() {
-                let f =
-                    extend_forward_2bit_avx2_swar(seq_x_pack, seq_y_pack, pos_x, pos_y, wl, cx, cy);
+                let f = extend_forward_2bit_avx2_swar(
+                    seq_x_pack, seq_y_pack, pos_x, pos_y, wl, seed_ident, seed_score, cx, cy,
+                );
                 let b =
                     extend_backward_2bit_avx2_swar(seq_x_pack, seq_y_pack, pos_x, pos_y, f, cx, cy);
                 (f, b)
             } else {
-                let f = extend_forward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, wl);
+                let f = extend_forward_2bit_portable(
+                    seq_x_pack, seq_y_pack, pos_x, pos_y, wl, seed_ident, seed_score,
+                );
                 let b = extend_backward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, f);
                 (f, b)
             }
@@ -409,16 +451,29 @@ pub(crate) fn extend_single_hit_outcome(
         #[cfg(not(target_arch = "x86_64"))]
         {
             let _ = use_bmi2;
-            let f = extend_forward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, wl);
+            let f = extend_forward_2bit_portable(
+                seq_x_pack, seq_y_pack, pos_x, pos_y, wl, seed_ident, seed_score,
+            );
             let b = extend_backward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, f);
             (f, b)
         }
     } else if opts.scoring.is_default_gecko() {
-        let f = extend_forward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, wl);
+        let f = extend_forward_2bit_portable(
+            seq_x_pack, seq_y_pack, pos_x, pos_y, wl, seed_ident, seed_score,
+        );
         let b = extend_backward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, f);
         (f, b)
     } else {
-        let f = extend_forward_scalar(seq_x_pack, seq_y_pack, pos_x, pos_y, wl, opts.scoring);
+        let f = extend_forward_scalar(
+            seq_x_pack,
+            seq_y_pack,
+            pos_x,
+            pos_y,
+            wl,
+            seed_ident,
+            seed_score,
+            opts.scoring,
+        );
         let b = extend_backward_scalar(seq_x_pack, seq_y_pack, pos_x, pos_y, f, opts.scoring);
         (f, b)
     };
@@ -461,17 +516,38 @@ pub(crate) unsafe fn extend_single_hit_outcome_avx2_bmi2(
         };
     }
 
+    let (seed_ident, seed_score) = seed_init_stats(
+        seq_x_pack,
+        seq_y_pack,
+        pos_x,
+        pos_y,
+        wl,
+        opts.scoring,
+        opts.spaced_seed,
+    );
+
     let (fwd, bwd) = if opts.scoring.is_default_gecko() {
         let cy = sp_cursor_for(&seq_y_pack.special_runs, pos_y);
         let f = unsafe {
-            extend_forward_2bit_avx2_bmi2(seq_x_pack, seq_y_pack, pos_x, pos_y, wl, cx_x, cy)
+            extend_forward_2bit_avx2_bmi2(
+                seq_x_pack, seq_y_pack, pos_x, pos_y, wl, seed_ident, seed_score, cx_x, cy,
+            )
         };
         let b = unsafe {
             extend_backward_2bit_avx2_bmi2(seq_x_pack, seq_y_pack, pos_x, pos_y, f, cx_x, cy)
         };
         (f, b)
     } else {
-        let f = extend_forward_scalar(seq_x_pack, seq_y_pack, pos_x, pos_y, wl, opts.scoring);
+        let f = extend_forward_scalar(
+            seq_x_pack,
+            seq_y_pack,
+            pos_x,
+            pos_y,
+            wl,
+            seed_ident,
+            seed_score,
+            opts.scoring,
+        );
         let b = extend_backward_scalar(seq_x_pack, seq_y_pack, pos_x, pos_y, f, opts.scoring);
         (f, b)
     };
@@ -514,17 +590,38 @@ pub(crate) unsafe fn extend_single_hit_outcome_avx2_swar(
         };
     }
 
+    let (seed_ident, seed_score) = seed_init_stats(
+        seq_x_pack,
+        seq_y_pack,
+        pos_x,
+        pos_y,
+        wl,
+        opts.scoring,
+        opts.spaced_seed,
+    );
+
     let (fwd, bwd) = if opts.scoring.is_default_gecko() {
         let cy = sp_cursor_for(&seq_y_pack.special_runs, pos_y);
         let f = unsafe {
-            extend_forward_2bit_avx2_swar(seq_x_pack, seq_y_pack, pos_x, pos_y, wl, cx_x, cy)
+            extend_forward_2bit_avx2_swar(
+                seq_x_pack, seq_y_pack, pos_x, pos_y, wl, seed_ident, seed_score, cx_x, cy,
+            )
         };
         let b = unsafe {
             extend_backward_2bit_avx2_swar(seq_x_pack, seq_y_pack, pos_x, pos_y, f, cx_x, cy)
         };
         (f, b)
     } else {
-        let f = extend_forward_scalar(seq_x_pack, seq_y_pack, pos_x, pos_y, wl, opts.scoring);
+        let f = extend_forward_scalar(
+            seq_x_pack,
+            seq_y_pack,
+            pos_x,
+            pos_y,
+            wl,
+            seed_ident,
+            seed_score,
+            opts.scoring,
+        );
         let b = extend_backward_scalar(seq_x_pack, seq_y_pack, pos_x, pos_y, f, opts.scoring);
         (f, b)
     };
@@ -538,12 +635,15 @@ pub(crate) unsafe fn extend_single_hit_outcome_avx2_swar(
 // Portable scalar extension (custom scoring + reference oracle for fuzz tests)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn extend_forward_scalar(
     seq_x: &PackedSeq,
     seq_y: &PackedSeq,
     pos_x: u64,
     pos_y: u64,
     wl: u64,
+    seed_ident: u64,
+    seed_score: i64,
     scoring: Scoring,
 ) -> ForwardResult {
     let nx = seq_x.len as u64;
@@ -555,9 +655,9 @@ fn extend_forward_scalar(
 
     let mut xfil_max = pos_x + wl - 1;
     let mut ycol_max = pos_y + wl - 1;
-    let mut n_identities = wl;
-    let mut max_identities = wl;
-    let mut fscore = scoring.match_score * wl as i64;
+    let mut n_identities = seed_ident;
+    let mut max_identities = seed_ident;
+    let mut fscore = seed_score;
     let mut fscore_max = fscore;
 
     let point = scoring.match_score;
@@ -720,6 +820,8 @@ fn extend_forward_2bit_portable(
     pos_x: u64,
     pos_y: u64,
     wl: u64,
+    seed_ident: u64,
+    seed_score: i64,
 ) -> ForwardResult {
     let nx = seq_x.len as u64;
     let ny = seq_y.len as u64;
@@ -729,9 +831,9 @@ fn extend_forward_2bit_portable(
 
     let mut xfil_max = pos_x + wl - 1;
     let mut ycol_max = pos_y + wl - 1;
-    let mut n_identities = wl;
-    let mut max_identities = wl;
-    let mut fscore = 4 * wl as i64;
+    let mut n_identities = seed_ident;
+    let mut max_identities = seed_ident;
+    let mut fscore = seed_score;
     let mut fscore_max = fscore;
 
     let sp_x = &seq_x.special_runs;
@@ -1124,12 +1226,15 @@ macro_rules! impl_extend_2bit_avx2 {
         #[cfg(target_arch = "x86_64")]
         #[target_feature(enable = $features)]
         #[inline]
+        #[allow(clippy::too_many_arguments)]
         unsafe fn $fwd_fn(
             seq_x: &PackedSeq,
             seq_y: &PackedSeq,
             pos_x: u64,
             pos_y: u64,
             wl: u64,
+            seed_ident: u64,
+            seed_score: i64,
             init_cx: usize,
             init_cy: usize,
         ) -> ForwardResult {
@@ -1143,9 +1248,9 @@ macro_rules! impl_extend_2bit_avx2 {
 
             let mut xfil_max = pos_x + wl - 1;
             let mut ycol_max = pos_y + wl - 1;
-            let mut n_identities = wl;
-            let mut max_identities = wl;
-            let mut fscore = 4 * wl as i64;
+            let mut n_identities = seed_ident;
+            let mut max_identities = seed_ident;
+            let mut fscore = seed_score;
             let mut fscore_max = fscore;
 
             let sp_x = &seq_x.special_runs;
@@ -1593,9 +1698,13 @@ unsafe fn extend_forward_2bit_avx2(
     let cx = sp_cursor_for(&seq_x.special_runs, pos_x);
     let cy = sp_cursor_for(&seq_y.special_runs, pos_y);
     if use_bmi2 {
-        unsafe { extend_forward_2bit_avx2_bmi2(seq_x, seq_y, pos_x, pos_y, wl, cx, cy) }
+        unsafe {
+            extend_forward_2bit_avx2_bmi2(seq_x, seq_y, pos_x, pos_y, wl, wl, 4 * wl as i64, cx, cy)
+        }
     } else {
-        unsafe { extend_forward_2bit_avx2_swar(seq_x, seq_y, pos_x, pos_y, wl, cx, cy) }
+        unsafe {
+            extend_forward_2bit_avx2_swar(seq_x, seq_y, pos_x, pos_y, wl, wl, 4 * wl as i64, cx, cy)
+        }
     }
 }
 
@@ -1766,6 +1875,7 @@ mod tests {
                 fixed_length: true,
                 strand: 'f',
                 scoring: Scoring::default(),
+                spaced_seed: false,
             },
         );
 
@@ -1864,8 +1974,25 @@ mod tests {
             let py = pos_y as u64;
             let wl_u64 = wl as u64;
 
-            let f_scalar = extend_forward_scalar(&gx.seq, &gy.seq, px, py, wl_u64, scoring);
-            let f_port = extend_forward_2bit_portable(&gx.seq, &gy.seq, px, py, wl_u64);
+            let f_scalar = extend_forward_scalar(
+                &gx.seq,
+                &gy.seq,
+                px,
+                py,
+                wl_u64,
+                wl_u64,
+                scoring.match_score * wl_u64 as i64,
+                scoring,
+            );
+            let f_port = extend_forward_2bit_portable(
+                &gx.seq,
+                &gy.seq,
+                px,
+                py,
+                wl_u64,
+                wl_u64,
+                4 * wl_u64 as i64,
+            );
             assert_eq!(f_port, f_scalar, "portable forward mismatch trial={trial}");
 
             let b_scalar = extend_backward_scalar(&gx.seq, &gy.seq, px, py, f_scalar, scoring);

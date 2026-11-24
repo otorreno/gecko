@@ -19,6 +19,7 @@ static __global__ void query_left_maximal_kernel(
     int shift_bits,
     int tag_shift,
     int wl,
+    uint64_t seed_mask,
     bool compare_reverse,
     uint64_t tile_start,
     uint64_t tile_end,
@@ -34,6 +35,8 @@ static __global__ void query_left_maximal_kernel(
     if (t_end > tile_end) t_end = tile_end;
 
     uint64_t mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
+    uint64_t eff_mask = (seed_mask != 0ULL) ? seed_mask : mask;
+    bool is_spaced = (eff_mask != mask);
     int rc_shift = 2 * (wl - 1);
     int rev_rshift = 64 - 2 * wl;
     uint64_t scan_from = (t_start >= (uint64_t)(wl - 1)) ? (t_start - (uint64_t)(wl - 1)) : 0ULL;
@@ -65,9 +68,11 @@ static __global__ void query_left_maximal_kernel(
                 uint64_t cur_i = i + k;
                 if (++valid >= wl && cur_i >= t_start) {
                     uint32_t posX = (uint32_t)(cur_i + 1ULL - (uint64_t)wl);
-                    uint32_t x_strand = (kf <= kr) ? 0U : 1U;
-                    uint64_t canon = x_strand ? kr : kf;
-                    bool is_pal = (kf == kr);
+                    uint64_t sf = kf & eff_mask;
+                    uint64_t sr = kr & eff_mask;
+                    uint32_t x_strand = (sf <= sr) ? 0U : 1U;
+                    uint64_t canon = x_strand ? sr : sf;
+                    bool is_pal = (sf == sr);
 
                     uint64_t h = fmix64(canon);
                     uint32_t bkt = (uint32_t)(h >> shift_bits);
@@ -90,10 +95,10 @@ static __global__ void query_left_maximal_kernel(
                     }
                     if (j >= en || __ldg(&idx_tags[j]) != tag) continue;
 
-                    uint64_t x_seed_lsb = load_32_2bit(seqX.bits, posX) & mask;
-                    bool prev_x_valid = (posX > 0U) && !is_bit_set(seqX.invalid_bm, posX - 1U);
+                    uint64_t x_seed_lsb = load_32_2bit(seqX.bits, posX) & eff_mask;
+                    bool prev_x_valid = !is_spaced && (posX > 0U) && !is_bit_set(seqX.invalid_bm, posX - 1U);
                     uint32_t prev_x_2bit = prev_x_valid ? base_2bit_dev(seqX.bits, posX - 1U) : 4U;
-                    bool next_x_valid = ((uint64_t)posX + (uint64_t)wl < seqX.len) &&
+                    bool next_x_valid = !is_spaced && ((uint64_t)posX + (uint64_t)wl < seqX.len) &&
                                         !is_bit_set(seqX.invalid_bm, posX + (uint32_t)wl);
                     uint32_t next_x_2bit = next_x_valid ? base_2bit_dev(seqX.bits, posX + (uint32_t)wl) : 4U;
 
@@ -104,7 +109,7 @@ static __global__ void query_left_maximal_kernel(
                         uint64_t y_word = load_32_2bit(seqY.bits, posY_orig);
 
                         if (is_pal || (x_strand == y_strand)) {
-                            if (((y_word ^ x_seed_lsb) & mask) == 0ULL) {
+                            if (((y_word ^ x_seed_lsb) & eff_mask) == 0ULL) {
                                 bool left_ext = prev_x_valid && (posY_orig > 0U) &&
                                                 !is_bit_set(seqY.invalid_bm, posY_orig - 1U) &&
                                                 (base_2bit_dev(seqY.bits, posY_orig - 1U) == prev_x_2bit) &&
@@ -113,7 +118,7 @@ static __global__ void query_left_maximal_kernel(
                                                  !is_bit_set(seqY.invalid_bm, posY_orig + (uint32_t)wl) &&
                                                  (base_2bit_dev(seqY.bits, posY_orig + (uint32_t)wl) == next_x_2bit) &&
                                                  !is_bit_set(dropped_bitmap, posY_orig + 1U);
-                                if (!left_ext || !right_ext) {
+                                if (is_spaced || !left_ext || !right_ext) {
                                     if (*hit_count <= max_hits) {
                                         uint32_t slot = atomicAdd(hit_count, 1U);
                                         if (slot < max_hits) {
@@ -125,7 +130,7 @@ static __global__ void query_left_maximal_kernel(
                         }
                         if (compare_reverse && (is_pal || (x_strand != y_strand))) {
                             uint64_t y_rc_lsb = (~reverse_32_2bit_dev(y_word)) >> rev_rshift;
-                            if (((y_rc_lsb ^ x_seed_lsb) & mask) == 0ULL) {
+                            if (((y_rc_lsb ^ x_seed_lsb) & eff_mask) == 0ULL) {
                                 /* Check mirrored neighbors directly in seqY (avoids storing/reading seqY_rc.invalid_bm):
                                  * Y_rc[posY_rc - 1]  == comp(Y[posY_orig + wl])
                                  * Y_rc[posY_rc + wl] == comp(Y[posY_orig - 1]) */
@@ -138,7 +143,7 @@ static __global__ void query_left_maximal_kernel(
                                                  !is_bit_set(seqY.invalid_bm, posY_orig - 1U) &&
                                                  ((base_2bit_dev(seqY.bits, posY_orig - 1U) ^ 3U) == next_x_2bit) &&
                                                  !is_bit_set(dropped_bitmap, posY_orig - 1U);
-                                if (!left_ext || !right_ext) {
+                                if (is_spaced || !left_ext || !right_ext) {
                                     if (*hit_count <= max_hits) {
                                         uint32_t slot = atomicAdd(hit_count, 1U);
                                         if (slot < max_hits) {
@@ -202,6 +207,7 @@ uint32_t gpu_query_tile_left_maximal(
     const GpuSeqView &seqY,
     const GpuRefIndex &idx,
     int wl,
+    uint64_t seed_mask,
     bool compare_reverse,
     uint64_t tile_start,
     uint64_t tile_end,
@@ -225,7 +231,7 @@ uint32_t gpu_query_tile_left_maximal(
     query_left_maximal_kernel<<<grid, 256>>>(
         seqX, seqY,
         idx.d_bucket_off, idx.d_tags, idx.d_vals, idx.d_dropped_bitmap, idx.shift_bits, idx.tag_shift, wl,
-        compare_reverse,
+        seed_mask, compare_reverse,
         tile_start, tile_end, d_hits, d_hit_count, max_hits);
     CUDA_CHECK_VOID(cudaGetLastError());
 

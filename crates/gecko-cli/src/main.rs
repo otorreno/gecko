@@ -172,6 +172,11 @@ struct CompareArgs {
     #[arg(short = 'k', long, default_value_t = 12)]
     word_length: usize,
 
+    /// Palindromic spaced-seed pattern (e.g. '111010110011010111') or preset
+    /// (w12s18, w14s20, w16s22, w18s26, w20s28). Overrides --word-length with the mask span.
+    #[arg(long)]
+    spaced_seed: Option<String>,
+
     /// Skip 32-mers occurring more than this many times in a genome.
     #[arg(long, default_value_t = 1000)]
     freq_limit: u64,
@@ -351,6 +356,10 @@ struct AllVsAllArgs {
     #[arg(short = 'k', long, default_value_t = 12)]
     word_length: usize,
 
+    /// Palindromic spaced-seed pattern or preset (w12s18, w14s20, w16s22, w18s26, w20s28).
+    #[arg(long)]
+    spaced_seed: Option<String>,
+
     /// File extensions to include (comma-separated).
     #[arg(long, value_delimiter = ',', default_values_t = ["fa".to_string(), "fasta".to_string(), "fna".to_string(), "gz".to_string()])]
     ext: Vec<String>,
@@ -493,10 +502,19 @@ fn main() -> Result<()> {
 
 fn cmd_compare(args: CompareArgs) -> Result<()> {
     let t0 = Instant::now();
+    let spaced_seed = args
+        .spaced_seed
+        .as_deref()
+        .map(gecko_core::SpacedSeed::parse)
+        .transpose()?;
+    let word_length = spaced_seed
+        .as_ref()
+        .map_or(args.word_length, |sp| sp.span);
     let config = CompareConfig {
         min_length: args.min_length,
         min_similarity: args.min_similarity,
-        word_length: args.word_length,
+        word_length,
+        spaced_seed,
         freq_limit: args.freq_limit,
         max_rep: args.max_rep,
         fixed_length: !args.percent_length,
@@ -752,10 +770,19 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
     std::fs::create_dir_all(&args.outdir)?;
     let formats = OutputFormat::expand(&args.formats);
 
+    let spaced_seed = args
+        .spaced_seed
+        .as_deref()
+        .map(gecko_core::SpacedSeed::parse)
+        .transpose()?;
+    let word_length = spaced_seed
+        .as_ref()
+        .map_or(args.word_length, |sp| sp.span);
     let config = CompareConfig {
         min_length: args.min_length,
         min_similarity: args.min_similarity,
-        word_length: args.word_length,
+        word_length,
+        spaced_seed,
         freq_limit: args.freq_limit,
         memory_budget: args.memory,
         ..Default::default()
@@ -906,18 +933,21 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
                     );
                     logged_backend = true;
                 }
-                let use_ref_index = RefIndex::fits_in_budget(
+                let spaced_mask = config.spaced_mask_2bit();
+                let use_ref_index = RefIndex::fits_in_budget_with_mask(
                     &genomes[j],
                     config.word_length,
+                    spaced_mask,
                     config.soft_mask,
                     config.compare_reverse,
                     config.memory_budget,
                 );
 
                 let cached_ref = if use_ref_index {
-                    let idx = RefIndex::build(
+                    let idx = RefIndex::build_with_mask(
                         &genomes[j],
                         config.word_length,
+                        spaced_mask,
                         config.freq_limit,
                         config.soft_mask,
                     )?;

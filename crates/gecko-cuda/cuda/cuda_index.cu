@@ -124,6 +124,7 @@ static __global__ void count_valid_kmers_kernel(
 static __global__ void extract_kmers_kernel(
     GpuSeqView seq,
     int wl,
+    uint64_t seed_mask,
     uint32_t num_chunks,
     const uint32_t * __restrict__ chunk_offsets,
     uint64_t * __restrict__ out_keys,
@@ -137,6 +138,7 @@ static __global__ void extract_kmers_kernel(
     if (c_end > seq.len) c_end = seq.len;
 
     uint64_t mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
+    uint64_t eff_mask = (seed_mask != 0ULL) ? seed_mask : mask;
     int rc_shift = 2 * (wl - 1);
     uint64_t scan_from = (c_start >= (uint64_t)(wl - 1)) ? (c_start - (uint64_t)(wl - 1)) : 0ULL;
 
@@ -166,8 +168,10 @@ static __global__ void extract_kmers_kernel(
                 kf = ((kf << 2) | b) & mask;
                 kr = (kr >> 2) | ((b ^ 3ULL) << rc_shift);
                 if (++valid >= wl && (i + k) >= c_start) {
-                    uint32_t strand = (kf <= kr) ? 0U : 1U;
-                    uint64_t key = strand ? kr : kf;
+                    uint64_t sf = kf & eff_mask;
+                    uint64_t sr = kr & eff_mask;
+                    uint32_t strand = (sf <= sr) ? 0U : 1U;
+                    uint64_t key = strand ? sr : sf;
                     uint32_t start_pos = (uint32_t)((i + k) + 1ULL - (uint64_t)wl);
                     out_keys[dst] = fmix64(key);
                     out_vals[dst] = (start_pos << 1) | strand;
@@ -321,6 +325,7 @@ void gpu_build_revcomp_2bit(
 GpuRefIndex gpu_build_ref_index(
     const GpuSeqView &seqY,
     int wl,
+    uint64_t seed_mask,
     uint32_t freq_limit
 ) {
     GpuRefIndex idx{};
@@ -368,7 +373,7 @@ GpuRefIndex gpu_build_ref_index(
 
     if (idx.n_valid > 0) {
         extract_kmers_kernel<<<(num_chunks + 255) / 256, 256>>>(
-            seqY, wl, num_chunks, d_chunk_offsets, d_keys_a, d_vals_a);
+            seqY, wl, seed_mask, num_chunks, d_chunk_offsets, d_keys_a, d_vals_a);
         CUDA_CHECK_VOID(cudaGetLastError());
     }
     CUDA_CHECK_VOID(cudaFree(d_chunk_offsets));

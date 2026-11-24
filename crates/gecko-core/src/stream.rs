@@ -271,6 +271,7 @@ pub fn compare_streaming(
         fixed_length: config.fixed_length,
         strand: 'f',
         scoring: config.scoring,
+        spaced_seed: ref_index.spaced_mask.is_some(),
     };
     let rev_opts = ExtendOptions {
         strand: 'r',
@@ -475,7 +476,7 @@ macro_rules! impl_stream_tier {
     ) => {
         $(#[$attr])*
         #[allow(clippy::too_many_arguments)]
-        unsafe fn $scan_hash<const WL32: bool, const PART_FILTER: bool, P: PsRead>(
+        unsafe fn $scan_hash<const WL32: bool, const PART_FILTER: bool, const SPACED: bool, P: PsRead>(
             query: &Genome,
             reference: &Genome,
             rev_ref: Option<&Genome>,
@@ -491,6 +492,7 @@ macro_rules! impl_stream_tier {
             wl: usize,
             ny: u64,
             mask: u64,
+            seed_mask: u64,
             rc_shift: u32,
             soft_mask: bool,
             max_rep: usize,
@@ -537,12 +539,17 @@ macro_rules! impl_stream_tier {
                         word >>= 2;
                         kf = if WL32 { (kf << 2) | b } else { ((kf << 2) | b) & mask };
                         kr = (kr >> 2) | ((b ^ 3) << if WL32 { 62 } else { rc_shift });
-                        let (canon, q_kind) = if kf < kr {
-                            (kf, 0u8)
-                        } else if kr < kf {
-                            (kr, 1u8)
+                        let (sf, sr) = if SPACED {
+                            (kf & seed_mask, kr & seed_mask)
                         } else {
-                            (kf, 2u8)
+                            (kf, kr)
+                        };
+                        let (canon, q_kind) = if sf < sr {
+                            (sf, 0u8)
+                        } else if sr < sf {
+                            (sr, 1u8)
+                        } else {
+                            (sf, 2u8)
                         };
                         let h = fmix64(canon);
                         if PART_FILTER {
@@ -580,7 +587,7 @@ macro_rules! impl_stream_tier {
                                     tags,
                                     ps_ptr,
                                     wl as u64,
-                                    mask,
+                                    seed_mask,
                                     ny,
                                     max_rep,
                                     fwd_opts,
@@ -606,7 +613,7 @@ macro_rules! impl_stream_tier {
                         tags,
                         ps_ptr,
                         wl as u64,
-                        mask,
+                        seed_mask,
                         ny,
                         max_rep,
                         fwd_opts,
@@ -1062,9 +1069,12 @@ macro_rules! impl_stream_tier {
                 );
                 state.fwd_cache.update_hsp(diag, skip_end);
             } else {
-                state
-                    .fwd_cache
-                    .update_noise(diag, pos_x + 2 * opts.word_length as u64 - 1);
+                let skip = if opts.spaced_seed {
+                    pos_x + opts.word_length as u64 - 1
+                } else {
+                    pos_x + 2 * opts.word_length as u64 - 1
+                };
+                state.fwd_cache.update_noise(diag, skip);
             }
         }
 
@@ -1114,7 +1124,12 @@ macro_rules! impl_stream_tier {
                 );
                 rev_cache.update_hsp(diag, skip_end);
             } else {
-                rev_cache.update_noise(diag, pos_x + 2 * opts.word_length as u64 - 1);
+                let skip = if opts.spaced_seed {
+                    pos_x + opts.word_length as u64 - 1
+                } else {
+                    pos_x + 2 * opts.word_length as u64 - 1
+                };
+                rev_cache.update_noise(diag, skip);
             }
         }
     };
@@ -1162,71 +1177,99 @@ impl_stream_tier!(
     |h, gx, gy, opts, _cx_x, cov| extend_single_hit_outcome(h, gx, gy, opts, false, false, cov)
 );
 
-macro_rules! dispatch_hash_tier {
+macro_rules! dispatch_hash_tier_spaced {
     (
-        $fn_name:ident, $wl32:expr, $part_filter:expr, $ps:expr,
+        $fn_name:ident, $wl32:expr, $part_filter:expr, $spaced_const:expr, $ps:expr,
         $query:expr, $reference:expr, $rev_ref:expr, $offsets:expr, $tags:expr,
         $sub_bits:expr, $hash_shift:expr, $p_start:expr, $p_end:expr,
-        $chunk_start:expr, $chunk_end:expr, $wl:expr, $ny:expr, $mask:expr,
+        $chunk_start:expr, $chunk_end:expr, $wl:expr, $ny:expr, $mask:expr, $seed_mask:expr,
         $rc_shift:expr, $soft_mask:expr, $max_rep:expr, $fwd_opts:expr, $rev_opts:expr, $state:expr
     ) => {
         match ($wl32, $part_filter, $ps) {
             (true, false, PosStrandVec::U32(v)) => unsafe {
-                $fn_name::<true, false, *const u32>(
+                $fn_name::<true, false, $spaced_const, *const u32>(
                     $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
                     $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
-                    32, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                    32, $ny, $mask, $seed_mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
                 );
             },
             (true, true, PosStrandVec::U32(v)) => unsafe {
-                $fn_name::<true, true, *const u32>(
+                $fn_name::<true, true, $spaced_const, *const u32>(
                     $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
                     $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
-                    32, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                    32, $ny, $mask, $seed_mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
                 );
             },
             (false, false, PosStrandVec::U32(v)) => unsafe {
-                $fn_name::<false, false, *const u32>(
+                $fn_name::<false, false, $spaced_const, *const u32>(
                     $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
                     $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
-                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                    $wl, $ny, $mask, $seed_mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
                 );
             },
             (false, true, PosStrandVec::U32(v)) => unsafe {
-                $fn_name::<false, true, *const u32>(
+                $fn_name::<false, true, $spaced_const, *const u32>(
                     $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
                     $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
-                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                    $wl, $ny, $mask, $seed_mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
                 );
             },
             (true, false, PosStrandVec::U64(v)) => unsafe {
-                $fn_name::<true, false, *const u64>(
+                $fn_name::<true, false, $spaced_const, *const u64>(
                     $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
                     $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
-                    32, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                    32, $ny, $mask, $seed_mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
                 );
             },
             (true, true, PosStrandVec::U64(v)) => unsafe {
-                $fn_name::<true, true, *const u64>(
+                $fn_name::<true, true, $spaced_const, *const u64>(
                     $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
                     $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
-                    32, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                    32, $ny, $mask, $seed_mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
                 );
             },
             (false, false, PosStrandVec::U64(v)) => unsafe {
-                $fn_name::<false, false, *const u64>(
+                $fn_name::<false, false, $spaced_const, *const u64>(
                     $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
                     $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
-                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                    $wl, $ny, $mask, $seed_mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
                 );
             },
             (false, true, PosStrandVec::U64(v)) => unsafe {
-                $fn_name::<false, true, *const u64>(
+                $fn_name::<false, true, $spaced_const, *const u64>(
                     $query, $reference, $rev_ref, $offsets, $tags, v.as_ptr(),
                     $sub_bits, $hash_shift, $p_start, $p_end, $chunk_start, $chunk_end,
-                    $wl, $ny, $mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
+                    $wl, $ny, $mask, $seed_mask, $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state,
                 );
             },
+        }
+    };
+}
+
+macro_rules! dispatch_hash_tier {
+    (
+        $fn_name:ident, $wl32:expr, $part_filter:expr, $is_spaced:expr, $ps:expr,
+        $query:expr, $reference:expr, $rev_ref:expr, $offsets:expr, $tags:expr,
+        $sub_bits:expr, $hash_shift:expr, $p_start:expr, $p_end:expr,
+        $chunk_start:expr, $chunk_end:expr, $wl:expr, $ny:expr, $mask:expr, $seed_mask:expr,
+        $rc_shift:expr, $soft_mask:expr, $max_rep:expr, $fwd_opts:expr, $rev_opts:expr, $state:expr
+    ) => {
+        if $is_spaced {
+            dispatch_hash_tier_spaced!(
+                $fn_name, $wl32, $part_filter, true, $ps,
+                $query, $reference, $rev_ref, $offsets, $tags,
+                $sub_bits, $hash_shift, $p_start, $p_end,
+                $chunk_start, $chunk_end, $wl, $ny, $mask, $seed_mask,
+                $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state
+            );
+        } else {
+            dispatch_hash_tier_spaced!(
+                $fn_name, $wl32, $part_filter, false, $ps,
+                $query, $reference, $rev_ref, $offsets, $tags,
+                $sub_bits, $hash_shift, $p_start, $p_end,
+                $chunk_start, $chunk_end, $wl, $ny, $mask, $seed_mask,
+                $rc_shift, $soft_mask, $max_rep, $fwd_opts, $rev_opts, $state
+            );
         }
     };
 }
@@ -1294,6 +1337,8 @@ fn scan_query_chunk(
     let p_start = ref_index.part_start as u32;
     let p_end = ref_index.part_end as u32;
     let part_filter = p_start != 0 || p_end != 256;
+    let is_spaced = ref_index.spaced_mask.is_some();
+    let seed_mask = ref_index.spaced_mask.unwrap_or(mask);
 
     match (&ref_index.kind, isa) {
         #[cfg(target_arch = "x86_64")]
@@ -1307,10 +1352,10 @@ fn scan_query_chunk(
             },
             IsaTier::Avx2Bmi2Popcnt,
         ) => dispatch_hash_tier!(
-            scan_hash_avx2_bmi2, wl == 32, part_filter, pos_strand,
+            scan_hash_avx2_bmi2, wl == 32, part_filter, is_spaced, pos_strand,
             query, reference, rev_ref, offsets, tags,
             *sub_bits, *hash_shift, p_start, p_end,
-            chunk_start, chunk_end, wl, ny, mask,
+            chunk_start, chunk_end, wl, ny, mask, seed_mask,
             rc_shift, soft_mask, max_rep, fwd_opts, rev_opts, state
         ),
         #[cfg(target_arch = "x86_64")]
@@ -1324,10 +1369,10 @@ fn scan_query_chunk(
             },
             IsaTier::Avx2Popcnt,
         ) => dispatch_hash_tier!(
-            scan_hash_avx2_swar, wl == 32, part_filter, pos_strand,
+            scan_hash_avx2_swar, wl == 32, part_filter, is_spaced, pos_strand,
             query, reference, rev_ref, offsets, tags,
             *sub_bits, *hash_shift, p_start, p_end,
-            chunk_start, chunk_end, wl, ny, mask,
+            chunk_start, chunk_end, wl, ny, mask, seed_mask,
             rc_shift, soft_mask, max_rep, fwd_opts, rev_opts, state
         ),
         (
@@ -1340,10 +1385,10 @@ fn scan_query_chunk(
             },
             IsaTier::Portable,
         ) => dispatch_hash_tier!(
-            scan_hash_portable, wl == 32, part_filter, pos_strand,
+            scan_hash_portable, wl == 32, part_filter, is_spaced, pos_strand,
             query, reference, rev_ref, offsets, tags,
             *sub_bits, *hash_shift, p_start, p_end,
-            chunk_start, chunk_end, wl, ny, mask,
+            chunk_start, chunk_end, wl, ny, mask, seed_mask,
             rc_shift, soft_mask, max_rep, fwd_opts, rev_opts, state
         ),
         #[cfg(target_arch = "x86_64")]

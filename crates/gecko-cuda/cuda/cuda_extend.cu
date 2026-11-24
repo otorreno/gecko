@@ -50,6 +50,7 @@ static __global__ void extend_short_kernel(
     GpuSeqView seqY,
     GpuSeqView seqY_rc,
     int wl,
+    bool is_spaced,
     uint32_t min_len,
     float sim_th,
     int match_score,
@@ -80,9 +81,17 @@ static __global__ void extend_short_kernel(
 
     int64_t xfilmax = (int64_t)posX + wl - 1;
     int64_t ycolmax = (int64_t)posY + wl - 1;
+    int nIdent = wl;
     int fscore = match_score * wl;
+    if (is_spaced) {
+        uint64_t span_mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
+        uint64_t diff = (load_32_2bit(seqX.bits, posX) ^ load_32_2bit(dy.bits, posY)) & span_mask;
+        int mm = __popcll((diff | (diff >> 1)) & 0x5555555555555555ULL);
+        nIdent = wl - mm;
+        fscore = nIdent * match_score - mm * mismatch_penalty;
+    }
     int fscoreMax = fscore;
-    int nIdent = wl, maxIdent = wl;
+    int maxIdent = nIdent;
 
     bool fwd_terminated = false;
     for (int64_t off = 0; off < lim_fwd && !fwd_terminated; off += 32) {
@@ -376,6 +385,7 @@ static __global__ void extend_long_warp_kernel(
     GpuSeqView seqY,
     GpuSeqView seqY_rc,
     int wl,
+    bool is_spaced,
     uint32_t min_len,
     float sim_th,
     int match_score,
@@ -404,9 +414,17 @@ static __global__ void extend_long_warp_kernel(
 
     int64_t xfilmax = (int64_t)posX + wl - 1;
     int64_t ycolmax = (int64_t)posY + wl - 1;
+    int nIdent = wl;
     int fscore = match_score * wl;
+    if (is_spaced) {
+        uint64_t span_mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
+        uint64_t diff = (load_32_2bit(seqX.bits, posX) ^ load_32_2bit(dy.bits, posY)) & span_mask;
+        int mm = __popcll((diff | (diff >> 1)) & 0x5555555555555555ULL);
+        nIdent = wl - mm;
+        fscore = nIdent * match_score - mm * mismatch_penalty;
+    }
     int fscoreMax = fscore;
-    int nIdent = wl, maxIdent = wl;
+    int maxIdent = nIdent;
 
     for (int64_t off = 0; off < rem_fwd; off += 32) {
         int64_t rem_chunk = rem_fwd - off;
@@ -619,6 +637,7 @@ uint32_t gpu_extend_tile_two_tier(
     const GpuSeqView &seqY,
     const GpuSeqView &seqY_rc,
     int wl,
+    bool is_spaced,
     uint32_t min_len,
     float sim_th,
     int match_score,
@@ -638,7 +657,7 @@ uint32_t gpu_extend_tile_two_tier(
 
     extend_short_kernel<<<(n_hits + 255) / 256, 256>>>(
         d_filtered_hits, n_hits, seqX, seqY, seqY_rc,
-        wl, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
+        wl, is_spaced, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
         d_long_seeds, d_long_count, d_out_frags, d_frag_count, max_frags);
     CUDA_CHECK_VOID(cudaGetLastError());
 
@@ -649,7 +668,7 @@ uint32_t gpu_extend_tile_two_tier(
         uint32_t grid = (h_nlong + warps_per_block - 1) / warps_per_block;
         extend_long_warp_kernel<<<grid, warps_per_block * 32>>>(
             d_long_seeds, h_nlong, seqX, seqY, seqY_rc,
-            wl, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
+            wl, is_spaced, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
             d_out_frags, d_frag_count, max_frags);
         CUDA_CHECK_VOID(cudaGetLastError());
     }

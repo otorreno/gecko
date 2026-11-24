@@ -7,6 +7,7 @@ pub mod pipeline;
 pub mod radix;
 pub mod ref_index;
 pub mod seq;
+pub mod spaced;
 pub mod stream;
 
 pub use error::{GeckoError, Result};
@@ -20,3 +21,4 @@ pub use pipeline::{
 };
 pub use ref_index::{PosStrandVec, RefIndex};
 pub use seq::{Genome, PackedSeq, SeqRecord};
+pub use spaced::SpacedSeed;

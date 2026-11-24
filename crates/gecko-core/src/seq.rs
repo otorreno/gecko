@@ -767,6 +767,56 @@ impl PackedSeqBuilder {
         added
     }
 
+    /// Stitch another [`PackedSeqBuilder`] onto the end of `self` with exact 2-bit word alignment
+    /// and shifted/merged sparse metadata runs.
+    fn append_builder(&mut self, other: &PackedSeqBuilder) {
+        if other.len == 0 {
+            return;
+        }
+        let base_off = self.len as u64;
+        if self.bit_pos == 0 {
+            self.bits.extend_from_slice(&other.bits);
+            self.cur_word = other.cur_word;
+            self.bit_pos = other.bit_pos;
+            self.len += other.len;
+        } else {
+            let shift = self.bit_pos;
+            let inv = 64 - shift;
+            self.bits.reserve(other.bits.len() + 1);
+            for &w in &other.bits {
+                self.cur_word |= w << shift;
+                self.bits.push(self.cur_word);
+                self.cur_word = w >> inv;
+            }
+            if other.bit_pos > 0 {
+                self.cur_word |= other.cur_word << shift;
+                let next_pos = shift + other.bit_pos;
+                if next_pos >= 64 {
+                    self.bits.push(self.cur_word);
+                    let rem = next_pos - 64;
+                    self.cur_word = if rem == 0 { 0 } else { other.cur_word >> inv };
+                    self.bit_pos = rem;
+                } else {
+                    self.bit_pos = next_pos;
+                }
+            }
+            self.len += other.len;
+        }
+
+        for &(s, e) in &other.n_runs {
+            self.record_n_range(s + base_off, e + base_off);
+        }
+        for &(s, e) in &other.soft_runs {
+            self.record_soft_range(s + base_off, e + base_off);
+        }
+        for &p in &other.sep_pos {
+            self.sep_pos.push(p + base_off);
+        }
+        for &(p, b) in &other.iupac {
+            self.iupac.push((p + base_off, b));
+        }
+    }
+
     pub fn finish(mut self) -> PackedSeq {
         if self.bit_pos > 0 {
             self.bits.push(self.cur_word);
@@ -852,21 +902,36 @@ pub struct Genome {
 }
 
 impl Genome {
-    /// Load a plain or gzip-compressed FASTA file directly into 2-bit/bp storage using 4 MB I/O.
+    /// Load a plain or gzip-compressed FASTA file directly into 2-bit/bp storage.
+    ///
+    /// For uncompressed FASTAs >= 8 MiB on Unix when multiple Rayon threads are available,
+    /// partitions the file along newline boundaries and packs 2-bit sequences in parallel via
+    /// positional reads (`pread`), then stitches chunks bit-identically.
     pub fn from_fasta_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
         let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-        let mut reader = BufReader::with_capacity(4 << 20, file);
+        let name = file_stem_name(path);
 
-        // Auto-detect gzip via magic bytes 0x1f 0x8b
+        // Auto-detect gzip via 2-byte magic header (0x1f 0x8b) without a 4 MiB upfront read.
+        #[cfg(unix)]
         let is_gz = {
-            let buf = reader.fill_buf()?;
-            buf.len() >= 2 && buf[0] == 0x1f && buf[1] == 0x8b
+            use std::os::unix::fs::FileExt;
+            let mut magic = [0u8; 2];
+            file.read_at(&mut magic, 0).unwrap_or(0) >= 2 && magic == [0x1f, 0x8b]
+        };
+        #[cfg(not(unix))]
+        let is_gz = {
+            use std::io::{Read, Seek};
+            let mut f = &file;
+            let mut magic = [0u8; 2];
+            let n = f.read(&mut magic).unwrap_or(0);
+            f.seek(std::io::SeekFrom::Start(0))?;
+            n >= 2 && magic == [0x1f, 0x8b]
         };
 
-        let name = file_stem_name(path);
         if is_gz {
+            let reader = BufReader::with_capacity(4 << 20, file);
             let gz = MultiGzDecoder::new(reader);
             Self::from_fasta_reader_with_hint(
                 BufReader::with_capacity(4 << 20, gz),
@@ -875,23 +940,260 @@ impl Genome {
                 file_len.saturating_mul(3),
             )
         } else {
+            #[cfg(unix)]
+            {
+                const PAR_THRESHOLD: usize = 8 * 1024 * 1024;
+                if file_len >= PAR_THRESHOLD && rayon::current_num_threads() > 1 {
+                    return Self::from_plain_fasta_parallel(&file, file_len, name, path);
+                }
+            }
+            let reader = BufReader::with_capacity(4 << 20, file);
             Self::from_fasta_reader_with_hint(reader, name, path, file_len)
         }
     }
 
-    /// Load query and reference FASTAs concurrently across two threads.
+    #[cfg(unix)]
+    fn from_plain_fasta_parallel(
+        file: &File,
+        file_len: usize,
+        name: String,
+        path: &Path,
+    ) -> Result<Self> {
+        use rayon::prelude::*;
+        use std::os::unix::fs::FileExt;
+
+        let n_chunks = (rayon::current_num_threads() * 2).clamp(2, 32);
+        let mut boundaries = Vec::with_capacity(n_chunks + 1);
+        boundaries.push(0usize);
+
+        let mut probe = [0u8; 4096];
+        for c in 1..n_chunks {
+            let approx = file_len * c / n_chunks;
+            let mut pos = approx;
+            let mut found = None;
+            while pos < file_len {
+                let to_read = probe.len().min(file_len - pos);
+                file.read_exact_at(&mut probe[..to_read], pos as u64)?;
+                if let Some(rel) = probe[..to_read].iter().position(|&b| b == b'\n') {
+                    found = Some(pos + rel + 1);
+                    break;
+                }
+                pos += to_read;
+            }
+            let next_b = found.unwrap_or(file_len);
+            if next_b > *boundaries.last().unwrap() && next_b < file_len {
+                boundaries.push(next_b);
+            }
+        }
+        boundaries.push(file_len);
+
+        if boundaries.len() <= 2 {
+            let mut f = file.try_clone()?;
+            use std::io::Seek;
+            f.seek(std::io::SeekFrom::Start(0))?;
+            return Self::from_fasta_reader_with_hint(
+                BufReader::with_capacity(4 << 20, f),
+                name,
+                path,
+                file_len,
+            );
+        }
+
+        struct ChunkParsed {
+            leading: PackedSeqBuilder,
+            records: Vec<(String, String, PackedSeqBuilder)>,
+        }
+
+        let chunk_ranges: Vec<(usize, usize)> =
+            boundaries.windows(2).map(|w| (w[0], w[1])).collect();
+
+        const READ_BUF_CAP: usize = 256 * 1024;
+
+        let parsed: Vec<ChunkParsed> = chunk_ranges
+            .par_iter()
+            .map(|&(start, end)| -> Result<ChunkParsed> {
+                let total_len = end - start;
+                let mut leading = PackedSeqBuilder::with_capacity_bases(0);
+                let mut records: Vec<(String, String, PackedSeqBuilder)> = Vec::new();
+
+                let mut buf = vec![0u8; READ_BUF_CAP];
+                let mut file_off = start;
+                let mut carry = 0usize;
+                let mut pred_w = 0usize;
+
+                while file_off < end || carry > 0 {
+                    let rem_file = end - file_off;
+                    let to_read = if rem_file > 0 {
+                        let space = buf.len() - carry;
+                        if space == 0 {
+                            buf.resize(buf.len() * 2, 0);
+                        }
+                        let n = (buf.len() - carry).min(rem_file);
+                        file.read_exact_at(&mut buf[carry..carry + n], file_off as u64)?;
+                        file_off += n;
+                        n
+                    } else {
+                        0
+                    };
+                    let valid = carry + to_read;
+                    let at_end = file_off == end;
+
+                    // Process all complete lines in buf[..valid] (or final partial line if at_end).
+                    let limit = if at_end {
+                        valid
+                    } else if let Some(last_nl) = buf[..valid].iter().rposition(|&b| b == b'\n') {
+                        last_nl + 1
+                    } else {
+                        carry = valid;
+                        continue;
+                    };
+
+                    let mut pos = 0usize;
+                    while pos < limit {
+                        if pred_w > 0
+                            && pos + pred_w < limit
+                            && buf[pos + pred_w] == b'\n'
+                            && buf[pos] != b'>'
+                        {
+                            let target = if let Some((_, _, b)) = records.last_mut() {
+                                b
+                            } else {
+                                if leading.len == 0 {
+                                    leading.bits.reserve(total_len / 32 + 2);
+                                }
+                                &mut leading
+                            };
+                            target.push_fasta_bytes(&buf[pos..pos + pred_w]);
+                            pos += pred_w + 1;
+                            continue;
+                        }
+
+                        let nl = buf[pos..limit]
+                            .iter()
+                            .position(|&b| b == b'\n')
+                            .map_or(limit, |rel| pos + rel);
+                        let has_cr = nl > pos && buf[nl - 1] == b'\r';
+                        let line_end = if has_cr { nl - 1 } else { nl };
+                        let line = &buf[pos..line_end];
+
+                        if !line.is_empty() {
+                            if line[0] == b'>' {
+                                let header =
+                                    String::from_utf8_lossy(&line[1..]).trim_start().to_string();
+                                let id = header.split_whitespace().next().unwrap_or("").to_string();
+                                let rem_est = (end - file_off) + (limit - nl);
+                                records.push((
+                                    id,
+                                    header,
+                                    PackedSeqBuilder::with_capacity_bases(rem_est),
+                                ));
+                            } else {
+                                if !has_cr && line.len() >= 16 {
+                                    pred_w = line.len();
+                                }
+                                let target = if let Some((_, _, b)) = records.last_mut() {
+                                    b
+                                } else {
+                                    if leading.len == 0 {
+                                        leading.bits.reserve(total_len / 32 + 2);
+                                    }
+                                    &mut leading
+                                };
+                                target.push_fasta_bytes(line);
+                            }
+                        }
+                        pos = (nl + 1).min(limit);
+                    }
+
+                    carry = valid - limit;
+                    if carry > 0 {
+                        buf.copy_within(limit..valid, 0);
+                    }
+                    if at_end {
+                        break;
+                    }
+                }
+
+                Ok(ChunkParsed { leading, records })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut merged: Option<PackedSeqBuilder> = None;
+        let mut records: Vec<SeqRecord> = Vec::new();
+        let mut total_bases: u64 = 0;
+
+        for (ci, chunk) in parsed.into_iter().enumerate() {
+            if chunk.leading.len > 0 {
+                if ci == 0 || records.is_empty() {
+                    return Err(GeckoError::InvalidFasta {
+                        path: path.to_path_buf(),
+                        message: "sequence data encountered before first '>' header".into(),
+                    });
+                }
+                let added = chunk.leading.len as u64;
+                merged.as_mut().unwrap().append_builder(&chunk.leading);
+                records.last_mut().unwrap().len += added;
+                total_bases += added;
+            }
+            for (id, header, mut rec_builder) in chunk.records {
+                if merged.is_none() {
+                    // Reuse the very first record's builder directly without copying its bits.
+                    let extra_words = (file_len / 32 + 4).saturating_sub(rec_builder.bits.capacity());
+                    if extra_words > 0 {
+                        rec_builder.bits.reserve(extra_words);
+                    }
+                    let added = rec_builder.len as u64;
+                    merged = Some(rec_builder);
+                    records.push(SeqRecord {
+                        id,
+                        header,
+                        start_with_sep: 0,
+                        start_no_sep: 0,
+                        len: added,
+                    });
+                    total_bases += added;
+                } else {
+                    let m = merged.as_mut().unwrap();
+                    m.push_sep();
+                    let start_with_sep = m.len as u64;
+                    let added = rec_builder.len as u64;
+                    m.append_builder(&rec_builder);
+                    records.push(SeqRecord {
+                        id,
+                        header,
+                        start_with_sep,
+                        start_no_sep: total_bases,
+                        len: added,
+                    });
+                    total_bases += added;
+                }
+            }
+        }
+
+        let Some(merged) = merged else {
+            return Err(GeckoError::InvalidFasta {
+                path: path.to_path_buf(),
+                message: "no FASTA records found".into(),
+            });
+        };
+
+        Ok(Self {
+            name,
+            seq: merged.finish(),
+            records,
+            total_bases,
+        })
+    }
+
+    /// Load query and reference FASTAs concurrently across Rayon workers.
     pub fn load_pair_parallel(
         query_path: impl AsRef<Path>,
         ref_path: impl AsRef<Path>,
     ) -> Result<(Self, Self)> {
         let qp = query_path.as_ref();
         let rp = ref_path.as_ref();
-        std::thread::scope(|s| {
-            let hq = s.spawn(|| Self::from_fasta_path(qp));
-            let r = Self::from_fasta_path(rp);
-            let q = hq.join().expect("FASTA loader thread panicked");
-            Ok((q?, r?))
-        })
+        let (q, r) = rayon::join(|| Self::from_fasta_path(qp), || Self::from_fasta_path(rp));
+        Ok((q?, r?))
     }
 
     /// Parse FASTA records from any [`BufRead`] source.
@@ -1385,5 +1687,58 @@ mod tests {
             assert_eq!(s_simd.iupac, s_scalar.iupac);
             assert_eq!(s_simd.special_runs, s_scalar.special_runs);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parallel_fasta_loader_matches_serial_bit_exact() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let line_a = "ACGTacgtNNNNACGTCCGGTTAAACGTTTGGCCAAAACCCGGGTTTACGTACGGTTAAC\n";
+        let line_b = "NNNNNNNNNNNNNNNNggggccccaaaaTTTTACGTACGTACGTACGTACGTACGTACGT\r\n";
+        let line_c = "RYSWKMACGTacgtACGTacgtACGTacgtACGTacgtACGTacgtACGTacgtACGTac\n";
+        for rec in 0..5 {
+            writeln!(tmp, ">chr{rec} synthetic multi-fasta record {rec}").unwrap();
+            for rep in 0..400 {
+                let s = match (rec + rep) % 3 {
+                    0 => line_a,
+                    1 => line_b,
+                    _ => line_c,
+                };
+                tmp.write_all(s.as_bytes()).unwrap();
+            }
+        }
+        tmp.flush().unwrap();
+
+        let path = tmp.path();
+        let file = File::open(path).unwrap();
+        let file_len = file.metadata().unwrap().len() as usize;
+        let par = Genome::from_plain_fasta_parallel(&file, file_len, "t".into(), path).unwrap();
+
+        let file2 = File::open(path).unwrap();
+        let ser = Genome::from_fasta_reader_with_hint(
+            BufReader::with_capacity(64 * 1024, file2),
+            "t".into(),
+            path,
+            file_len,
+        )
+        .unwrap();
+
+        assert_eq!(par.total_bases, ser.total_bases);
+        assert_eq!(par.records.len(), ser.records.len());
+        for (a, b) in par.records.iter().zip(ser.records.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.header, b.header);
+            assert_eq!(a.start_with_sep, b.start_with_sep);
+            assert_eq!(a.start_no_sep, b.start_no_sep);
+            assert_eq!(a.len, b.len);
+        }
+        assert_eq!(par.seq.len, ser.seq.len);
+        assert_eq!(par.seq.bits, ser.seq.bits);
+        assert_eq!(par.seq.n_runs, ser.seq.n_runs);
+        assert_eq!(par.seq.soft_runs, ser.seq.soft_runs);
+        assert_eq!(par.seq.sep_pos, ser.seq.sep_pos);
+        assert_eq!(par.seq.iupac, ser.seq.iupac);
+        assert_eq!(par.seq.special_runs, ser.seq.special_runs);
     }
 }

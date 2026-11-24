@@ -25,71 +25,8 @@ static uint8_t comp_iupac_host(uint8_t c) {
     }
 }
 
-static int upload_packed_seq(const GeckoPackedSeqHost *src, GpuSeqBuf &dst) {
-    memset(&dst, 0, sizeof(dst));
-    dst.len = src->len;
-    dst.n_seps = src->n_seps;
-    dst.n_iupac = src->n_iupac;
-
-    size_t bits_words = (size_t)((src->len + 31ULL) / 32ULL) + 2;
-    size_t copy_words = (src->bits_words < bits_words) ? (size_t)src->bits_words : bits_words;
-    CUDA_CHECK(cudaMalloc(&dst.d_bits, bits_words * sizeof(uint64_t)));
-    if (copy_words > 0 && src->bits) {
-        CUDA_CHECK(cudaMemcpy(dst.d_bits, src->bits, copy_words * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    }
-    if (bits_words > copy_words) {
-        CUDA_CHECK(cudaMemset(dst.d_bits + copy_words, 0, (bits_words - copy_words) * sizeof(uint64_t)));
-    }
-
-    size_t bm_words = (size_t)((src->len + 31ULL) / 32ULL) + 2;
-    size_t bm_copy = (src->bm_words < bm_words) ? (size_t)src->bm_words : bm_words;
-    if (src->special_bm) {
-        CUDA_CHECK(cudaMalloc(&dst.d_special_bm, bm_words * sizeof(uint32_t)));
-        if (bm_copy > 0) {
-            CUDA_CHECK(cudaMemcpy(dst.d_special_bm, src->special_bm, bm_copy * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        }
-        if (bm_words > bm_copy) {
-            CUDA_CHECK(cudaMemset(dst.d_special_bm + bm_copy, 0, (bm_words - bm_copy) * sizeof(uint32_t)));
-        }
-    }
-    if (src->invalid_bm) {
-        if (src->invalid_bm == src->special_bm && dst.d_special_bm) {
-            dst.d_invalid_bm = dst.d_special_bm;
-            dst.owns_invalid_bm = false;
-        } else {
-            CUDA_CHECK(cudaMalloc(&dst.d_invalid_bm, bm_words * sizeof(uint32_t)));
-            if (bm_copy > 0) {
-                CUDA_CHECK(cudaMemcpy(dst.d_invalid_bm, src->invalid_bm, bm_copy * sizeof(uint32_t), cudaMemcpyHostToDevice));
-            }
-            if (bm_words > bm_copy) {
-                CUDA_CHECK(cudaMemset(dst.d_invalid_bm + bm_copy, 0, (bm_words - bm_copy) * sizeof(uint32_t)));
-            }
-            dst.owns_invalid_bm = true;
-        }
-    }
-
-    if (src->n_seps > 0 && src->sep_pos) {
-        CUDA_CHECK(cudaMalloc(&dst.d_sep_pos, (size_t)src->n_seps * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemcpy(dst.d_sep_pos, src->sep_pos, (size_t)src->n_seps * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    }
-    if (src->n_iupac > 0 && src->iupac_pos && src->iupac_byte) {
-        CUDA_CHECK(cudaMalloc(&dst.d_iupac_pos, (size_t)src->n_iupac * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&dst.d_iupac_byte, (size_t)src->n_iupac * sizeof(uint8_t)));
-        CUDA_CHECK(cudaMemcpy(dst.d_iupac_pos, src->iupac_pos, (size_t)src->n_iupac * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(dst.d_iupac_byte, src->iupac_byte, (size_t)src->n_iupac * sizeof(uint8_t), cudaMemcpyHostToDevice));
-    }
-    return 0;
-}
-
-static void free_gpu_seq(GpuSeqBuf &s) {
-    if (s.d_bits) cudaFree(s.d_bits);
-    if (s.d_special_bm) cudaFree(s.d_special_bm);
-    if (s.owns_invalid_bm && s.d_invalid_bm) cudaFree(s.d_invalid_bm);
-    if (s.d_sep_pos) cudaFree(s.d_sep_pos);
-    if (s.d_iupac_pos) cudaFree(s.d_iupac_pos);
-    if (s.d_iupac_byte) cudaFree(s.d_iupac_byte);
-    memset(&s, 0, sizeof(s));
-}
+static constexpr size_t PINNED_SLOT_BYTES = 8ULL << 20;      /* 8 MiB per ping-pong slot (16 MiB total) */
+static constexpr size_t PINNED_MIN_BYTES  = 64ULL << 10;     /* stage transfers >= 64 KiB */
 
 struct GeckoCudaScratch {
     uint64_t *d_hits = nullptr;
@@ -103,8 +40,172 @@ struct GeckoCudaScratch {
     uint32_t *d_frag_count = nullptr;
     void *d_cub_temp = nullptr;
     size_t cub_temp_cap = 0;
+    uint8_t *h_pinned = nullptr;
+    size_t h_pinned_slot_cap = 0;
+    cudaEvent_t slot_done[2] = {nullptr, nullptr};
+    bool pinned_failed = false;
     bool allocated = false;
 };
+
+static int ensure_pinned_host(GeckoCudaScratch *sc, size_t needed) {
+    if (!sc || sc->pinned_failed) return -1;
+    size_t want_slot = std::min<size_t>(needed, PINNED_SLOT_BYTES);
+    if (want_slot <= sc->h_pinned_slot_cap && sc->h_pinned) return 0;
+
+    if (sc->h_pinned) {
+        cudaFreeHost(sc->h_pinned);
+        sc->h_pinned = nullptr;
+        sc->h_pinned_slot_cap = 0;
+    }
+    size_t alloc_slot = (want_slot + (1ULL << 20) - 1ULL) & ~((1ULL << 20) - 1ULL);
+    if (alloc_slot > PINNED_SLOT_BYTES) alloc_slot = PINNED_SLOT_BYTES;
+    if (cudaHostAlloc(&sc->h_pinned, alloc_slot * 2, cudaHostAllocDefault) == cudaSuccess) {
+        if (!sc->slot_done[0]) {
+            if (cudaEventCreateWithFlags(&sc->slot_done[0], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&sc->slot_done[1], cudaEventDisableTiming) != cudaSuccess) {
+                cudaFreeHost(sc->h_pinned);
+                sc->h_pinned = nullptr;
+                sc->pinned_failed = true;
+                return -1;
+            }
+        }
+        sc->h_pinned_slot_cap = alloc_slot;
+        return 0;
+    }
+    /* Graceful fallback to pageable host memory if pinned quota is exhausted */
+    sc->h_pinned = nullptr;
+    sc->h_pinned_slot_cap = 0;
+    sc->pinned_failed = true;
+    return -1;
+}
+
+static int upload_h2d_staged(void *dst, const void *src, size_t bytes, GeckoCudaScratch *sc) {
+    if (bytes == 0) return 0;
+    if (bytes < PINNED_MIN_BYTES || ensure_pinned_host(sc, bytes) != 0) {
+        CUDA_CHECK(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice));
+        return 0;
+    }
+    const uint8_t *s_ptr = static_cast<const uint8_t *>(src);
+    uint8_t *d_ptr = static_cast<uint8_t *>(dst);
+    size_t slot_cap = sc->h_pinned_slot_cap;
+    size_t off = 0;
+    int chunk = 0;
+    while (off < bytes) {
+        size_t n = std::min<size_t>(slot_cap, bytes - off);
+        int s = chunk & 1;
+        if (chunk >= 2) {
+            CUDA_CHECK(cudaEventSynchronize(sc->slot_done[s]));
+        }
+        uint8_t *buf = sc->h_pinned + (size_t)s * slot_cap;
+        memcpy(buf, s_ptr + off, n);
+        CUDA_CHECK(cudaMemcpyAsync(d_ptr + off, buf, n, cudaMemcpyHostToDevice, 0));
+        CUDA_CHECK(cudaEventRecord(sc->slot_done[s], 0));
+        off += n;
+        chunk++;
+    }
+    if (chunk >= 1) CUDA_CHECK(cudaEventSynchronize(sc->slot_done[(chunk - 1) & 1]));
+    if (chunk >= 2) CUDA_CHECK(cudaEventSynchronize(sc->slot_done[(chunk - 2) & 1]));
+    return 0;
+}
+
+static int download_d2h_staged(void *dst, const void *src, size_t bytes, GeckoCudaScratch *sc) {
+    if (bytes == 0) return 0;
+    if (bytes < PINNED_MIN_BYTES || ensure_pinned_host(sc, bytes) != 0) {
+        CUDA_CHECK(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost));
+        return 0;
+    }
+    const uint8_t *s_ptr = static_cast<const uint8_t *>(src);
+    uint8_t *d_ptr = static_cast<uint8_t *>(dst);
+    size_t slot_cap = sc->h_pinned_slot_cap;
+
+    size_t cur_off = 0;
+    size_t cur_n = std::min<size_t>(slot_cap, bytes);
+    int s = 0;
+    CUDA_CHECK(cudaMemcpyAsync(sc->h_pinned, s_ptr, cur_n, cudaMemcpyDeviceToHost, 0));
+    CUDA_CHECK(cudaEventRecord(sc->slot_done[0], 0));
+
+    while (cur_off < bytes) {
+        size_t next_off = cur_off + cur_n;
+        size_t next_n = (next_off < bytes) ? std::min<size_t>(slot_cap, bytes - next_off) : 0;
+        if (next_n > 0) {
+            uint8_t *next_buf = sc->h_pinned + (size_t)(s ^ 1) * slot_cap;
+            CUDA_CHECK(cudaMemcpyAsync(next_buf, s_ptr + next_off, next_n, cudaMemcpyDeviceToHost, 0));
+            CUDA_CHECK(cudaEventRecord(sc->slot_done[s ^ 1], 0));
+        }
+        CUDA_CHECK(cudaEventSynchronize(sc->slot_done[s]));
+        memcpy(d_ptr + cur_off, sc->h_pinned + (size_t)s * slot_cap, cur_n);
+        cur_off = next_off;
+        cur_n = next_n;
+        s ^= 1;
+    }
+    return 0;
+}
+
+static int upload_packed_seq(const GeckoPackedSeqHost *src, GpuSeqBuf &dst, GeckoCudaScratch *sc) {
+    memset(&dst, 0, sizeof(dst));
+    dst.len = src->len;
+    dst.n_seps = src->n_seps;
+    dst.n_iupac = src->n_iupac;
+
+    size_t bits_words = (size_t)((src->len + 31ULL) / 32ULL) + 2;
+    size_t copy_words = (src->bits_words < bits_words) ? (size_t)src->bits_words : bits_words;
+    CUDA_CHECK(cudaMalloc(&dst.d_bits, bits_words * sizeof(uint64_t)));
+    if (copy_words > 0 && src->bits) {
+        if (upload_h2d_staged(dst.d_bits, src->bits, copy_words * sizeof(uint64_t), sc) != 0) return -1;
+    }
+    if (bits_words > copy_words) {
+        CUDA_CHECK(cudaMemset(dst.d_bits + copy_words, 0, (bits_words - copy_words) * sizeof(uint64_t)));
+    }
+
+    size_t bm_words = (size_t)((src->len + 31ULL) / 32ULL) + 2;
+    size_t bm_copy = (src->bm_words < bm_words) ? (size_t)src->bm_words : bm_words;
+    if (src->special_bm) {
+        CUDA_CHECK(cudaMalloc(&dst.d_special_bm, bm_words * sizeof(uint32_t)));
+        if (bm_copy > 0) {
+            if (upload_h2d_staged(dst.d_special_bm, src->special_bm, bm_copy * sizeof(uint32_t), sc) != 0) return -1;
+        }
+        if (bm_words > bm_copy) {
+            CUDA_CHECK(cudaMemset(dst.d_special_bm + bm_copy, 0, (bm_words - bm_copy) * sizeof(uint32_t)));
+        }
+    }
+    if (src->invalid_bm) {
+        if (src->invalid_bm == src->special_bm && dst.d_special_bm) {
+            dst.d_invalid_bm = dst.d_special_bm;
+            dst.owns_invalid_bm = false;
+        } else {
+            CUDA_CHECK(cudaMalloc(&dst.d_invalid_bm, bm_words * sizeof(uint32_t)));
+            if (bm_copy > 0) {
+                if (upload_h2d_staged(dst.d_invalid_bm, src->invalid_bm, bm_copy * sizeof(uint32_t), sc) != 0) return -1;
+            }
+            if (bm_words > bm_copy) {
+                CUDA_CHECK(cudaMemset(dst.d_invalid_bm + bm_copy, 0, (bm_words - bm_copy) * sizeof(uint32_t)));
+            }
+            dst.owns_invalid_bm = true;
+        }
+    }
+
+    if (src->n_seps > 0 && src->sep_pos) {
+        CUDA_CHECK(cudaMalloc(&dst.d_sep_pos, (size_t)src->n_seps * sizeof(uint32_t)));
+        if (upload_h2d_staged(dst.d_sep_pos, src->sep_pos, (size_t)src->n_seps * sizeof(uint32_t), sc) != 0) return -1;
+    }
+    if (src->n_iupac > 0 && src->iupac_pos && src->iupac_byte) {
+        CUDA_CHECK(cudaMalloc(&dst.d_iupac_pos, (size_t)src->n_iupac * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&dst.d_iupac_byte, (size_t)src->n_iupac * sizeof(uint8_t)));
+        if (upload_h2d_staged(dst.d_iupac_pos, src->iupac_pos, (size_t)src->n_iupac * sizeof(uint32_t), sc) != 0) return -1;
+        if (upload_h2d_staged(dst.d_iupac_byte, src->iupac_byte, (size_t)src->n_iupac * sizeof(uint8_t), sc) != 0) return -1;
+    }
+    return 0;
+}
+
+static void free_gpu_seq(GpuSeqBuf &s) {
+    if (s.d_bits) cudaFree(s.d_bits);
+    if (s.d_special_bm) cudaFree(s.d_special_bm);
+    if (s.owns_invalid_bm && s.d_invalid_bm) cudaFree(s.d_invalid_bm);
+    if (s.d_sep_pos) cudaFree(s.d_sep_pos);
+    if (s.d_iupac_pos) cudaFree(s.d_iupac_pos);
+    if (s.d_iupac_byte) cudaFree(s.d_iupac_byte);
+    memset(&s, 0, sizeof(s));
+}
 
 static int ensure_scratch(GeckoCudaScratch &sc) {
     if (sc.allocated) return 0;
@@ -132,6 +233,9 @@ static void free_scratch(GeckoCudaScratch &sc) {
     if (sc.d_long_count) cudaFree(sc.d_long_count);
     if (sc.d_frag_count) cudaFree(sc.d_frag_count);
     if (sc.d_cub_temp) cudaFree(sc.d_cub_temp);
+    if (sc.h_pinned) cudaFreeHost(sc.h_pinned);
+    if (sc.slot_done[0]) cudaEventDestroy(sc.slot_done[0]);
+    if (sc.slot_done[1]) cudaEventDestroy(sc.slot_done[1]);
     sc = GeckoCudaScratch{};
 }
 
@@ -198,7 +302,8 @@ extern "C" GeckoCudaRefHandle *gecko_cuda_prepare_ref(
     h->soft_mask = (soft_mask != 0);
     h->compare_reverse = (compare_reverse != 0);
 
-    if (upload_packed_seq(ref_seq, h->seqY) != 0) {
+    if (upload_packed_seq(ref_seq, h->seqY, &h->scratch) != 0) {
+        free_scratch(h->scratch);
         free_gpu_seq(h->seqY);
         delete h;
         return nullptr;
@@ -275,7 +380,7 @@ extern "C" int gecko_cuda_query_and_extend(
     }
 
     GpuSeqBuf seqX{};
-    if (upload_packed_seq(query_seq, seqX) != 0) {
+    if (upload_packed_seq(query_seq, seqX, &h->scratch) != 0) {
         free_gpu_seq(seqX);
         return -1;
     }
@@ -295,7 +400,6 @@ extern "C" int gecko_cuda_query_and_extend(
     GpuSeqView viewY_rc = h->compare_reverse ? h->seqY_rc.view() : viewY;
 
     std::vector<GpuFrag> all_frags;
-    std::vector<GpuFrag> tile_frags;
 
     /* Choose an initial tile size tuned to k-mer density, and adaptively halve
      * any tile that overflows GECKO_MAX_TILE_HITS or GECKO_MAX_TILE_FRAGS so
@@ -360,9 +464,16 @@ extern "C" int gecko_cuda_query_and_extend(
         out->extended_hits += n_filt;
 
         if (n_frags > 0) {
-            tile_frags.resize(n_frags);
-            CUDA_CHECK(cudaMemcpy(tile_frags.data(), d_out_frags, (size_t)n_frags * sizeof(GpuFrag), cudaMemcpyDeviceToHost));
-            all_frags.insert(all_frags.end(), tile_frags.begin(), tile_frags.end());
+            size_t old_n = all_frags.size();
+            all_frags.resize(old_n + n_frags);
+            if (download_d2h_staged(
+                    all_frags.data() + old_n,
+                    d_out_frags,
+                    (size_t)n_frags * sizeof(GpuFrag),
+                    &h->scratch) != 0) {
+                free_gpu_seq(seqX);
+                return -1;
+            }
         }
     }
     CUDA_CHECK(cudaDeviceSynchronize());

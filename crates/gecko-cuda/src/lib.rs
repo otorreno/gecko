@@ -45,16 +45,14 @@ mod ffi {
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct GpuFrag {
-        pub diag: i64,
         pub x_start: u32,
         pub y_start: u32,
-        pub x_end: u32,
-        pub y_end: u32,
+        pub length: u32,
         pub ident: u32,
         pub score: u32,
-        pub strand: u8,
-        pub pad: [u8; 7],
+        pub flags: u32,
     }
+    const _: () = assert!(std::mem::size_of::<GpuFrag>() == 24);
 
     #[repr(C)]
     #[derive(Default)]
@@ -295,23 +293,28 @@ mod ffi {
         };
 
         for gf in slice {
-            let is_rev = gf.strand != 0;
-            let seq_x = query.seq_index_for_data_pos(gf.x_start as u64) as u64;
+            let is_rev = (gf.flags & 1) != 0;
+            let x_start_raw = gf.x_start as u64;
+            let y_start_raw = gf.y_start as u64;
+            let length = gf.length as u64;
+            let x_end_raw = x_start_raw + length - 1;
+            let y_end_raw = y_start_raw + length - 1;
+            let diag = (x_start_raw as i64) - (y_start_raw as i64);
+
+            let seq_x = query.seq_index_for_data_pos(x_start_raw) as u64;
             let seq_y_buf = if is_rev {
-                find_rc_seq_id(&rc_starts, gf.y_start as u64)
+                find_rc_seq_id(&rc_starts, y_start_raw)
             } else {
-                reference.seq_index_for_data_pos(gf.y_start as u64) as u64
+                reference.seq_index_for_data_pos(y_start_raw) as u64
             };
-            let length = (gf.x_end - gf.x_start + 1) as u64;
             let sim = ((gf.score as f64) * 100.0 / ((length as f64) * match_sc)) as f32;
-            coverage.record(length, sim);
 
             let frag = Fragment {
-                diag: gf.diag,
-                x_start: (gf.x_start as u64) - seq_x,
-                y_start: (gf.y_start as u64) - seq_y_buf,
-                x_end: (gf.x_end as u64) - seq_x,
-                y_end: (gf.y_end as u64) - seq_y_buf,
+                diag,
+                x_start: x_start_raw - seq_x,
+                y_start: y_start_raw - seq_y_buf,
+                x_end: x_end_raw - seq_x,
+                y_end: y_end_raw - seq_y_buf,
                 length,
                 ident: gf.ident as u64,
                 score: gf.score as u64,
@@ -339,6 +342,9 @@ mod ffi {
         let reverse_fragments = frags_r.len() as u64;
         let mut fragments = frags_f;
         fragments.extend(frags_r);
+        for f in &fragments {
+            coverage.record(f.length, f.similarity);
+        }
 
         let stats = CompareStats {
             word_matches: raw.leftmax_hits,
@@ -383,7 +389,7 @@ mod ffi {
                         &ref_ffi,
                         config.word_length as c_int,
                         config.spaced_mask_2bit().unwrap_or(0),
-                        config.freq_limit as u32,
+                        config.freq_limit.min(u32::MAX as u64) as u32,
                         c_int::from(config.soft_mask),
                         c_int::from(config.compare_reverse),
                     )
@@ -425,7 +431,7 @@ mod ffi {
                     gecko_cuda_query_and_extend(
                         self.handle.0,
                         &q_ffi,
-                        min_len as u32,
+                        min_len.min(u32::MAX as u64) as u32,
                         config.min_similarity,
                         config.scoring.match_score as c_int,
                         config.scoring.mismatch_penalty as c_int,
@@ -488,7 +494,7 @@ mod ffi {
                         &ref_ffi,
                         config.word_length as c_int,
                         config.spaced_mask_2bit().unwrap_or(0),
-                        config.freq_limit as u32,
+                        config.freq_limit.min(u32::MAX as u64) as u32,
                         c_int::from(config.soft_mask),
                         c_int::from(config.compare_reverse),
                     )
@@ -524,7 +530,7 @@ mod ffi {
                 gecko_cuda_query_and_extend(
                     handle.0,
                     &q_ffi,
-                    min_len as u32,
+                    min_len.min(u32::MAX as u64) as u32,
                     config.min_similarity,
                     config.scoring.match_score as c_int,
                     config.scoring.mismatch_penalty as c_int,

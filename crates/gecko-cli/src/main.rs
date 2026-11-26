@@ -7,7 +7,6 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use backend::{BackendArg, SelectedBackend};
 use clap::{Parser, Subcommand, ValueEnum};
-use rayon::prelude::*;
 use gecko_core::formats::align::{write_alignments_path, write_borders_path};
 use gecko_core::formats::csv::{
     ComparisonMetadata, read_csv_path, write_csv_path, write_inf_path, write_mat_path,
@@ -18,10 +17,15 @@ use gecko_core::formats::modern::{
 };
 use gecko_core::formats::plot::{ColorMode, PlotOptions, PlotOrigin, write_dotplot_png_path};
 use gecko_core::kmer::{DictOptions, INDEX_WORD_SIZE, KmerDict};
-use gecko_core::pipeline::{CompareConfig, compare_genomes, compare_with_ref_index};
+use gecko_core::minimizer::{MinimizerIndex, compare_minimizer_streaming_with_coverage};
+use gecko_core::pipeline::{
+    CompareConfig, SeedingMode, compare_genomes, compare_with_ref_index_with_coverage,
+    profile_enabled,
+};
 use gecko_core::ref_index::RefIndex;
 use gecko_core::seq::Genome;
 use gecko_core::{Fragment, Scoring};
+use rayon::prelude::*;
 
 #[derive(Parser)]
 #[command(
@@ -152,6 +156,26 @@ impl OutputFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SeedingArg {
+    /// Stride-1 exact canonical RefIndex seeding (Direct-CSR / Hash-CSR).
+    Exact,
+    /// Shift-invariant canonical minimizer super-seeding for contiguous k >= 18 (exact fallback for k < 18).
+    Minimizer,
+    /// Auto-select minimizer super-seeding for contiguous k >= 18 and exact seeding otherwise.
+    Auto,
+}
+
+impl From<SeedingArg> for SeedingMode {
+    fn from(arg: SeedingArg) -> Self {
+        match arg {
+            SeedingArg::Exact => SeedingMode::Exact,
+            SeedingArg::Minimizer => SeedingMode::Minimizer,
+            SeedingArg::Auto => SeedingMode::Auto,
+        }
+    }
+}
+
 #[derive(Parser)]
 struct CompareArgs {
     /// Query genome in FASTA or gzipped FASTA (.gz) format.
@@ -176,6 +200,15 @@ struct CompareArgs {
     /// (w12s18, w14s20, w16s22, w18s26, w20s28). Overrides --word-length with the mask span.
     #[arg(long)]
     spaced_seed: Option<String>,
+
+    /// Seeding mechanism (`exact`, `minimizer` for contiguous k >= 18, or `auto`).
+    #[arg(long, value_enum, default_value_t = SeedingArg::Exact)]
+    seeding: SeedingArg,
+
+    /// Require two non-overlapping seed hits on the same diagonal within WINDOW bp before extension
+    /// (opt-in BLAST/LASTZ noise filter; default window 40 bp when passed without a value).
+    #[arg(long, num_args = 0..=1, default_missing_value = "40", value_name = "WINDOW")]
+    two_hit: Option<u32>,
 
     /// Skip 32-mers occurring more than this many times in a genome.
     #[arg(long, default_value_t = 1000)]
@@ -360,6 +393,14 @@ struct AllVsAllArgs {
     #[arg(long)]
     spaced_seed: Option<String>,
 
+    /// Seeding mechanism (`exact`, `minimizer` for contiguous k >= 18, or `auto`).
+    #[arg(long, value_enum, default_value_t = SeedingArg::Exact)]
+    seeding: SeedingArg,
+
+    /// Require two non-overlapping seed hits on the same diagonal within WINDOW bp before extension.
+    #[arg(long, num_args = 0..=1, default_missing_value = "40", value_name = "WINDOW")]
+    two_hit: Option<u32>,
+
     /// File extensions to include (comma-separated).
     #[arg(long, value_delimiter = ',', default_values_t = ["fa".to_string(), "fasta".to_string(), "fna".to_string(), "gz".to_string()])]
     ext: Vec<String>,
@@ -502,14 +543,13 @@ fn main() -> Result<()> {
 
 fn cmd_compare(args: CompareArgs) -> Result<()> {
     let t0 = Instant::now();
+    let formats = OutputFormat::expand(&args.formats);
     let spaced_seed = args
         .spaced_seed
         .as_deref()
         .map(gecko_core::SpacedSeed::parse)
         .transpose()?;
-    let word_length = spaced_seed
-        .as_ref()
-        .map_or(args.word_length, |sp| sp.span);
+    let word_length = spaced_seed.as_ref().map_or(args.word_length, |sp| sp.span);
     let config = CompareConfig {
         min_length: args.min_length,
         min_similarity: args.min_similarity,
@@ -526,6 +566,9 @@ fn cmd_compare(args: CompareArgs) -> Result<()> {
             mismatch_penalty: args.mismatch_penalty,
             n_penalty: args.n_penalty,
         },
+        seeding_mode: args.seeding.into(),
+        two_hit_window: args.two_hit,
+        collect_coverage: formats.contains(&OutputFormat::Mat),
     };
 
     let run = backend::run_compare_from_paths(
@@ -541,7 +584,6 @@ fn cmd_compare(args: CompareArgs) -> Result<()> {
     let res = run.result;
 
     let t_write_start = Instant::now();
-    let formats = OutputFormat::expand(&args.formats);
     let prefix = args
         .prefix
         .unwrap_or_else(|| format!("{}-{}", query.name, reference.name));
@@ -775,9 +817,7 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
         .as_deref()
         .map(gecko_core::SpacedSeed::parse)
         .transpose()?;
-    let word_length = spaced_seed
-        .as_ref()
-        .map_or(args.word_length, |sp| sp.span);
+    let word_length = spaced_seed.as_ref().map_or(args.word_length, |sp| sp.span);
     let config = CompareConfig {
         min_length: args.min_length,
         min_similarity: args.min_similarity,
@@ -785,6 +825,9 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
         spaced_seed,
         freq_limit: args.freq_limit,
         memory_budget: args.memory,
+        seeding_mode: args.seeding.into(),
+        two_hit_window: args.two_hit,
+        collect_coverage: formats.contains(&OutputFormat::Mat),
         ..Default::default()
     };
     config.validate()?;
@@ -804,9 +847,15 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
     let mut logged_backend = false;
     let t_comp = Instant::now();
 
-    for j in 1..files.len() {
+    // Length-aware reference scheduling (F11): process smaller references first to minimize peak
+    // allocator fragmentation and surface fast pairs early, while preserving exact canonical
+    // `(genomes[i], genomes[j])` orientation and `<g_i>-<g_j>` filenames for every `i < j`.
+    let mut ref_order: Vec<usize> = (1..files.len()).collect();
+    ref_order.sort_by_key(|&j| (genomes[j].total_bases, j));
+
+    for j in ref_order {
         // Check if any pair `(i, j)` actually needs running before indexing `genomes[j]`.
-        let needed_queries: Vec<usize> = (0..j)
+        let mut needed_queries: Vec<usize> = (0..j)
             .filter(|&i| {
                 let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
                 !(args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists())
@@ -820,6 +869,18 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
                 eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
             }
             continue;
+        }
+        // Query longer sequences first against the hot reference index for better load balancing.
+        needed_queries.sort_by_key(|&i| (std::cmp::Reverse(genomes[i].total_bases), i));
+        let skipped_count = j - needed_queries.len();
+        if skipped_count > 0 {
+            for i in 0..j {
+                let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
+                if args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists() {
+                    done += 1;
+                    eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
+                }
+            }
         }
 
         match selected {
@@ -839,18 +900,14 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
                         );
                         logged_backend = true;
                     }
-                    for i in 0..j {
+                    for &i in &needed_queries {
                         done += 1;
                         let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
-                        if args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists()
-                        {
-                            eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
-                            continue;
-                        }
                         let res = cuda_ref.query(&genomes[i], &config)?;
                         let q_fname = files[i].file_name().and_then(|s| s.to_str()).unwrap_or("");
                         let r_fname = files[j].file_name().and_then(|s| s.to_str()).unwrap_or("");
-                        let meta = res.metadata(q_fname, r_fname, &genomes[i], &genomes[j], &config);
+                        let meta =
+                            res.metadata(q_fname, r_fname, &genomes[i], &genomes[j], &config);
                         write_outputs(
                             &args.outdir,
                             &prefix,
@@ -890,18 +947,14 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
                         );
                         logged_backend = true;
                     }
-                    for i in 0..j {
+                    for &i in &needed_queries {
                         done += 1;
                         let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
-                        if args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists()
-                        {
-                            eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
-                            continue;
-                        }
                         let res = wgpu_ref.query(&genomes[i], &config)?;
                         let q_fname = files[i].file_name().and_then(|s| s.to_str()).unwrap_or("");
                         let r_fname = files[j].file_name().and_then(|s| s.to_str()).unwrap_or("");
-                        let meta = res.metadata(q_fname, r_fname, &genomes[i], &genomes[j], &config);
+                        let meta =
+                            res.metadata(q_fname, r_fname, &genomes[i], &genomes[j], &config);
                         write_outputs(
                             &args.outdir,
                             &prefix,
@@ -924,60 +977,129 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
                 }
             }
             SelectedBackend::Cpu => {
+                enum CachedCpuRef {
+                    Exact(RefIndex, Option<Genome>),
+                    Minimizer(MinimizerIndex, Option<Genome>),
+                    None,
+                }
+
+                let use_min = config.use_minimizer_seeding(None);
                 if !logged_backend {
                     eprintln!(
-                        "Backend: cpu ({} threads, reusable RefIndex; loaded {} genomes in {:.2}s)",
+                        "Backend: cpu ({} threads, reusable {}; loaded {} genomes in {:.2}s)",
                         rayon::current_num_threads(),
+                        if use_min {
+                            "MinimizerIndex"
+                        } else {
+                            "RefIndex"
+                        },
                         genomes.len(),
                         load_secs,
                     );
                     logged_backend = true;
                 }
-                let spaced_mask = config.spaced_mask_2bit();
-                let use_ref_index = RefIndex::fits_in_budget_with_mask(
-                    &genomes[j],
-                    config.word_length,
-                    spaced_mask,
-                    config.soft_mask,
-                    config.compare_reverse,
-                    config.memory_budget,
-                );
 
-                let cached_ref = if use_ref_index {
-                    let idx = RefIndex::build_with_mask(
+                let cached_ref = if use_min
+                    && MinimizerIndex::fits_in_budget(
                         &genomes[j],
                         config.word_length,
-                        spaced_mask,
+                        config.compare_reverse,
+                        config.memory_budget,
+                    ) {
+                    let t_idx = Instant::now();
+                    let idx = MinimizerIndex::build(
+                        &genomes[j],
+                        config.word_length,
                         config.freq_limit,
                         config.soft_mask,
+                        false,
                     )?;
+                    let idx_ms = t_idx.elapsed().as_secs_f64() * 1e3;
+                    let t_rev = Instant::now();
                     let rev = if config.compare_reverse {
                         Some(genomes[j].reverse_complement())
                     } else {
                         None
                     };
-                    Some((idx, rev))
+                    if profile_enabled() {
+                        eprintln!(
+                            "[GECKO_PROFILE] all_vs_all_index ref={} mode=minimizer kept_entries={} heap_mib={:.2} index_ms={:.2} rev_ms={:.2}",
+                            genomes[j].name,
+                            idx.kept_entries,
+                            idx.heap_bytes() as f64 / (1024.0 * 1024.0),
+                            idx_ms,
+                            t_rev.elapsed().as_secs_f64() * 1e3,
+                        );
+                    }
+                    CachedCpuRef::Minimizer(idx, rev)
+                } else if !use_min {
+                    let spaced_mask = config.spaced_mask_2bit();
+                    if RefIndex::fits_in_budget_with_mask(
+                        &genomes[j],
+                        config.word_length,
+                        spaced_mask,
+                        config.soft_mask,
+                        config.compare_reverse,
+                        config.memory_budget,
+                    ) {
+                        let t_idx = Instant::now();
+                        let idx = RefIndex::build_with_mask(
+                            &genomes[j],
+                            config.word_length,
+                            spaced_mask,
+                            config.freq_limit,
+                            config.soft_mask,
+                        )?;
+                        let idx_ms = t_idx.elapsed().as_secs_f64() * 1e3;
+                        let t_rev = Instant::now();
+                        let rev = if config.compare_reverse {
+                            Some(genomes[j].reverse_complement())
+                        } else {
+                            None
+                        };
+                        if profile_enabled() {
+                            eprintln!(
+                                "[GECKO_PROFILE] all_vs_all_index ref={} mode=exact kept_entries={} heap_mib={:.2} index_ms={:.2} rev_ms={:.2}",
+                                genomes[j].name,
+                                idx.kept_entries,
+                                idx.heap_bytes() as f64 / (1024.0 * 1024.0),
+                                idx_ms,
+                                t_rev.elapsed().as_secs_f64() * 1e3,
+                            );
+                        }
+                        CachedCpuRef::Exact(idx, rev)
+                    } else {
+                        CachedCpuRef::None
+                    }
                 } else {
-                    None
+                    CachedCpuRef::None
                 };
 
-                for i in 0..j {
+                for &i in &needed_queries {
                     done += 1;
                     let prefix = format!("{}-{}", genomes[i].name, genomes[j].name);
-                    if args.skip_existing && args.outdir.join(format!("{prefix}.frags")).exists() {
-                        eprintln!("[{done}/{total_pairs}] Skipping existing {prefix}");
-                        continue;
-                    }
-                    let res = if let Some((ref idx, ref rev)) = cached_ref {
-                        compare_with_ref_index(
+                    let res = match &cached_ref {
+                        CachedCpuRef::Exact(idx, rev) => compare_with_ref_index_with_coverage(
                             &genomes[i],
                             &genomes[j],
                             idx,
                             rev.as_ref(),
                             &config,
-                        )?
-                    } else {
-                        compare_genomes(&genomes[i], &genomes[j], &config, None)?
+                            config.collect_coverage,
+                        )?,
+                        CachedCpuRef::Minimizer(idx, rev) => {
+                            compare_minimizer_streaming_with_coverage(
+                                &genomes[i],
+                                &genomes[j],
+                                idx,
+                                rev.as_ref(),
+                                &config,
+                                config.collect_coverage,
+                            )?
+                        }
+                        CachedCpuRef::None => {
+                            compare_genomes(&genomes[i], &genomes[j], &config, None)?
+                        }
                     };
                     let q_fname = files[i].file_name().and_then(|s| s.to_str()).unwrap_or("");
                     let r_fname = files[j].file_name().and_then(|s| s.to_str()).unwrap_or("");

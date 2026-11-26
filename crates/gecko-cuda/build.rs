@@ -14,6 +14,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GECKO_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=NVCC");
 
     let cuda_sources = [
         "cuda/cuda_common.cuh",
@@ -32,9 +33,17 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let nvcc = env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
-    let arch_str = env::var("GECKO_CUDA_ARCH").unwrap_or_else(|_| {
-        "-gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_89,code=sm_89".to_string()
-    });
+    let arch_str = env::var("GECKO_CUDA_ARCH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            "-gencode arch=compute_75,code=sm_75 \
+             -gencode arch=compute_80,code=sm_80 \
+             -gencode arch=compute_86,code=sm_86 \
+             -gencode arch=compute_89,code=sm_89 \
+             -gencode arch=compute_89,code=compute_89"
+                .to_string()
+        });
     let arch_flags: Vec<&str> = arch_str.split_whitespace().collect();
 
     let cu_files = [

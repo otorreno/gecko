@@ -63,6 +63,19 @@ impl Default for CoverageMatrix {
     }
 }
 
+/// Exact integer reciprocal for `floor((u_max * 100) / length)` on `length in 2..=160`
+/// (`t[l] = ceil(2^32 / l)`). Zero-division bit-exact match for [`CoverageMatrix::record`]
+/// on short default-scoring (`+4/-4/-1`) extensions.
+const RECIP_100: [u32; 161] = {
+    let mut t = [0u32; 161];
+    let mut l = 2usize;
+    while l <= 160 {
+        t[l] = (1u64 << 32).div_ceil(l as u64) as u32;
+        l += 1;
+    }
+    t
+};
+
 impl CoverageMatrix {
     pub fn new() -> Self {
         Self {
@@ -78,6 +91,20 @@ impl CoverageMatrix {
         // Safety: `bins` always has length 1000 and `row <= 999`, `col <= 99`.
         unsafe {
             *self.bins.get_unchecked_mut(row).get_unchecked_mut(col) += 1;
+        }
+    }
+
+    /// Zero-division bit-exact coverage recording for short default-scoring (`+4/-4/-1`)
+    /// extensions with `2 <= length <= 160` and `0 <= u_max <= length`.
+    #[inline(always)]
+    pub(crate) fn record_unit_exact(&mut self, length: usize, u_max: u32) {
+        debug_assert!((2..=160).contains(&length));
+        debug_assert_eq!(self.bins.len(), 1000);
+        let recip = unsafe { *RECIP_100.get_unchecked(length) } as u64;
+        let col = ((((u_max as u64) * 100) * recip) >> 32).min(99) as usize;
+        // Safety: `bins` has length 1000, `length <= 160 < 1000`, `col <= 99`.
+        unsafe {
+            *self.bins.get_unchecked_mut(length).get_unchecked_mut(col) += 1;
         }
     }
 
@@ -283,7 +310,8 @@ fn sp_cursor_for(runs: &[(u64, u64)], pos: u64) -> usize {
 }
 
 /// Finalize `(fwd, bwd)` extension results into an [`ExtendOutcome`], deferring
-/// `seq_index_for_data_pos` lookups until a fragment is accepted when `opts.fixed_length` is set.
+/// `seq_index_for_data_pos` lookups until a fragment is accepted when `opts.fixed_length` is set
+/// and deferring FP64 similarity division behind `length > min_length` when `coverage` is `None`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn finalize_extend_outcome(
@@ -295,15 +323,20 @@ fn finalize_extend_outcome(
     opts: ExtendOptions,
     fwd: ForwardResult,
     bwd: BackwardResult,
-    coverage: &mut CoverageMatrix,
+    coverage: Option<&mut CoverageMatrix>,
 ) -> ExtendOutcome {
     // `(fwd.xfil_max - seq_x) - (bwd.xfil_max2 - seq_x) + 1 == fwd.xfil_max - bwd.xfil_max2 + 1`.
     let length = fwd.xfil_max - bwd.xfil_max2 + 1;
     let score = bwd.fscore_max.max(0) as u64;
-    let max_possible = (length as f64) * (opts.scoring.match_score as f64);
-    let similarity = ((score as f64) * 100.0 / max_possible) as f32;
 
-    coverage.record(length, similarity);
+    let computed_sim = if let Some(cov) = coverage {
+        let max_possible = (length as f64) * (opts.scoring.match_score as f64);
+        let sim = ((score as f64) * 100.0 / max_possible) as f32;
+        cov.record(length, sim);
+        Some(sim)
+    } else {
+        None
+    };
 
     let (min_length, cached_seqs) = if opts.fixed_length {
         (opts.min_length, None)
@@ -316,46 +349,76 @@ fn finalize_extend_outcome(
         (ml, Some((sx, sy)))
     };
 
-    if length > min_length && similarity > opts.min_similarity {
-        let (seq_x, seq_y) = cached_seqs.unwrap_or_else(|| {
-            (
-                genome_x.seq_index_for_data_pos(pos_x),
-                genome_y.seq_index_for_data_pos(pos_y),
-            )
+    if length > min_length {
+        let similarity = computed_sim.unwrap_or_else(|| {
+            let max_possible = (length as f64) * (opts.scoring.match_score as f64);
+            ((score as f64) * 100.0 / max_possible) as f32
         });
-        let x_start = bwd.xfil_max2 - seq_x as u64;
-        let y_start = bwd.ycol_max2 - seq_y as u64;
-        let x_end = fwd.xfil_max - seq_x as u64;
-        let y_end = fwd.ycol_max - seq_y as u64;
-        let out_seq_y = if opts.strand == 'f' {
-            seq_y as u64
-        } else {
-            (genome_y.num_records() - 1 - seq_y) as u64
-        };
-        ExtendOutcome {
-            fragment: Some(Fragment {
-                diag: h.diag,
-                x_start,
-                y_start,
-                x_end,
-                y_end,
-                length,
-                ident: bwd.max_identities,
-                score,
-                similarity,
-                seq_x: seq_x as u64,
-                seq_y: out_seq_y,
-                block: 0,
-                strand: opts.strand,
-            }),
-            xfil_max: fwd.xfil_max,
-        }
-    } else {
-        ExtendOutcome {
-            fragment: None,
-            xfil_max: fwd.xfil_max,
+        if similarity > opts.min_similarity {
+            let (seq_x, seq_y) = cached_seqs.unwrap_or_else(|| {
+                (
+                    genome_x.seq_index_for_data_pos(pos_x),
+                    genome_y.seq_index_for_data_pos(pos_y),
+                )
+            });
+            let x_start = bwd.xfil_max2 - seq_x as u64;
+            let y_start = bwd.ycol_max2 - seq_y as u64;
+            let x_end = fwd.xfil_max - seq_x as u64;
+            let y_end = fwd.ycol_max - seq_y as u64;
+            let out_seq_y = if opts.strand == 'f' {
+                seq_y as u64
+            } else {
+                (genome_y.num_records() - 1 - seq_y) as u64
+            };
+            return ExtendOutcome {
+                fragment: Some(Fragment {
+                    diag: h.diag,
+                    x_start,
+                    y_start,
+                    x_end,
+                    y_end,
+                    length,
+                    ident: bwd.max_identities,
+                    score,
+                    similarity,
+                    seq_x: seq_x as u64,
+                    seq_y: out_seq_y,
+                    block: 0,
+                    strand: opts.strand,
+                }),
+                xfil_max: fwd.xfil_max,
+            };
         }
     }
+
+    ExtendOutcome {
+        fragment: None,
+        xfil_max: fwd.xfil_max,
+    }
+}
+
+/// Compute initial seed `(identities, score)` from a precomputed 2-bit XOR `seed_diff`
+/// (`seq_x.load_32(pos_x) ^ seq_y.load_32(pos_y)`), avoiding redundant loads on spaced seeds.
+#[inline(always)]
+pub(crate) fn seed_init_stats_from_diff(
+    seed_diff: u64,
+    wl: u64,
+    scoring: Scoring,
+    spaced_seed: bool,
+) -> (u64, i64) {
+    if !spaced_seed {
+        return (wl, wl as i64 * scoring.match_score);
+    }
+    let span_mask = if wl >= 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * wl)) - 1
+    };
+    let diff = seed_diff & span_mask;
+    let mm = ((diff | (diff >> 1)) & 0x5555_5555_5555_5555).count_ones() as u64;
+    let ident = wl - mm;
+    let score = ident as i64 * scoring.match_score - mm as i64 * scoring.mismatch_penalty;
+    (ident, score)
 }
 
 #[inline(always)]
@@ -371,16 +434,8 @@ fn seed_init_stats(
     if !spaced_seed {
         return (wl, wl as i64 * scoring.match_score);
     }
-    let span_mask = if wl >= 32 {
-        u64::MAX
-    } else {
-        (1u64 << (2 * wl)) - 1
-    };
-    let diff = (seq_x.load_32(pos_x as usize) ^ seq_y.load_32(pos_y as usize)) & span_mask;
-    let mm = ((diff | (diff >> 1)) & 0x5555_5555_5555_5555).count_ones() as u64;
-    let ident = wl - mm;
-    let score = ident as i64 * scoring.match_score - mm as i64 * scoring.mismatch_penalty;
-    (ident, score)
+    let seed_diff = seq_x.load_32(pos_x as usize) ^ seq_y.load_32(pos_y as usize);
+    seed_init_stats_from_diff(seed_diff, wl, scoring, true)
 }
 
 /// Bidirectional ungapped extension from a single seed hit, faithful to GECKO's `FragFromHit`.
@@ -479,26 +534,30 @@ pub(crate) fn extend_single_hit_outcome(
     };
 
     finalize_extend_outcome(
-        h, pos_x, pos_y, genome_x, genome_y, opts, fwd, bwd, coverage,
+        h,
+        pos_x,
+        pos_y,
+        genome_x,
+        genome_y,
+        opts,
+        fwd,
+        bwd,
+        Some(coverage),
     )
 }
 
-/// Inlineable AVX2 + BMI2 + POPCNT single-hit extension with caller-supplied monotonic `sp_x` cursor.
-///
-/// # Safety
-/// Caller must run inside a `#[target_feature(enable = "avx2,bmi2,popcnt")]` context and guarantee
-/// `sp_x[..cx_x].end <= h.pos_x`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi2,popcnt")]
+/// Portable single-hit extension with caller-supplied `(seed_ident, seed_score)` and optional
+/// coverage matrix.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn extend_single_hit_outcome_avx2_bmi2(
+pub(crate) fn extend_single_hit_with_seed_portable(
     h: Hit,
     genome_x: &Genome,
     genome_y: &Genome,
     opts: ExtendOptions,
-    cx_x: usize,
-    coverage: &mut CoverageMatrix,
+    seed_ident: u64,
+    seed_score: i64,
+    coverage: Option<&mut CoverageMatrix>,
 ) -> ExtendOutcome {
     let seq_x_pack = &genome_x.seq;
     let seq_y_pack = &genome_y.seq;
@@ -516,15 +575,67 @@ pub(crate) unsafe fn extend_single_hit_outcome_avx2_bmi2(
         };
     }
 
-    let (seed_ident, seed_score) = seed_init_stats(
-        seq_x_pack,
-        seq_y_pack,
-        pos_x,
-        pos_y,
-        wl,
-        opts.scoring,
-        opts.spaced_seed,
-    );
+    let (fwd, bwd) = if opts.scoring.is_default_gecko() {
+        let f = extend_forward_2bit_portable(
+            seq_x_pack, seq_y_pack, pos_x, pos_y, wl, seed_ident, seed_score,
+        );
+        let b = extend_backward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, f);
+        (f, b)
+    } else {
+        let f = extend_forward_scalar(
+            seq_x_pack,
+            seq_y_pack,
+            pos_x,
+            pos_y,
+            wl,
+            seed_ident,
+            seed_score,
+            opts.scoring,
+        );
+        let b = extend_backward_scalar(seq_x_pack, seq_y_pack, pos_x, pos_y, f, opts.scoring);
+        (f, b)
+    };
+
+    finalize_extend_outcome(
+        h, pos_x, pos_y, genome_x, genome_y, opts, fwd, bwd, coverage,
+    )
+}
+
+/// Inlineable AVX2 + BMI2 + POPCNT single-hit extension with caller-supplied `(seed_ident,
+/// seed_score)`, monotonic `sp_x` cursor, and optional coverage matrix.
+///
+/// # Safety
+/// Caller must run inside a `#[target_feature(enable = "avx2,bmi2,popcnt")]` context and guarantee
+/// `sp_x[..cx_x].end <= h.pos_x`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi2,popcnt")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn extend_single_hit_with_seed_avx2_bmi2(
+    h: Hit,
+    genome_x: &Genome,
+    genome_y: &Genome,
+    opts: ExtendOptions,
+    seed_ident: u64,
+    seed_score: i64,
+    cx_x: usize,
+    coverage: Option<&mut CoverageMatrix>,
+) -> ExtendOutcome {
+    let seq_x_pack = &genome_x.seq;
+    let seq_y_pack = &genome_y.seq;
+    let nx = seq_x_pack.len as u64;
+    let ny = seq_y_pack.len as u64;
+
+    let pos_x = h.pos_x;
+    let pos_y = h.pos_y();
+    let wl = opts.word_length as u64;
+
+    if pos_x + wl > nx || pos_y + wl > ny {
+        return ExtendOutcome {
+            fragment: None,
+            xfil_max: pos_x + wl.saturating_sub(1),
+        };
+    }
 
     let (fwd, bwd) = if opts.scoring.is_default_gecko() {
         let cy = sp_cursor_for(&seq_y_pack.special_runs, pos_y);
@@ -557,7 +668,8 @@ pub(crate) unsafe fn extend_single_hit_outcome_avx2_bmi2(
     )
 }
 
-/// Inlineable AVX2 + POPCNT (SWAR pack) single-hit extension with caller-supplied monotonic `sp_x` cursor.
+/// Inlineable AVX2 + POPCNT (SWAR pack) single-hit extension with caller-supplied `(seed_ident,
+/// seed_score)`, monotonic `sp_x` cursor, and optional coverage matrix.
 ///
 /// # Safety
 /// Caller must run inside a `#[target_feature(enable = "avx2,popcnt")]` context and guarantee
@@ -566,13 +678,15 @@ pub(crate) unsafe fn extend_single_hit_outcome_avx2_bmi2(
 #[target_feature(enable = "avx2,popcnt")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn extend_single_hit_outcome_avx2_swar(
+pub(crate) unsafe fn extend_single_hit_with_seed_avx2_swar(
     h: Hit,
     genome_x: &Genome,
     genome_y: &Genome,
     opts: ExtendOptions,
+    seed_ident: u64,
+    seed_score: i64,
     cx_x: usize,
-    coverage: &mut CoverageMatrix,
+    coverage: Option<&mut CoverageMatrix>,
 ) -> ExtendOutcome {
     let seq_x_pack = &genome_x.seq;
     let seq_y_pack = &genome_y.seq;
@@ -589,16 +703,6 @@ pub(crate) unsafe fn extend_single_hit_outcome_avx2_swar(
             xfil_max: pos_x + wl.saturating_sub(1),
         };
     }
-
-    let (seed_ident, seed_score) = seed_init_stats(
-        seq_x_pack,
-        seq_y_pack,
-        pos_x,
-        pos_y,
-        wl,
-        opts.scoring,
-        opts.spaced_seed,
-    );
 
     let (fwd, bwd) = if opts.scoring.is_default_gecko() {
         let cy = sp_cursor_for(&seq_y_pack.special_runs, pos_y);
@@ -801,7 +905,7 @@ fn safe_backward_dist(runs: &[(u64, u64)], pos: u64, cursor: &mut usize) -> u64 
 
 /// Portable SWAR compaction of even bits (`0, 2, 4, ..., 62`) of `x` into bits `0..31`.
 #[inline(always)]
-fn pack_even_bits_swar(mut x: u64) -> u32 {
+pub(crate) fn pack_even_bits_swar(mut x: u64) -> u32 {
     x = (x | (x >> 1)) & 0x3333_3333_3333_3333;
     x = (x | (x >> 2)) & 0x0F0F_0F0F_0F0F_0F0F;
     x = (x | (x >> 4)) & 0x00FF_00FF_00FF_00FF;
@@ -2055,5 +2159,19 @@ mod tests {
             "skip must not step over a valley boundary where a new HSP begins (got {skip2})"
         );
         assert!(skip2 >= (wl / 2) as u64);
+    }
+
+    #[test]
+    fn record_unit_exact_matches_fp64_record_exhaustively() {
+        let mut cov_exact = CoverageMatrix::new();
+        let mut cov_fp = CoverageMatrix::new();
+        for length in 2usize..=160 {
+            for u_max in 0u32..=(length as u32) {
+                cov_exact.record_unit_exact(length, u_max);
+                let sim = (((4 * u_max) as f64) * 100.0 / ((length as f64) * 4.0)) as f32;
+                cov_fp.record(length as u64, sim);
+            }
+        }
+        assert_eq!(cov_exact.bins, cov_fp.bins);
     }
 }

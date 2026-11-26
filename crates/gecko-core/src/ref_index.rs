@@ -1,12 +1,33 @@
 use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
 use crate::error::{GeckoError, Result};
-use crate::seq::{Genome, PackedSeq};
+use crate::seq::{Genome, PackedSeq, reverse_32_2bit};
 
 const NUM_PARTITIONS: usize = 256;
-const STAGE_CAP: usize = 64;
+const STAGE_CAP: usize = 64; // 192 KiB HashCsr<u32> / 128 KiB DirectCsr<u32> fits cleanly in 256 KiB L2; 4x fewer flushes/RFOs/dTLB misses than 16
+const UNIQ_BUF_CAP: usize = 64;
+
+const BLOOM_MIN_KMERS: usize = 4_096;
+const BLOOM_MAX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB full-index cap (128 KiB/part, fits in 45 MiB L3)
+const BLOOM_TARGET_BITS_PER_KMER: usize = 8; // 16 MiB on 16M-kmer chr21 (k_h=6), 32 MiB on 50M-kmer chr16 (k_h=4)
+const BLOOM_MAX_K_H: usize = 8; // Retained for BLOOM_SALTS, contains_unchecked, & unit tests
+const BLOOM_CHOOSE_MAX_K_H: usize = 6; // Putze blocked-Bloom sweet spot (<=0.04% FPR delta, -14%..-25% CPU)
+
+/// Odd 32-bit multiply-shift salts (Putze / Impala family) for 9-bit lane hashes
+/// inside a 512-bit cache-line block. Eliminates double-hash even-stride periodicity.
+const BLOOM_SALTS: [u32; BLOOM_MAX_K_H] = [
+    0x47b6_137b,
+    0x4497_4d91,
+    0x8824_ad5b,
+    0xa2b7_289d,
+    0x7054_95c7,
+    0x2df1_424b,
+    0x9efc_4947,
+    0x5c6b_fb31,
+];
 
 /// 2-bit DNA encoding lookup table with soft-masking (uppercase A/C/G/T/U only).
 pub(crate) const BASE_LUT_SOFT_MASK: [u8; 256] = make_base_lut(true);
@@ -52,6 +73,47 @@ pub fn fmix64(mut k: u64) -> u64 {
     k
 }
 
+/// Exact algebraic inverse of MurmurHash3 [`fmix64`].
+#[cfg(test)]
+#[inline(always)]
+pub(crate) fn inv_fmix64(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0x9cb4_b2f8_1293_37db);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0x4f74_430c_22a5_4005);
+    h ^= h >> 33;
+    h
+}
+
+/// Returns `true` iff a canonical (possibly spaced-masked) `wl`-bp MSB-first key is a palindrome
+/// (`sf == sr`). Safe for all `wl in 4..=32`.
+#[inline(always)]
+fn is_palindrome_key(canon: u64, wl: usize, seed_mask: u64) -> bool {
+    let rc = (reverse_32_2bit(!canon) >> (64 - 2 * wl)) & seed_mask;
+    rc == canon
+}
+
+/// Fast setup check: an odd-length contiguous k-mer (or odd spaced seed whose center position
+/// `(wl - 1) / 2` is a care `'1'` base) can never equal its reverse complement.
+#[inline(always)]
+fn can_key_be_palindrome(wl: usize, spaced_mask: Option<u64>) -> bool {
+    (wl & 1) == 0 || spaced_mask.is_some_and(|sm| ((sm >> (wl - 1)) & 3) == 0)
+}
+
+/// Software prefetch into L2 cache (`_MM_HINT_T1` on x86_64) for L3-resident Bloom blocks
+/// without evicting L1d active-diagonal ring or batch stack buffers.
+#[inline(always)]
+pub(crate) fn prefetch_t1<T>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T1);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = ptr;
+    }
+}
+
 /// Software prefetch into L3/L2 cache (`_MM_HINT_T2` on x86_64, matching C `__builtin_prefetch(..., 0, 1)`
 /// so 64-wide random index prefetches do not evict hot diagonal-cache lines from L1d/L2).
 #[inline(always)]
@@ -64,6 +126,186 @@ pub(crate) fn prefetch_t2<T>(ptr: *const T) {
     {
         let _ = ptr;
     }
+}
+
+/// Single 64-byte cache-line-aligned 512-bit Blocked Bloom filter block.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, align(64))]
+pub(crate) struct BloomBlock(pub [u64; 8]);
+
+/// Partition-aligned L3-sized 64-byte cache-line-blocked Bloom filter built inline in Pass 2
+/// from the existing `fmix64(canon)` hash (zero extra hashing, zero atomics).
+#[derive(Debug, Clone)]
+pub(crate) struct BlockedBloom {
+    pub blocks: Vec<BloomBlock>,
+    pub sub_bits: u32,
+    pub block_shift: u32, // 56 - sub_bits
+    pub k_h: u8,          // 1..=8
+}
+
+impl BlockedBloom {
+    #[inline]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.blocks.capacity() * std::mem::size_of::<BloomBlock>()
+    }
+
+    /// Branchless single-cache-line probe. Zero inner-loop branches eliminates branch
+    /// mispredictions on divergent missing k-mers.
+    ///
+    /// # Safety
+    /// Caller must ensure `blk_idx < self.blocks.len()`.
+    #[inline(always)]
+    pub(crate) unsafe fn contains_unchecked(&self, blk_idx: usize, tag: u32) -> bool {
+        let words = unsafe { &self.blocks.get_unchecked(blk_idx).0 };
+        macro_rules! probe_bit {
+            ($i:expr) => {{
+                let bit = (tag.wrapping_mul(BLOOM_SALTS[$i]) >> 23) as usize;
+                (unsafe { *words.get_unchecked(bit >> 6) }) >> (bit & 63)
+            }};
+        }
+        let hit = match self.k_h {
+            1 => probe_bit!(0),
+            2 => probe_bit!(0) & probe_bit!(1),
+            3 => probe_bit!(0) & probe_bit!(1) & probe_bit!(2),
+            4 => probe_bit!(0) & probe_bit!(1) & probe_bit!(2) & probe_bit!(3),
+            5 => probe_bit!(0) & probe_bit!(1) & probe_bit!(2) & probe_bit!(3) & probe_bit!(4),
+            6 => {
+                probe_bit!(0)
+                    & probe_bit!(1)
+                    & probe_bit!(2)
+                    & probe_bit!(3)
+                    & probe_bit!(4)
+                    & probe_bit!(5)
+            }
+            7 => {
+                probe_bit!(0)
+                    & probe_bit!(1)
+                    & probe_bit!(2)
+                    & probe_bit!(3)
+                    & probe_bit!(4)
+                    & probe_bit!(5)
+                    & probe_bit!(6)
+            }
+            _ => {
+                probe_bit!(0)
+                    & probe_bit!(1)
+                    & probe_bit!(2)
+                    & probe_bit!(3)
+                    & probe_bit!(4)
+                    & probe_bit!(5)
+                    & probe_bit!(6)
+                    & probe_bit!(7)
+            }
+        };
+        (hit & 1) != 0
+    }
+}
+
+#[inline(always)]
+pub(crate) fn insert_in_bloom_block(block: &mut BloomBlock, tag: u32, k_h: usize) {
+    macro_rules! set_bit {
+        ($i:expr) => {{
+            let bit = (tag.wrapping_mul(BLOOM_SALTS[$i]) >> 23) as usize;
+            unsafe {
+                *block.0.get_unchecked_mut(bit >> 6) |= 1u64 << (bit & 63);
+            }
+        }};
+    }
+    match k_h {
+        1 => {
+            set_bit!(0);
+        }
+        2 => {
+            set_bit!(0);
+            set_bit!(1);
+        }
+        3 => {
+            set_bit!(0);
+            set_bit!(1);
+            set_bit!(2);
+        }
+        4 => {
+            set_bit!(0);
+            set_bit!(1);
+            set_bit!(2);
+            set_bit!(3);
+        }
+        5 => {
+            set_bit!(0);
+            set_bit!(1);
+            set_bit!(2);
+            set_bit!(3);
+            set_bit!(4);
+        }
+        6 => {
+            set_bit!(0);
+            set_bit!(1);
+            set_bit!(2);
+            set_bit!(3);
+            set_bit!(4);
+            set_bit!(5);
+        }
+        7 => {
+            set_bit!(0);
+            set_bit!(1);
+            set_bit!(2);
+            set_bit!(3);
+            set_bit!(4);
+            set_bit!(5);
+            set_bit!(6);
+        }
+        _ => {
+            set_bit!(0);
+            set_bit!(1);
+            set_bit!(2);
+            set_bit!(3);
+            set_bit!(4);
+            set_bit!(5);
+            set_bit!(6);
+            set_bit!(7);
+        }
+    }
+}
+
+/// Choose `(sub_bits, k_h)` for the partition-aligned Blocked Bloom filter, or `None` when
+/// the reference is tiny, `freq_limit == 0`, or the filter would be over-saturated.
+#[inline]
+pub(crate) fn choose_bloom_params(
+    total_kmers: usize,
+    n_parts: usize,
+    freq_limit: u64,
+) -> Option<(u32, u8)> {
+    if total_kmers < BLOOM_MIN_KMERS || freq_limit == 0 || n_parts == 0 {
+        return None;
+    }
+    // Scale-invariant per-partition cap: at most `BLOOM_MAX_BYTES / 64 / NUM_PARTITIONS`
+    // (= 2,048 blocks = 128 KiB per coarse partition, `max_sub_bits = 11`).
+    // Multi-slab runs (`n_parts < 256`) get the exact same bits/k-mer and `k_h` as single-slab
+    // (`10.75 MiB` at 3 slabs, `6.50 MiB` at 5 slabs, `k_h = 4`) instead of 2x-4x oversizing Bloom
+    // RAM and inflating Pass-2 insert work (`k_h = 7`).
+    let max_per_part = ((BLOOM_MAX_BYTES / 64) / NUM_PARTITIONS).max(1);
+    let max_sub_bits = max_per_part.ilog2(); // 11
+
+    let desired_total_blocks = total_kmers
+        .saturating_mul(BLOOM_TARGET_BITS_PER_KMER)
+        .div_ceil(512);
+    let desired_per_part = desired_total_blocks.div_ceil(n_parts).max(1);
+    let sub_bits = desired_per_part
+        .next_power_of_two()
+        .trailing_zeros()
+        .min(max_sub_bits);
+
+    let total_blocks = n_parts << sub_bits;
+    let total_bits = total_blocks.saturating_mul(512);
+    // Disable if over-saturated (< 0.7 bits/k-mer).
+    if total_bits.saturating_mul(10) < total_kmers.saturating_mul(7) {
+        return None;
+    }
+    let bits_per_kmer = (total_bits as f64) / (total_kmers as f64);
+    let k_h = (bits_per_kmer * std::f64::consts::LN_2)
+        .round()
+        .clamp(1.0, BLOOM_CHOOSE_MAX_K_H as f64) as u8;
+    Some((sub_bits, k_h))
 }
 
 /// Packed `(pos << 1) | strand_bit` storage (`u32` for references < 2^31 bp, `u64` fallback).
@@ -131,13 +373,15 @@ pub(crate) enum RefIndexKind {
         offsets: Vec<u32>,
         tags: Vec<u32>,
         pos_strand: PosStrandVec,
+        bloom: Option<BlockedBloom>,
     },
 }
 
-/// Single-reference canonical k-mer index supporting lock-free streaming queries.
+/// Single-reference canonical (or forward-only) k-mer index supporting lock-free streaming queries.
 ///
 /// Indexes only Reference Y once at `word_length` (`4..=32`) using canonical keys
-/// `min(kf, kr)` and a 1-bit strand flag `(kr < kf)`, with per-strand `freq_limit` filtering.
+/// `min(kf, kr)` and a 1-bit strand flag `(kr < kf)` (or direct forward keys `kf` when
+/// `forward_only` is enabled), with per-strand `freq_limit` filtering.
 /// Supports exact global-`freq_limit` multi-slab streaming by restricting to a contiguous range
 /// of coarse hash/prefix partitions `[part_start .. part_end)` within `0..256`.
 #[derive(Debug, Clone)]
@@ -153,6 +397,15 @@ pub struct RefIndex {
     pub part_start: u16,
     pub part_end: u16,
     pub(crate) kind: RefIndexKind,
+    /// 1-bit/bp bitmap encoding whether a reference position's k-mer is valid, kept in this slab,
+    /// non-palindromic (when canonical), and globally unique (`cnt == 1` across both strands).
+    /// Read as `((unique_bm[pos >> 6] ^ unique_bm_xor) >> (pos & 63)) & 1`.
+    pub(crate) unique_bm: Vec<u64>,
+    /// Sense mask for `unique_bm`: `0` on `DirectCsr` (bit=1 means unique) and `u64::MAX` on
+    /// `HashCsr` (bit=0 means unique, so Pass 2 only writes duplicates — 10x-145x fewer writes).
+    pub(crate) unique_bm_xor: u64,
+    /// Whether this index keys directly on forward k-mers `kf` (`--forward-only` specialization).
+    pub(crate) forward_only: bool,
 }
 
 /// Whether Direct CSR mode should be used for `(word_length, ref_total_bases)`.
@@ -278,6 +531,26 @@ pub fn compute_partition_slabs_with_mask(
     soft_mask: bool,
     max_kmers_per_slab: usize,
 ) -> Vec<(u16, u16)> {
+    compute_partition_slabs_with_mask_and_strand(
+        reference,
+        word_length,
+        spaced_mask,
+        soft_mask,
+        max_kmers_per_slab,
+        false,
+    )
+}
+
+/// Partition the 256 coarse k-mer partitions (`0..256`) with optional spaced-seed mask and
+/// forward-only strand specialization.
+pub fn compute_partition_slabs_with_mask_and_strand(
+    reference: &Genome,
+    word_length: usize,
+    spaced_mask: Option<u64>,
+    soft_mask: bool,
+    max_kmers_per_slab: usize,
+    forward_only: bool,
+) -> Vec<(u16, u16)> {
     let total_kmers = count_valid_kmers(reference, word_length, soft_mask);
     if total_kmers == 0 {
         return Vec::new();
@@ -288,7 +561,7 @@ pub fn compute_partition_slabs_with_mask(
     }
 
     if !use_direct_csr_for(word_length, reference.total_bases, spaced_mask) {
-        // Hash-CSR partitions by top 8 bits of `fmix64(canon)`, which is uniform to <0.2%.
+        // Hash-CSR partitions by top 8 bits of `fmix64(key)`, which is uniform to <0.2%.
         let num_slabs = total_kmers.div_ceil(cap).clamp(1, NUM_PARTITIONS);
         let mut slabs = Vec::with_capacity(num_slabs);
         for s in 0..num_slabs {
@@ -301,7 +574,7 @@ pub fn compute_partition_slabs_with_mask(
         return slabs;
     }
 
-    // Direct-CSR partitions by top 8 bits of `min(kf, kr)` (non-uniform across 0..256),
+    // Direct-CSR partitions by top 8 bits of `canon` (or `kf` in forward-only mode),
     // so compute the exact 256-bucket histogram and greedily pack contiguous ranges <= cap.
     let seq = &reference.seq;
     let sub_bits = (2 * word_length - 8) as u32;
@@ -311,9 +584,29 @@ pub fn compute_partition_slabs_with_mask(
         .par_iter()
         .map(|&(start, end)| {
             let mut counts = [0usize; NUM_PARTITIONS];
-            for_each_canonical_kmer_2bit(seq, start, end, word_length, soft_mask, |canon, _, _| {
-                counts[(canon >> sub_bits) as usize] += 1;
-            });
+            if forward_only {
+                for_each_canonical_kmer_2bit::<true, _>(
+                    seq,
+                    start,
+                    end,
+                    word_length,
+                    soft_mask,
+                    |key, _, _| {
+                        counts[(key >> sub_bits) as usize] += 1;
+                    },
+                );
+            } else {
+                for_each_canonical_kmer_2bit::<false, _>(
+                    seq,
+                    start,
+                    end,
+                    word_length,
+                    soft_mask,
+                    |key, _, _| {
+                        counts[(key >> sub_bits) as usize] += 1;
+                    },
+                );
+            }
             counts
         })
         .reduce(
@@ -369,34 +662,47 @@ impl RefIndex {
         } else {
             0
         };
+        let unique_bm_bytes = if total_kmers > 0 {
+            reference.seq.len.div_ceil(64) * std::mem::size_of::<u64>()
+        } else {
+            0
+        };
         let threads = rayon::current_num_threads().max(1);
 
         if use_direct_csr_for(word_length, reference.total_bases, spaced_mask) {
             let sub_keys = 1usize << (2 * word_length - 8);
             let offsets_bytes = NUM_PARTITIONS * (sub_keys + 1) * std::mem::size_of::<u32>();
             let ps_total = total_kmers.saturating_mul(ps_bytes);
-            // Transient u32 coarse keys and per-thread scratch are freed before `rev_ref` is allocated.
+            // Single-slab `rev_ref` is built sequentially AFTER `RefIndex::build` drops transient
+            // `coarse_keys`, reusing freed heap space.
             let coarse_keys_bytes = total_kmers.saturating_mul(std::mem::size_of::<u32>());
             let scratch_per_part = (total_kmers / NUM_PARTITIONS).max(1) * ps_bytes;
-            let scratch_bytes = threads.saturating_mul(scratch_per_part + sub_keys * 8);
+            let scratch_bytes = threads.saturating_mul(scratch_per_part + sub_keys * 4);
             let transient_build = coarse_keys_bytes.saturating_add(scratch_bytes);
             offsets_bytes
                 .saturating_add(ps_total)
+                .saturating_add(unique_bm_bytes)
                 .saturating_add(transient_build.max(rev_bytes))
         } else {
             let p = choose_bucket_bits(total_kmers);
             let sub_buckets = 1usize << (p - 8);
             let offsets_bytes = NUM_PARTITIONS * (sub_buckets + 1) * std::mem::size_of::<u32>();
+            let bloom_bytes = choose_bloom_params(total_kmers, NUM_PARTITIONS, 1)
+                .map_or(0, |(sb, _)| {
+                    (NUM_PARTITIONS << sb) * std::mem::size_of::<BloomBlock>()
+                });
             // Steady-state HashCsr stores 4-byte `tags: Vec<u32>`, while Pass 1b/2 holds transient
-            // per-partition `u64` keys (freed partition-by-partition as `tags` pages are written).
+            // per-partition `u64` keys (freed partition-by-partition before `rev_ref` is built).
             let peak_key_bytes = total_kmers.saturating_mul(std::mem::size_of::<u64>());
             let ps_total = total_kmers.saturating_mul(ps_bytes);
             let scratch_per_part =
                 (total_kmers / NUM_PARTITIONS).max(1) * (std::mem::size_of::<u64>() + ps_bytes);
-            let scratch_bytes = threads.saturating_mul(scratch_per_part + sub_buckets * 8);
+            let scratch_bytes = threads.saturating_mul(scratch_per_part + sub_buckets * 4);
             offsets_bytes
                 .saturating_add(peak_key_bytes)
                 .saturating_add(ps_total)
+                .saturating_add(bloom_bytes)
+                .saturating_add(unique_bm_bytes)
                 .saturating_add(scratch_bytes.max(rev_bytes))
         }
     }
@@ -504,14 +810,15 @@ impl RefIndex {
         } else {
             8usize
         };
-        // Peak build RAM per k-mer: Hash-CSR transient u64 keys (8 B, shrunk to 4 B tags) +
-        // pos_strand + offsets/scratch headroom; Direct-CSR <= that.
-        let bytes_per_kmer =
-            if use_direct_csr_for(word_length, reference.total_bases, spaced_mask) {
-                ps_bytes + 5
-            } else {
-                8 + ps_bytes + 3
-            };
+        // Peak build RAM per k-mer (multi-slab passes `build_unique_bm = false`, so `unique_bm`
+        // is 0 B): Hash-CSR transient u64 keys (8 B, shrunk to 4 B tags) + pos_strand +
+        // scale-invariant Bloom (~0.66-1.0 B/k-mer) + offsets/scratch headroom.
+        let bytes_per_kmer = if use_direct_csr_for(word_length, reference.total_bases, spaced_mask)
+        {
+            ps_bytes + 5
+        } else {
+            8 + ps_bytes + 4
+        };
         let usable = slab_budget * 7 / 10;
         let max_kmers = (usable / bytes_per_kmer).min((u32::MAX as usize) - 1);
         if max_kmers < 1_000_000 {
@@ -539,7 +846,27 @@ impl RefIndex {
         freq_limit: u64,
         soft_mask: bool,
     ) -> Result<Self> {
-        Self::build_partitions_with_mask(
+        Self::build_with_mask_and_strand(
+            reference,
+            word_length,
+            spaced_mask,
+            freq_limit,
+            soft_mask,
+            false,
+        )
+    }
+
+    /// Build a canonical (`forward_only = false`) or forward-only (`forward_only = true`)
+    /// reference index with an optional 2-bit palindromic spaced-seed mask.
+    pub fn build_with_mask_and_strand(
+        reference: &Genome,
+        word_length: usize,
+        spaced_mask: Option<u64>,
+        freq_limit: u64,
+        soft_mask: bool,
+        forward_only: bool,
+    ) -> Result<Self> {
+        Self::build_partitions_with_mask_and_strand(
             reference,
             0,
             NUM_PARTITIONS as u16,
@@ -547,6 +874,7 @@ impl RefIndex {
             spaced_mask,
             freq_limit,
             soft_mask,
+            forward_only,
         )
     }
 
@@ -583,6 +911,59 @@ impl RefIndex {
         freq_limit: u64,
         soft_mask: bool,
     ) -> Result<Self> {
+        Self::build_partitions_with_mask_and_strand(
+            reference,
+            part_start,
+            part_end,
+            word_length,
+            spaced_mask,
+            freq_limit,
+            soft_mask,
+            false,
+        )
+    }
+
+    /// Build a partition-slab canonical or forward-only reference index with an optional 2-bit
+    /// spaced-seed mask.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_partitions_with_mask_and_strand(
+        reference: &Genome,
+        part_start: u16,
+        part_end: u16,
+        word_length: usize,
+        spaced_mask: Option<u64>,
+        freq_limit: u64,
+        soft_mask: bool,
+        forward_only: bool,
+    ) -> Result<Self> {
+        Self::build_partitions_with_options(
+            reference,
+            part_start,
+            part_end,
+            word_length,
+            spaced_mask,
+            freq_limit,
+            soft_mask,
+            forward_only,
+            true,
+        )
+    }
+
+    /// Internal partition-slab builder with configurable `unique_bm` construction
+    /// (`build_unique_bm = false` avoids rebuilding a full-genome uniqueness bitmap on every
+    /// slab in multi-slab streaming while remaining 100% bit-exact).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_partitions_with_options(
+        reference: &Genome,
+        part_start: u16,
+        part_end: u16,
+        word_length: usize,
+        spaced_mask: Option<u64>,
+        freq_limit: u64,
+        soft_mask: bool,
+        forward_only: bool,
+        build_unique_bm: bool,
+    ) -> Result<Self> {
         let max_starts = reference
             .seq
             .len
@@ -597,6 +978,8 @@ impl RefIndex {
             spaced_mask,
             freq_limit,
             soft_mask,
+            forward_only,
+            build_unique_bm,
         )
     }
 
@@ -620,6 +1003,8 @@ impl RefIndex {
             None,
             freq_limit,
             soft_mask,
+            false,
+            true,
         )
     }
 
@@ -634,6 +1019,8 @@ impl RefIndex {
         spaced_mask: Option<u64>,
         freq_limit: u64,
         soft_mask: bool,
+        forward_only: bool,
+        build_unique_bm: bool,
     ) -> Result<Self> {
         if !(4..=32).contains(&word_length) {
             return Err(GeckoError::InvalidParameter(format!(
@@ -658,6 +1045,8 @@ impl RefIndex {
                     word_length,
                     freq_limit,
                     soft_mask,
+                    forward_only,
+                    build_unique_bm,
                 )
             } else {
                 build_direct_csr_u64(
@@ -669,6 +1058,8 @@ impl RefIndex {
                     word_length,
                     freq_limit,
                     soft_mask,
+                    forward_only,
+                    build_unique_bm,
                 )
             }
         } else if use_u32_ps {
@@ -682,6 +1073,8 @@ impl RefIndex {
                 spaced_mask,
                 freq_limit,
                 soft_mask,
+                forward_only,
+                build_unique_bm,
             )
         } else {
             build_hash_csr_u64(
@@ -694,27 +1087,37 @@ impl RefIndex {
                 spaced_mask,
                 freq_limit,
                 soft_mask,
+                forward_only,
+                build_unique_bm,
             )
         }
     }
 
     /// Approximate heap memory currently held by the built index.
     pub fn heap_bytes(&self) -> usize {
+        let unique_bytes = self.unique_bm.capacity() * std::mem::size_of::<u64>();
         match &self.kind {
             RefIndexKind::DirectCsr {
                 offsets,
                 pos_strand,
                 ..
-            } => offsets.capacity() * std::mem::size_of::<u32>() + pos_strand.heap_bytes(),
+            } => {
+                offsets.capacity() * std::mem::size_of::<u32>()
+                    + pos_strand.heap_bytes()
+                    + unique_bytes
+            }
             RefIndexKind::HashCsr {
                 offsets,
                 tags,
                 pos_strand,
+                bloom,
                 ..
             } => {
                 offsets.capacity() * std::mem::size_of::<u32>()
                     + tags.capacity() * std::mem::size_of::<u32>()
                     + pos_strand.heap_bytes()
+                    + bloom.as_ref().map_or(0, BlockedBloom::heap_bytes)
+                    + unique_bytes
             }
         }
     }
@@ -723,6 +1126,20 @@ impl RefIndex {
     #[inline(always)]
     pub fn is_direct(&self) -> bool {
         matches!(self.kind, RefIndexKind::DirectCsr { .. })
+    }
+
+    /// Whether this index was built with `--forward-only` specialization.
+    #[inline(always)]
+    pub fn is_forward_only(&self) -> bool {
+        self.forward_only
+    }
+
+    #[inline(always)]
+    pub(crate) fn pos_strand_vec(&self) -> &PosStrandVec {
+        match &self.kind {
+            RefIndexKind::DirectCsr { pos_strand, .. } => pos_strand,
+            RefIndexKind::HashCsr { pos_strand, .. } => pos_strand,
+        }
     }
 
     /// Compute the local `offsets` index `b_idx` for a canonical k-mer key, or `None` if the key
@@ -798,6 +1215,21 @@ impl RefIndex {
 
     /// Convenience single-key lookup returning all matching `(pos_y, strand_bit)` entries.
     pub fn lookup(&self, canon_key: u64) -> Vec<(u64, u8)> {
+        if let RefIndexKind::HashCsr {
+            bloom: Some(bloom), ..
+        } = &self.kind
+        {
+            let h = fmix64(canon_key);
+            let p = (h >> 56) as usize;
+            if p < self.part_start as usize || p >= self.part_end as usize {
+                return Vec::new();
+            }
+            let blk = ((h >> bloom.block_shift) as usize)
+                - ((self.part_start as usize) << bloom.sub_bits);
+            if !unsafe { bloom.contains_unchecked(blk, h as u32) } {
+                return Vec::new();
+            }
+        }
         let Some(b_idx) = self.bucket_index(canon_key) else {
             return Vec::new();
         };
@@ -987,7 +1419,12 @@ pub(crate) unsafe fn probe_sorted_tags_avx2_inline(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn probe_bucket_u32_avx2(tags: &[u32], start: usize, end: usize, tag: u32) -> (usize, usize) {
+unsafe fn probe_bucket_u32_avx2(
+    tags: &[u32],
+    start: usize,
+    end: usize,
+    tag: u32,
+) -> (usize, usize) {
     unsafe { probe_sorted_tags_avx2_inline(tags, start, end, tag) }
 }
 
@@ -1084,10 +1521,10 @@ fn kmer_mask(wl: usize) -> u64 {
     }
 }
 
-/// Iterate all valid canonical k-mers whose start position lies in `[start..end)` directly from
-/// 2-bit packed `u64` words (jumping over `N` and soft-masked gaps in O(1), zero LUT lookups).
+/// Iterate all valid canonical (or forward-only) k-mers whose start position lies in
+/// `[start..end)` directly from 2-bit packed `u64` words.
 #[inline(always)]
-fn for_each_canonical_kmer_2bit<F>(
+fn for_each_canonical_kmer_2bit<const FWD_ONLY: bool, F>(
     seq: &PackedSeq,
     start: usize,
     end: usize,
@@ -1098,14 +1535,14 @@ fn for_each_canonical_kmer_2bit<F>(
     F: FnMut(u64, u64, u64),
 {
     if wl == 32 {
-        for_each_canonical_kmer_2bit_impl::<true, F>(seq, start, end, 32, soft_mask, f);
+        for_each_canonical_kmer_2bit_impl::<true, FWD_ONLY, F>(seq, start, end, 32, soft_mask, f);
     } else {
-        for_each_canonical_kmer_2bit_impl::<false, F>(seq, start, end, wl, soft_mask, f);
+        for_each_canonical_kmer_2bit_impl::<false, FWD_ONLY, F>(seq, start, end, wl, soft_mask, f);
     }
 }
 
 #[inline(always)]
-fn for_each_canonical_kmer_2bit_opt<F>(
+fn for_each_canonical_kmer_2bit_opt<const FWD_ONLY: bool, F>(
     seq: &PackedSeq,
     start: usize,
     end: usize,
@@ -1117,15 +1554,15 @@ fn for_each_canonical_kmer_2bit_opt<F>(
     F: FnMut(u64, u64, u64),
 {
     if let Some(sm) = spaced_mask {
-        for_each_canonical_spaced_kmer_2bit(seq, start, end, wl, sm, soft_mask, f);
+        for_each_canonical_spaced_kmer_2bit::<FWD_ONLY, F>(seq, start, end, wl, sm, soft_mask, f);
     } else {
-        for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, f);
+        for_each_canonical_kmer_2bit::<FWD_ONLY, F>(seq, start, end, wl, soft_mask, f);
     }
 }
 
-/// Iterate canonical spaced-seed k-mers using a palindromic 2-bit `spaced_mask`.
+/// Iterate canonical (or forward-only) spaced-seed k-mers using a palindromic 2-bit `spaced_mask`.
 #[inline(always)]
-fn for_each_canonical_spaced_kmer_2bit<F>(
+fn for_each_canonical_spaced_kmer_2bit<const FWD_ONLY: bool, F>(
     seq: &PackedSeq,
     start: usize,
     end: usize,
@@ -1157,7 +1594,9 @@ fn for_each_canonical_spaced_kmer_2bit<F>(
                 let b = word & 3;
                 word >>= 2;
                 kf = ((kf << 2) | b) & span_mask;
-                kr = (kr >> 2) | ((b ^ 3) << rc_shift);
+                if !FWD_ONLY {
+                    kr = (kr >> 2) | ((b ^ 3) << rc_shift);
+                }
             }
             idx += avail;
         }
@@ -1172,13 +1611,17 @@ fn for_each_canonical_spaced_kmer_2bit<F>(
                 let b = word & 3;
                 word >>= 2;
                 kf = ((kf << 2) | b) & span_mask;
-                kr = (kr >> 2) | ((b ^ 3) << rc_shift);
-                let sf = kf & spaced_mask;
-                let sr = kr & spaced_mask;
-                if sr < sf {
-                    f(sr, pos, 1);
+                if FWD_ONLY {
+                    f(kf & spaced_mask, pos, 0);
                 } else {
-                    f(sf, pos, 0);
+                    kr = (kr >> 2) | ((b ^ 3) << rc_shift);
+                    let sf = kf & spaced_mask;
+                    let sr = kr & spaced_mask;
+                    if sr < sf {
+                        f(sr, pos, 1);
+                    } else {
+                        f(sf, pos, if sf == sr { 2 } else { 0 });
+                    }
                 }
             }
             idx += avail;
@@ -1187,7 +1630,7 @@ fn for_each_canonical_spaced_kmer_2bit<F>(
 }
 
 #[inline(always)]
-fn for_each_canonical_kmer_2bit_impl<const WL32: bool, F>(
+fn for_each_canonical_kmer_2bit_impl<const WL32: bool, const FWD_ONLY: bool, F>(
     seq: &PackedSeq,
     start: usize,
     end: usize,
@@ -1223,12 +1666,14 @@ fn for_each_canonical_kmer_2bit_impl<const WL32: bool, F>(
                 } else {
                     ((kf << 2) | b) & mask
                 };
-                kr = (kr >> 2) | ((b ^ 3) << rc_shift);
+                if !FWD_ONLY {
+                    kr = (kr >> 2) | ((b ^ 3) << rc_shift);
+                }
             }
             idx += avail;
         }
 
-        // Emit one canonical k-mer per base through `re`, loading 32 bases per u64 word.
+        // Emit one canonical (or forward-only) k-mer per base through `re`.
         while idx < re {
             let w_idx = idx >> 5;
             let lane = idx & 31;
@@ -1243,11 +1688,15 @@ fn for_each_canonical_kmer_2bit_impl<const WL32: bool, F>(
                 } else {
                     ((kf << 2) | b) & mask
                 };
-                kr = (kr >> 2) | ((b ^ 3) << rc_shift);
-                if kr < kf {
-                    f(kr, pos, 1);
-                } else {
+                if FWD_ONLY {
                     f(kf, pos, 0);
+                } else {
+                    kr = (kr >> 2) | ((b ^ 3) << rc_shift);
+                    if kr < kf {
+                        f(kr, pos, 1);
+                    } else {
+                        f(kf, pos, if kf == kr { 2 } else { 0 });
+                    }
                 }
             }
             idx += avail;
@@ -1256,24 +1705,147 @@ fn for_each_canonical_kmer_2bit_impl<const WL32: bool, F>(
 }
 
 // ---------------------------------------------------------------------------
+// Lock-free prefetched `unique_bm` Pass 2 helpers & branchless sorting networks
+// ---------------------------------------------------------------------------
+
+/// Set all bits in half-open `[start, end)` inside `bm`.
+fn set_bit_range(bm: &mut [u64], start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    let w_s = start >> 6;
+    let w_e = (end - 1) >> 6;
+    let bit_s = start & 63;
+    let bit_e = (end - 1) & 63;
+    if w_s == w_e {
+        bm[w_s] |= (u64::MAX << bit_s) & (u64::MAX >> (63 - bit_e));
+    } else {
+        bm[w_s] |= u64::MAX << bit_s;
+        bm[w_s + 1..w_e].fill(u64::MAX);
+        bm[w_e] |= u64::MAX >> (63 - bit_e);
+    }
+}
+
+/// Initialize the inverted `non_unique_bm` (`1` = invalid / soft-masked / out-of-range) in
+/// O(#runs) sequential time so Pass 2 only marks duplicate keys (`cnt >= 2`).
+fn init_non_unique_bm(
+    seq: &PackedSeq,
+    slab_start: usize,
+    slab_end: usize,
+    wl: usize,
+    soft_mask: bool,
+) -> Vec<u64> {
+    let mut bm = vec![0u64; seq.len.div_ceil(64)];
+    let max_starts = seq.len.saturating_sub(wl - 1);
+    let lo = slab_start.min(max_starts);
+    let hi = slab_end.min(max_starts);
+    set_bit_range(&mut bm, 0, lo);
+    set_bit_range(&mut bm, hi, seq.len);
+    for &(s, e) in &seq.special_runs {
+        let rs = (s as usize).saturating_sub(wl - 1);
+        let re = (e as usize).min(seq.len);
+        set_bit_range(&mut bm, rs, re);
+    }
+    if soft_mask {
+        for &(s, e) in &seq.soft_runs {
+            let rs = (s as usize).saturating_sub(wl - 1);
+            let re = (e as usize).min(seq.len);
+            set_bit_range(&mut bm, rs, re);
+        }
+    }
+    bm
+}
+
+#[cold]
+#[inline(never)]
+fn flush_unique_buf(buf: &[usize], unique_atomic: &[AtomicU64]) {
+    let ptr = unique_atomic.as_ptr();
+    for &pos_y in buf {
+        prefetch_t2(unsafe { ptr.add(pos_y >> 6) });
+    }
+    for &pos_y in buf {
+        unsafe { unique_atomic.get_unchecked(pos_y >> 6) }
+            .fetch_or(1u64 << (pos_y & 63), Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+fn push_unique_pos(
+    buf: &mut [usize; UNIQ_BUF_CAP],
+    len: &mut usize,
+    pos_y: usize,
+    unique_atomic: &[AtomicU64],
+) {
+    if unique_atomic.is_empty() {
+        return;
+    }
+    unsafe { *buf.get_unchecked_mut(*len) = pos_y };
+    *len += 1;
+    if *len == UNIQ_BUF_CAP {
+        flush_unique_buf(buf.as_slice(), unique_atomic);
+        *len = 0;
+    }
+}
+
+/// Compile-time-specialized Blocked Bloom insert (`K_H == 0` folds away completely;
+/// `K_H in 1..=6` unrolls straight-line with immediate `BLOOM_SALTS[i]`, zero jump tables,
+/// zero salt spills).
+#[inline(always)]
+unsafe fn insert_bloom_const<const K_H: usize>(
+    bloom_ptr: *mut BloomBlock,
+    h_rot: u64,
+    bloom_sub_shift: u32,
+    bloom_sub_mask: usize,
+) {
+    if K_H == 0 {
+        return;
+    }
+    let sub_blk = (((h_rot as u32) >> bloom_sub_shift) as usize) & bloom_sub_mask;
+    let words = unsafe { &mut (*bloom_ptr.add(sub_blk)).0 };
+    let tag = (h_rot >> 32) as u32;
+    let mut i = 0usize;
+    while i < K_H {
+        let h = tag.wrapping_mul(BLOOM_SALTS[i]);
+        let word = (h >> 29) as usize;
+        let bit = (h >> 23) & 63;
+        unsafe {
+            *words.get_unchecked_mut(word) |= 1u64 << bit;
+        }
+        i += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Direct CSR builder (generic over u32 / u64 packed pos_strand)
 // ---------------------------------------------------------------------------
 
 trait PackedPs: Copy + Default + Ord + std::fmt::Debug + Send + Sync + 'static {
     fn pack(pos: u64, strand: u64) -> Self;
+    fn pos(self) -> usize;
     fn strand_bit(self) -> u64;
+    fn to_u64(self) -> u64;
     fn into_vec(v: Vec<Self>) -> PosStrandVec;
 }
 
 impl PackedPs for u32 {
     #[inline(always)]
     fn pack(pos: u64, strand: u64) -> Self {
-        ((pos << 1) | strand) as u32
+        ((pos << 1) | (strand & 1)) as u32
+    }
+
+    #[inline(always)]
+    fn pos(self) -> usize {
+        (self >> 1) as usize
     }
 
     #[inline(always)]
     fn strand_bit(self) -> u64 {
         (self & 1) as u64
+    }
+
+    #[inline(always)]
+    fn to_u64(self) -> u64 {
+        self as u64
     }
 
     fn into_vec(v: Vec<Self>) -> PosStrandVec {
@@ -1284,7 +1856,12 @@ impl PackedPs for u32 {
 impl PackedPs for u64 {
     #[inline(always)]
     fn pack(pos: u64, strand: u64) -> Self {
-        (pos << 1) | strand
+        (pos << 1) | (strand & 1)
+    }
+
+    #[inline(always)]
+    fn pos(self) -> usize {
+        (self >> 1) as usize
     }
 
     #[inline(always)]
@@ -1292,8 +1869,245 @@ impl PackedPs for u64 {
         self & 1
     }
 
+    #[inline(always)]
+    fn to_u64(self) -> u64 {
+        self
+    }
+
     fn into_vec(v: Vec<Self>) -> PosStrandVec {
         PosStrandVec::U64(v)
+    }
+}
+
+/// Branchless compare-and-swap of paired `(key, ps)` values using 128-bit comparison
+/// (`cmp + sbb` + `cmov` on x86_64, zero conditional branches).
+#[inline(always)]
+fn cas_pair<P: PackedPs>(ka: &mut u64, pa: &mut P, kb: &mut u64, pb: &mut P) {
+    let ak = *ka;
+    let bk = *kb;
+    let ap = *pa;
+    let bp = *pb;
+    let a128 = ((ak as u128) << 64) | (ap.to_u64() as u128);
+    let b128 = ((bk as u128) << 64) | (bp.to_u64() as u128);
+    let swap = a128 > b128;
+    *ka = if swap { bk } else { ak };
+    *kb = if swap { ak } else { bk };
+    *pa = if swap { bp } else { ap };
+    *pb = if swap { ap } else { bp };
+}
+
+/// Unrolled branchless bubble-insert of element at `POS` into already-sorted `[0..POS)`.
+/// Uses only 4 live registers and zero inner-loop branches.
+#[inline(always)]
+unsafe fn bubble_insert_at<const POS: usize, P: PackedPs>(sk: *mut u64, sp: *mut P) {
+    let mut k = unsafe { *sk.add(POS) };
+    let mut p = unsafe { *sp.add(POS) };
+    let mut j = POS;
+    while j > 0 {
+        let mut pk = unsafe { *sk.add(j - 1) };
+        let mut pp = unsafe { *sp.add(j - 1) };
+        cas_pair(&mut pk, &mut pp, &mut k, &mut p);
+        unsafe {
+            *sk.add(j) = k;
+            *sp.add(j) = p;
+        }
+        k = pk;
+        p = pp;
+        j -= 1;
+    }
+    unsafe {
+        *sk = k;
+        *sp = p;
+    }
+}
+
+/// Branchless cumulative compare-and-swap sort for `2 <= cnt <= 6` in-place on `(sk, sp)`.
+/// Structurally impossible to lower to a jump table (`ind_jmp = 0`, `Bim = 0`), half the
+/// static `cas_pair` count of independent networks (15 vs 30), and peak 8 live registers.
+#[inline(always)]
+unsafe fn sort_small_2_to_6<P: PackedPs>(sk: *mut u64, sp: *mut P, cnt: usize) {
+    debug_assert!((2..=6).contains(&cnt));
+    let mut k0 = unsafe { *sk };
+    let mut p0 = unsafe { *sp };
+    let mut k1 = unsafe { *sk.add(1) };
+    let mut p1 = unsafe { *sp.add(1) };
+    cas_pair(&mut k0, &mut p0, &mut k1, &mut p1);
+    if cnt == 2 {
+        unsafe {
+            *sk = k0;
+            *sp = p0;
+            *sk.add(1) = k1;
+            *sp.add(1) = p1;
+        }
+        return;
+    }
+
+    let mut k2 = unsafe { *sk.add(2) };
+    let mut p2 = unsafe { *sp.add(2) };
+    cas_pair(&mut k1, &mut p1, &mut k2, &mut p2);
+    cas_pair(&mut k0, &mut p0, &mut k1, &mut p1);
+    if cnt == 3 {
+        unsafe {
+            *sk = k0;
+            *sp = p0;
+            *sk.add(1) = k1;
+            *sp.add(1) = p1;
+            *sk.add(2) = k2;
+            *sp.add(2) = p2;
+        }
+        return;
+    }
+
+    let mut k3 = unsafe { *sk.add(3) };
+    let mut p3 = unsafe { *sp.add(3) };
+    cas_pair(&mut k2, &mut p2, &mut k3, &mut p3);
+    cas_pair(&mut k1, &mut p1, &mut k2, &mut p2);
+    cas_pair(&mut k0, &mut p0, &mut k1, &mut p1);
+    unsafe {
+        *sk = k0;
+        *sp = p0;
+        *sk.add(1) = k1;
+        *sp.add(1) = p1;
+        *sk.add(2) = k2;
+        *sp.add(2) = p2;
+        *sk.add(3) = k3;
+        *sp.add(3) = p3;
+    }
+    if cnt == 4 {
+        return;
+    }
+    unsafe { bubble_insert_at::<4, P>(sk, sp) };
+    if cnt == 6 {
+        unsafe { bubble_insert_at::<5, P>(sk, sp) };
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn sort_large_bucket<P: PackedPs>(sk: &mut [u64], sp: &mut [P], sort_buf_k: &mut Vec<(u64, P)>) {
+    let cnt = sk.len();
+    sort_buf_k.clear();
+    sort_buf_k.reserve(cnt);
+    for idx in 0..cnt {
+        unsafe {
+            sort_buf_k.push((*sk.get_unchecked(idx), *sp.get_unchecked(idx)));
+        }
+    }
+    sort_buf_k.sort_unstable();
+    for (off, &(h_rot, ps)) in sort_buf_k.iter().enumerate() {
+        unsafe {
+            *sk.get_unchecked_mut(off) = h_rot;
+            *sp.get_unchecked_mut(off) = ps;
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn emit_filtered_bucket<P: PackedPs, const K_H: usize>(
+    scratch_k: &[u64],
+    scratch_p: &[P],
+    sub_start: usize,
+    sub_end: usize,
+    freq_limit: u64,
+    forward_only: bool,
+    tag_ptr: *mut u32,
+    pp: &mut [P],
+    write_idx: &mut usize,
+    bloom_ptr: *mut BloomBlock,
+    bloom_sub_shift: u32,
+    bloom_sub_mask: usize,
+    dup_buf: &mut [usize; UNIQ_BUF_CAP],
+    dup_len: &mut usize,
+    non_unique_atomic: &[AtomicU64],
+) {
+    if forward_only {
+        // Forward-only exact 64-bit freq_limit filtering (all entries have strand 0).
+        let mut r = sub_start;
+        while r < sub_end {
+            let h_rot = unsafe { *scratch_k.get_unchecked(r) };
+            let mut r_end = r + 1;
+            while r_end < sub_end && unsafe { *scratch_k.get_unchecked(r_end) } == h_rot {
+                r_end += 1;
+            }
+            let run_len = r_end - r;
+            if run_len > 1 {
+                for &ps in unsafe { scratch_p.get_unchecked(r..r_end) } {
+                    push_unique_pos(dup_buf, dup_len, ps.pos(), non_unique_atomic);
+                }
+            }
+            if (run_len as u64) <= freq_limit {
+                unsafe {
+                    insert_bloom_const::<K_H>(bloom_ptr, h_rot, bloom_sub_shift, bloom_sub_mask);
+                }
+                let tag = (h_rot >> 32) as u32;
+                for &ps in unsafe { scratch_p.get_unchecked(r..r_end) } {
+                    unsafe {
+                        *tag_ptr.add(*write_idx) = tag;
+                        *pp.get_unchecked_mut(*write_idx) = ps;
+                    }
+                    *write_idx += 1;
+                }
+            }
+            r = r_end;
+        }
+    } else {
+        // Canonical exact 64-bit per-strand freq_limit filtering across runs of identical `h_rot`.
+        let mut r = sub_start;
+        while r < sub_end {
+            let h_rot = unsafe { *scratch_k.get_unchecked(r) };
+            let mut r_end = r + 1;
+            let mut cnt0 = 0u64;
+            let mut cnt1 = 0u64;
+            if unsafe { scratch_p.get_unchecked(r).strand_bit() } == 0 {
+                cnt0 += 1;
+            } else {
+                cnt1 += 1;
+            }
+            while r_end < sub_end && unsafe { *scratch_k.get_unchecked(r_end) } == h_rot {
+                if unsafe { scratch_p.get_unchecked(r_end).strand_bit() } == 0 {
+                    cnt0 += 1;
+                } else {
+                    cnt1 += 1;
+                }
+                r_end += 1;
+            }
+            if r_end - r > 1 {
+                for &ps in unsafe { scratch_p.get_unchecked(r..r_end) } {
+                    push_unique_pos(dup_buf, dup_len, ps.pos(), non_unique_atomic);
+                }
+            }
+            let keep0 = cnt0 <= freq_limit;
+            let keep1 = cnt1 <= freq_limit;
+            if keep0 || keep1 {
+                unsafe {
+                    insert_bloom_const::<K_H>(bloom_ptr, h_rot, bloom_sub_shift, bloom_sub_mask);
+                }
+                let tag = (h_rot >> 32) as u32;
+                if keep0 && keep1 {
+                    for &ps in unsafe { scratch_p.get_unchecked(r..r_end) } {
+                        unsafe {
+                            *tag_ptr.add(*write_idx) = tag;
+                            *pp.get_unchecked_mut(*write_idx) = ps;
+                        }
+                        *write_idx += 1;
+                    }
+                } else {
+                    for &ps in unsafe { scratch_p.get_unchecked(r..r_end) } {
+                        let is_keep = if ps.strand_bit() == 0 { keep0 } else { keep1 };
+                        if is_keep {
+                            unsafe {
+                                *tag_ptr.add(*write_idx) = tag;
+                                *pp.get_unchecked_mut(*write_idx) = ps;
+                            }
+                            *write_idx += 1;
+                        }
+                    }
+                }
+            }
+            r = r_end;
+        }
     }
 }
 
@@ -1307,9 +2121,20 @@ fn build_direct_csr_u32(
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
+    forward_only: bool,
+    build_unique_bm: bool,
 ) -> Result<RefIndex> {
     build_direct_csr::<u32>(
-        reference, slab_start, slab_end, part_start, part_end, wl, freq_limit, soft_mask,
+        reference,
+        slab_start,
+        slab_end,
+        part_start,
+        part_end,
+        wl,
+        freq_limit,
+        soft_mask,
+        forward_only,
+        build_unique_bm,
     )
 }
 
@@ -1323,9 +2148,20 @@ fn build_direct_csr_u64(
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
+    forward_only: bool,
+    build_unique_bm: bool,
 ) -> Result<RefIndex> {
     build_direct_csr::<u64>(
-        reference, slab_start, slab_end, part_start, part_end, wl, freq_limit, soft_mask,
+        reference,
+        slab_start,
+        slab_end,
+        part_start,
+        part_end,
+        wl,
+        freq_limit,
+        soft_mask,
+        forward_only,
+        build_unique_bm,
     )
 }
 
@@ -1339,6 +2175,8 @@ fn build_direct_csr<P: PackedPs>(
     wl: usize,
     freq_limit: u64,
     soft_mask: bool,
+    forward_only: bool,
+    build_unique_bm: bool,
 ) -> Result<RefIndex> {
     let seq = &reference.seq;
     let sub_bits = (2 * wl - 8) as u32;
@@ -1364,6 +2202,9 @@ fn build_direct_csr<P: PackedPs>(
                 offsets: vec![0u32; n_parts * (sub_keys + 1)],
                 pos_strand: P::into_vec(Vec::new()),
             },
+            unique_bm: Vec::new(),
+            unique_bm_xor: 0,
+            forward_only,
         });
     }
 
@@ -1372,17 +2213,40 @@ fn build_direct_csr<P: PackedPs>(
         .par_iter()
         .map(|&(start, end)| {
             let mut counts = [0usize; NUM_PARTITIONS];
-            if full_parts {
-                for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
-                    counts[(canon >> sub_bits) as usize] += 1;
-                });
-            } else {
-                for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, _, _| {
-                    let p = (canon >> sub_bits) as usize;
-                    if p >= part_start && p < part_end {
-                        counts[p - part_start] += 1;
+            macro_rules! count_direct {
+                ($fwd:expr) => {
+                    if full_parts {
+                        for_each_canonical_kmer_2bit::<$fwd, _>(
+                            seq,
+                            start,
+                            end,
+                            wl,
+                            soft_mask,
+                            |canon, _, _| {
+                                counts[(canon >> sub_bits) as usize] += 1;
+                            },
+                        );
+                    } else {
+                        for_each_canonical_kmer_2bit::<$fwd, _>(
+                            seq,
+                            start,
+                            end,
+                            wl,
+                            soft_mask,
+                            |canon, _, _| {
+                                let p = (canon >> sub_bits) as usize;
+                                if p >= part_start && p < part_end {
+                                    counts[p - part_start] += 1;
+                                }
+                            },
+                        );
                     }
-                });
+                };
+            }
+            if forward_only {
+                count_direct!(true);
+            } else {
+                count_direct!(false);
             }
             counts
         })
@@ -1396,7 +2260,7 @@ fn build_direct_csr<P: PackedPs>(
         ));
     }
 
-    // Pass 1b: parallel scatter with L1/L2-resident per-thread staging buffers.
+    // Pass 1b: parallel scatter with L2-resident per-thread staging buffers (`STAGE_CAP = 64`).
     let mut coarse_keys: Vec<u32> = Vec::with_capacity(total_kmers);
     let mut pos_strand: Vec<P> = Vec::with_capacity(total_kmers);
     let keys_ptr = SendMutPtr(coarse_keys.as_mut_ptr());
@@ -1422,44 +2286,74 @@ fn build_direct_csr<P: PackedPs>(
             let mut write_pos = init_write;
             let mut buf_len = [0u8; NUM_PARTITIONS];
 
-            for_each_canonical_kmer_2bit(seq, start, end, wl, soft_mask, |canon, pos, strand| {
-                let p_glob = (canon >> sub_bits) as usize;
-                if !full_parts && (p_glob < part_start || p_glob >= part_end) {
-                    return;
-                }
-                let p = if full_parts { p_glob } else { p_glob - part_start };
-                let idx = buf_len[p] as usize;
-                buf_k[p][idx] = (canon as usize & sub_mask) as u32;
-                buf_p[p][idx] = P::pack(pos, strand);
-                let next_len = idx + 1;
-                if next_len == STAGE_CAP {
-                    let dst = write_pos[p];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            buf_k[p].as_ptr(),
-                            kptr.0.add(dst),
-                            STAGE_CAP,
-                        );
-                        std::ptr::copy_nonoverlapping(
-                            buf_p[p].as_ptr(),
-                            pptr.0.add(dst),
-                            STAGE_CAP,
-                        );
-                    }
-                    write_pos[p] = dst + STAGE_CAP;
-                    buf_len[p] = 0;
-                } else {
-                    buf_len[p] = next_len as u8;
-                }
-            });
+            macro_rules! scatter_direct {
+                ($fwd:expr) => {
+                    for_each_canonical_kmer_2bit::<$fwd, _>(
+                        seq,
+                        start,
+                        end,
+                        wl,
+                        soft_mask,
+                        |canon, pos, strand| {
+                            let p_glob = (canon >> sub_bits) as usize;
+                            if !full_parts && (p_glob < part_start || p_glob >= part_end) {
+                                return;
+                            }
+                            let p = if full_parts {
+                                p_glob
+                            } else {
+                                p_glob - part_start
+                            };
+                            unsafe {
+                                let idx = *buf_len.get_unchecked(p) as usize;
+                                *buf_k.get_unchecked_mut(p).get_unchecked_mut(idx) =
+                                    (canon as usize & sub_mask) as u32;
+                                *buf_p.get_unchecked_mut(p).get_unchecked_mut(idx) =
+                                    P::pack(pos, strand);
+                                let next_len = idx + 1;
+                                if next_len == STAGE_CAP {
+                                    let dst = *write_pos.get_unchecked(p);
+                                    std::ptr::copy_nonoverlapping(
+                                        buf_k.get_unchecked(p).as_ptr(),
+                                        kptr.0.add(dst),
+                                        STAGE_CAP,
+                                    );
+                                    std::ptr::copy_nonoverlapping(
+                                        buf_p.get_unchecked(p).as_ptr(),
+                                        pptr.0.add(dst),
+                                        STAGE_CAP,
+                                    );
+                                    *write_pos.get_unchecked_mut(p) = dst + STAGE_CAP;
+                                    *buf_len.get_unchecked_mut(p) = 0;
+                                } else {
+                                    *buf_len.get_unchecked_mut(p) = next_len as u8;
+                                }
+                            }
+                        },
+                    );
+                };
+            }
+            if forward_only {
+                scatter_direct!(true);
+            } else {
+                scatter_direct!(false);
+            }
 
             for p in 0..n_parts {
-                let rem = buf_len[p] as usize;
+                let rem = unsafe { *buf_len.get_unchecked(p) } as usize;
                 if rem > 0 {
-                    let dst = write_pos[p];
+                    let dst = unsafe { *write_pos.get_unchecked(p) };
                     unsafe {
-                        std::ptr::copy_nonoverlapping(buf_k[p].as_ptr(), kptr.0.add(dst), rem);
-                        std::ptr::copy_nonoverlapping(buf_p[p].as_ptr(), pptr.0.add(dst), rem);
+                        std::ptr::copy_nonoverlapping(
+                            buf_k.get_unchecked(p).as_ptr(),
+                            kptr.0.add(dst),
+                            rem,
+                        );
+                        std::ptr::copy_nonoverlapping(
+                            buf_p.get_unchecked(p).as_ptr(),
+                            pptr.0.add(dst),
+                            rem,
+                        );
                     }
                 }
             }
@@ -1472,9 +2366,19 @@ fn build_direct_csr<P: PackedPs>(
         pos_strand.set_len(total_kmers);
     }
 
-    // Pass 2: Rayon-parallel fine-bucketing + per-strand freq_limit filtering + in-place compaction.
+    // Pass 2: Rayon-parallel fine-bucketing + per-strand freq_limit filtering + in-place compaction
+    // + lock-free prefetched `unique_bm` construction.
     let off_len = n_parts * (sub_keys + 1);
     let mut offsets: Vec<u32> = Vec::with_capacity(off_len);
+    let mut unique_bm = if build_unique_bm && total_kmers > 0 && freq_limit >= 1 {
+        vec![0u64; seq.len.div_ceil(64)]
+    } else {
+        Vec::new()
+    };
+    let unique_atomic: &[AtomicU64] = AtomicU64::from_mut_slice(&mut unique_bm);
+    let need_pal_check = !forward_only && can_key_be_palindrome(wl, None);
+    let mask = kmer_mask(wl);
+
     let part_k_slices = split_by_offsets_mut(&mut coarse_keys, &part_offsets);
     let part_p_slices = split_by_offsets_mut(&mut pos_strand, &part_offsets);
     let part_off_slices: Vec<&mut [MaybeUninit<u32>]> = offsets.spare_capacity_mut()[..off_len]
@@ -1487,29 +2391,31 @@ fn build_direct_csr<P: PackedPs>(
         .zip(part_p_slices.into_par_iter())
         .zip(part_off_slices.into_par_iter())
         .map_init(
-            || (vec![0u32; sub_keys], vec![0u32; sub_keys], Vec::<P>::new()),
-            |(sub_counts, sub_write, scratch_ps), (((lp, pk), pp), poff)| {
+            || (vec![0u32; sub_keys], Vec::<P>::new()),
+            |(sub_off, scratch_ps), (((lp, pk), pp), poff)| {
                 let part_off = part_offsets[lp];
                 let n = pk.len();
-                if n == 0 {
+                if n == 0 || freq_limit == 0 {
                     for slot in poff.iter_mut() {
                         slot.write(part_off as u32);
                     }
                     return 0usize;
                 }
 
-                sub_counts.fill(0);
+                sub_off.fill(0);
                 for &sub in pk.iter() {
                     unsafe {
-                        *sub_counts.get_unchecked_mut(sub as usize) += 1;
+                        *sub_off.get_unchecked_mut(sub as usize) += 1;
                     }
                 }
 
+                // In-place exclusive prefix sum; after scatter below, `sub_off[s] == end(s)`.
                 let mut acc = 0u32;
                 for s in 0..sub_keys {
                     unsafe {
-                        *sub_write.get_unchecked_mut(s) = acc;
-                        acc += *sub_counts.get_unchecked(s);
+                        let c = *sub_off.get_unchecked(s);
+                        *sub_off.get_unchecked_mut(s) = acc;
+                        acc += c;
                     }
                 }
 
@@ -1519,26 +2425,41 @@ fn build_direct_csr<P: PackedPs>(
                 for i in 0..n {
                     unsafe {
                         let sub = *pk.get_unchecked(i) as usize;
-                        let dst = *sub_write.get_unchecked(sub) as usize;
+                        let dst = *sub_off.get_unchecked(sub) as usize;
                         *scratch_ps.get_unchecked_mut(dst) = *pp.get_unchecked(i);
-                        *sub_write.get_unchecked_mut(sub) = (dst + 1) as u32;
+                        *sub_off.get_unchecked_mut(sub) = (dst + 1) as u32;
                     }
                 }
 
+                let mut uniq_buf = [0usize; UNIQ_BUF_CAP];
+                let mut uniq_len = 0usize;
                 let mut write_idx = 0usize;
                 let mut sub_start = 0usize;
-                for (slot, &cnt_u32) in poff.iter_mut().zip(sub_counts.iter()) {
+                for (s, (slot, &sub_end_u32)) in poff.iter_mut().zip(sub_off.iter()).enumerate() {
                     slot.write((part_off + write_idx) as u32);
-                    let cnt = cnt_u32 as usize;
+                    let sub_end = sub_end_u32 as usize;
+                    let cnt = sub_end - sub_start;
                     if cnt == 0 {
                         continue;
                     }
-                    let sub_end = sub_start + cnt;
-                    if (cnt as u64) <= freq_limit {
-                        pp[write_idx..write_idx + cnt]
-                            .copy_from_slice(&scratch_ps[sub_start..sub_end]);
+                    if cnt == 1 {
+                        let ps = unsafe { *scratch_ps.get_unchecked(sub_start) };
+                        unsafe { *pp.get_unchecked_mut(write_idx) = ps };
+                        write_idx += 1;
+                        let canon = (((part_start + lp) as u64) << sub_bits) | (s as u64);
+                        if !need_pal_check || !is_palindrome_key(canon, wl, mask) {
+                            push_unique_pos(&mut uniq_buf, &mut uniq_len, ps.pos(), unique_atomic);
+                        }
+                    } else if (cnt as u64) <= freq_limit {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                scratch_ps.as_ptr().add(sub_start),
+                                pp.as_mut_ptr().add(write_idx),
+                                cnt,
+                            );
+                        }
                         write_idx += cnt;
-                    } else {
+                    } else if !forward_only {
                         let mut cnt0 = 0u64;
                         let mut cnt1 = 0u64;
                         for &ps in &scratch_ps[sub_start..sub_end] {
@@ -1551,20 +2472,28 @@ fn build_direct_csr<P: PackedPs>(
                         let keep0 = cnt0 <= freq_limit;
                         let keep1 = cnt1 <= freq_limit;
                         if keep0 && keep1 {
-                            pp[write_idx..write_idx + cnt]
-                                .copy_from_slice(&scratch_ps[sub_start..sub_end]);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    scratch_ps.as_ptr().add(sub_start),
+                                    pp.as_mut_ptr().add(write_idx),
+                                    cnt,
+                                );
+                            }
                             write_idx += cnt;
                         } else if keep0 || keep1 {
                             for &ps in &scratch_ps[sub_start..sub_end] {
                                 let is_keep = if ps.strand_bit() == 0 { keep0 } else { keep1 };
                                 if is_keep {
-                                    pp[write_idx] = ps;
+                                    unsafe { *pp.get_unchecked_mut(write_idx) = ps };
                                     write_idx += 1;
                                 }
                             }
                         }
                     }
                     sub_start = sub_end;
+                }
+                if uniq_len > 0 {
+                    flush_unique_buf(&uniq_buf[..uniq_len], unique_atomic);
                 }
                 poff[sub_keys].write((part_off + write_idx) as u32);
                 write_idx
@@ -1592,12 +2521,298 @@ fn build_direct_csr<P: PackedPs>(
             offsets,
             pos_strand: P::into_vec(pos_strand),
         },
+        unique_bm,
+        unique_bm_xor: 0,
+        forward_only,
     })
 }
 
 // ---------------------------------------------------------------------------
 // 2-Level Parallel Radix-Partitioned Hash-CSR builder (32-bit tag compressed)
 // ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn process_hash_partition_impl<P: PackedPs, const K_H: usize>(
+    part_off: usize,
+    pk: Vec<u64>,
+    pp: &mut [P],
+    ptag: &mut [MaybeUninit<u32>],
+    poff: &mut [MaybeUninit<u32>],
+    bloom_ptr: *mut BloomBlock,
+    sub_buckets: usize,
+    sub_shift_hi: u32,
+    sub_mask: usize,
+    freq_limit: u64,
+    forward_only: bool,
+    bloom_sub_shift: u32,
+    bloom_sub_mask: usize,
+    non_unique_atomic: &[AtomicU64],
+    sub_off: &mut [u32],
+    scratch_k: &mut Vec<u64>,
+    scratch_p: &mut Vec<P>,
+    sort_buf_k: &mut Vec<(u64, P)>,
+) -> usize {
+    let n = pk.len();
+    if n == 0 || freq_limit == 0 {
+        for slot in poff.iter_mut() {
+            slot.write(part_off as u32);
+        }
+        for slot in &mut ptag[..n] {
+            slot.write(0);
+        }
+        drop(pk);
+        return 0usize;
+    }
+
+    sub_off.fill(0);
+    for &h_rot in pk.iter() {
+        let sub = (((h_rot as u32) >> sub_shift_hi) as usize) & sub_mask;
+        unsafe {
+            *sub_off.get_unchecked_mut(sub) += 1;
+        }
+    }
+
+    // In-place exclusive prefix sum; after scatter below, `sub_off[s] == end(s)`.
+    let mut acc = 0u32;
+    for s in 0..sub_buckets {
+        unsafe {
+            let c = *sub_off.get_unchecked(s);
+            *sub_off.get_unchecked_mut(s) = acc;
+            acc += c;
+        }
+    }
+
+    if scratch_k.len() < n {
+        let new_len = n + (n >> 3) + 1024;
+        scratch_k.resize(new_len, 0);
+        scratch_p.resize(new_len, P::default());
+    }
+    for i in 0..n {
+        unsafe {
+            let h_rot = *pk.get_unchecked(i);
+            let sub = (((h_rot as u32) >> sub_shift_hi) as usize) & sub_mask;
+            let dst = *sub_off.get_unchecked(sub) as usize;
+            *scratch_k.get_unchecked_mut(dst) = h_rot;
+            *scratch_p.get_unchecked_mut(dst) = *pp.get_unchecked(i);
+            *sub_off.get_unchecked_mut(sub) = (dst + 1) as u32;
+        }
+    }
+
+    // Release this partition's 64-bit hashes immediately before writing 32-bit tags.
+    drop(pk);
+
+    let tag_ptr = ptag.as_mut_ptr() as *mut u32;
+    let sk_base = scratch_k.as_mut_ptr();
+    let sp_base = scratch_p.as_mut_ptr();
+    let mut dup_buf = [0usize; UNIQ_BUF_CAP];
+    let mut dup_len = 0usize;
+    let mut write_idx = 0usize;
+    let mut sub_start = 0usize;
+
+    for (slot, &sub_end_u32) in poff.iter_mut().zip(sub_off.iter()) {
+        slot.write((part_off + write_idx) as u32);
+        let sub_end = sub_end_u32 as usize;
+        let cnt = sub_end - sub_start;
+        if cnt == 0 {
+            continue;
+        }
+        if cnt == 1 {
+            let h_rot = unsafe { *sk_base.add(sub_start) };
+            let ps = unsafe { *sp_base.add(sub_start) };
+            unsafe {
+                *tag_ptr.add(write_idx) = (h_rot >> 32) as u32;
+                *pp.get_unchecked_mut(write_idx) = ps;
+                insert_bloom_const::<K_H>(bloom_ptr, h_rot, bloom_sub_shift, bloom_sub_mask);
+            }
+            write_idx += 1;
+            sub_start = sub_end;
+            continue;
+        }
+
+        if cnt <= 6 {
+            unsafe { sort_small_2_to_6(sk_base.add(sub_start), sp_base.add(sub_start), cnt) };
+        } else if cnt <= 24 {
+            insertion_sort_pair(
+                unsafe { scratch_k.get_unchecked_mut(sub_start..sub_end) },
+                unsafe { scratch_p.get_unchecked_mut(sub_start..sub_end) },
+            );
+        } else {
+            sort_large_bucket(
+                unsafe { scratch_k.get_unchecked_mut(sub_start..sub_end) },
+                unsafe { scratch_p.get_unchecked_mut(sub_start..sub_end) },
+                sort_buf_k,
+            );
+        }
+
+        if (cnt as u64) <= freq_limit {
+            let first_k = unsafe { *sk_base.add(sub_start) };
+            let mut prev_k = !first_k; // Guaranteed != first_k for all u64!
+            let mut prev_ps = P::default();
+            let mut prev_marked = false;
+            for idx in sub_start..sub_end {
+                let h_rot = unsafe { *sk_base.add(idx) };
+                let ps = unsafe { *sp_base.add(idx) };
+                unsafe {
+                    *tag_ptr.add(write_idx) = (h_rot >> 32) as u32;
+                    *pp.get_unchecked_mut(write_idx) = ps;
+                }
+                write_idx += 1;
+                if h_rot != prev_k {
+                    unsafe {
+                        insert_bloom_const::<K_H>(
+                            bloom_ptr,
+                            h_rot,
+                            bloom_sub_shift,
+                            bloom_sub_mask,
+                        );
+                    }
+                    prev_k = h_rot;
+                    prev_ps = ps;
+                    prev_marked = false;
+                } else {
+                    if !prev_marked {
+                        push_unique_pos(
+                            &mut dup_buf,
+                            &mut dup_len,
+                            prev_ps.pos(),
+                            non_unique_atomic,
+                        );
+                        prev_marked = true;
+                    }
+                    push_unique_pos(&mut dup_buf, &mut dup_len, ps.pos(), non_unique_atomic);
+                }
+            }
+        } else {
+            unsafe {
+                emit_filtered_bucket::<P, K_H>(
+                    scratch_k,
+                    scratch_p,
+                    sub_start,
+                    sub_end,
+                    freq_limit,
+                    forward_only,
+                    tag_ptr,
+                    pp,
+                    &mut write_idx,
+                    bloom_ptr,
+                    bloom_sub_shift,
+                    bloom_sub_mask,
+                    &mut dup_buf,
+                    &mut dup_len,
+                    non_unique_atomic,
+                );
+            }
+        }
+
+        sub_start = sub_end;
+    }
+
+    if dup_len > 0 {
+        flush_unique_buf(&dup_buf[..dup_len], non_unique_atomic);
+    }
+    poff[sub_buckets].write((part_off + write_idx) as u32);
+    // Zero-initialize any slack entries at the tail of this partition so `tags` is
+    // 100% initialized across `[0 .. total_kmers + 8)` for wide AVX2 loads.
+    for slot in &mut ptag[write_idx..n] {
+        slot.write(0);
+    }
+    write_idx
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+unsafe fn process_hash_partition_scalar<P: PackedPs, const K_H: usize>(
+    part_off: usize,
+    pk: Vec<u64>,
+    pp: &mut [P],
+    ptag: &mut [MaybeUninit<u32>],
+    poff: &mut [MaybeUninit<u32>],
+    bloom_ptr: *mut BloomBlock,
+    sub_buckets: usize,
+    sub_shift_hi: u32,
+    sub_mask: usize,
+    freq_limit: u64,
+    forward_only: bool,
+    bloom_sub_shift: u32,
+    bloom_sub_mask: usize,
+    non_unique_atomic: &[AtomicU64],
+    sub_off: &mut [u32],
+    scratch_k: &mut Vec<u64>,
+    scratch_p: &mut Vec<P>,
+    sort_buf_k: &mut Vec<(u64, P)>,
+) -> usize {
+    unsafe {
+        process_hash_partition_impl::<P, K_H>(
+            part_off,
+            pk,
+            pp,
+            ptag,
+            poff,
+            bloom_ptr,
+            sub_buckets,
+            sub_shift_hi,
+            sub_mask,
+            freq_limit,
+            forward_only,
+            bloom_sub_shift,
+            bloom_sub_mask,
+            non_unique_atomic,
+            sub_off,
+            scratch_k,
+            scratch_p,
+            sort_buf_k,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+unsafe fn process_hash_partition_bmi2<P: PackedPs, const K_H: usize>(
+    part_off: usize,
+    pk: Vec<u64>,
+    pp: &mut [P],
+    ptag: &mut [MaybeUninit<u32>],
+    poff: &mut [MaybeUninit<u32>],
+    bloom_ptr: *mut BloomBlock,
+    sub_buckets: usize,
+    sub_shift_hi: u32,
+    sub_mask: usize,
+    freq_limit: u64,
+    forward_only: bool,
+    bloom_sub_shift: u32,
+    bloom_sub_mask: usize,
+    non_unique_atomic: &[AtomicU64],
+    sub_off: &mut [u32],
+    scratch_k: &mut Vec<u64>,
+    scratch_p: &mut Vec<P>,
+    sort_buf_k: &mut Vec<(u64, P)>,
+) -> usize {
+    unsafe {
+        process_hash_partition_impl::<P, K_H>(
+            part_off,
+            pk,
+            pp,
+            ptag,
+            poff,
+            bloom_ptr,
+            sub_buckets,
+            sub_shift_hi,
+            sub_mask,
+            freq_limit,
+            forward_only,
+            bloom_sub_shift,
+            bloom_sub_mask,
+            non_unique_atomic,
+            sub_off,
+            scratch_k,
+            scratch_p,
+            sort_buf_k,
+        )
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn build_hash_csr_u32(
@@ -1610,6 +2825,8 @@ fn build_hash_csr_u32(
     spaced_mask: Option<u64>,
     freq_limit: u64,
     soft_mask: bool,
+    forward_only: bool,
+    build_unique_bm: bool,
 ) -> Result<RefIndex> {
     build_hash_csr::<u32>(
         reference,
@@ -1621,6 +2838,8 @@ fn build_hash_csr_u32(
         spaced_mask,
         freq_limit,
         soft_mask,
+        forward_only,
+        build_unique_bm,
     )
 }
 
@@ -1635,6 +2854,8 @@ fn build_hash_csr_u64(
     spaced_mask: Option<u64>,
     freq_limit: u64,
     soft_mask: bool,
+    forward_only: bool,
+    build_unique_bm: bool,
 ) -> Result<RefIndex> {
     build_hash_csr::<u64>(
         reference,
@@ -1646,6 +2867,8 @@ fn build_hash_csr_u64(
         spaced_mask,
         freq_limit,
         soft_mask,
+        forward_only,
+        build_unique_bm,
     )
 }
 
@@ -1660,6 +2883,8 @@ fn build_hash_csr<P: PackedPs>(
     spaced_mask: Option<u64>,
     freq_limit: u64,
     soft_mask: bool,
+    forward_only: bool,
+    build_unique_bm: bool,
 ) -> Result<RefIndex> {
     let seq = &reference.seq;
     let n_parts = part_end - part_start;
@@ -1686,7 +2911,11 @@ fn build_hash_csr<P: PackedPs>(
                 offsets: vec![0u32; n_parts * (sub_buckets + 1)],
                 tags: vec![0u32; 8],
                 pos_strand: P::into_vec(Vec::new()),
+                bloom: None,
             },
+            unique_bm: Vec::new(),
+            unique_bm_xor: u64::MAX,
+            forward_only,
         });
     }
 
@@ -1695,34 +2924,43 @@ fn build_hash_csr<P: PackedPs>(
         .par_iter()
         .map(|&(start, end)| {
             let mut counts = [0usize; NUM_PARTITIONS];
-            if full_parts {
-                for_each_canonical_kmer_2bit_opt(
-                    seq,
-                    start,
-                    end,
-                    wl,
-                    spaced_mask,
-                    soft_mask,
-                    |canon, _, _| {
-                        let p = (fmix64(canon) >> 56) as usize;
-                        counts[p] += 1;
-                    },
-                );
+            macro_rules! count_hash {
+                ($fwd:expr) => {
+                    if full_parts {
+                        for_each_canonical_kmer_2bit_opt::<$fwd, _>(
+                            seq,
+                            start,
+                            end,
+                            wl,
+                            spaced_mask,
+                            soft_mask,
+                            |canon, _, _| {
+                                let p = (fmix64(canon) >> 56) as usize;
+                                counts[p] += 1;
+                            },
+                        );
+                    } else {
+                        for_each_canonical_kmer_2bit_opt::<$fwd, _>(
+                            seq,
+                            start,
+                            end,
+                            wl,
+                            spaced_mask,
+                            soft_mask,
+                            |canon, _, _| {
+                                let p = (fmix64(canon) >> 56) as usize;
+                                if p >= part_start && p < part_end {
+                                    counts[p - part_start] += 1;
+                                }
+                            },
+                        );
+                    }
+                };
+            }
+            if forward_only {
+                count_hash!(true);
             } else {
-                for_each_canonical_kmer_2bit_opt(
-                    seq,
-                    start,
-                    end,
-                    wl,
-                    spaced_mask,
-                    soft_mask,
-                    |canon, _, _| {
-                        let p = (fmix64(canon) >> 56) as usize;
-                        if p >= part_start && p < part_end {
-                            counts[p - part_start] += 1;
-                        }
-                    },
-                );
+                count_hash!(false);
             }
             counts
         })
@@ -1747,21 +2985,26 @@ fn build_hash_csr<P: PackedPs>(
 
     let sub_shift_hi = 32 - bucket_bits;
 
-    // Pass 1b: scatter rotated 64-bit hashes `h_rot = fmix64(canon).rotate_left(32)` (with the
-    // 32-bit `tag` in the high 32 bits and bucket bits in the low 32 bits) into per-partition
-    // `Vec<u64>`s. Because `fmix64` + rotate is a 64-bit bijection, Pass 2 needs ZERO `fmix64`
-    // recomputations and only ONE sort per bucket to both enforce exact 64-bit `freq_limit` and
-    // emit entries already sorted by ascending `tag`.
-    let mut part_keys: Vec<Vec<u64>> = part_totals
-        .iter()
-        .map(|&n| Vec::with_capacity(n))
-        .collect();
+    // Pass 1b: scatter rotated 64-bit hashes `h_rot = fmix64(canon).rotate_left(32)` into
+    // per-partition `Vec<u64>`s using L2-resident staging buffers (`STAGE_CAP = 64`).
+    let mut part_keys: Vec<Vec<u64>> = part_totals.iter().map(|&n| Vec::with_capacity(n)).collect();
     let key_ptrs: Vec<SendMutPtr<u64>> = part_keys
         .iter_mut()
         .map(|v| SendMutPtr(v.as_mut_ptr()))
         .collect();
     let mut pos_strand: Vec<P> = Vec::with_capacity(total_kmers);
     let ps_ptr = SendMutPtr(pos_strand.as_mut_ptr());
+
+    // Allocate inverted `non_unique_bm` (`0` = unique valid in-slab non-palindrome, `1` = non-unique)
+    // before Pass 1b so Pass 1b marks rare palindromes + out-of-slab positions sequentially, and
+    // Pass 2 ONLY writes duplicate keys (`cnt >= 2`) with ZERO `inv_fmix64` calls!
+    let mut non_unique_bm = if build_unique_bm && total_kmers > 0 && freq_limit >= 1 {
+        init_non_unique_bm(seq, slab_start, slab_end, wl, soft_mask)
+    } else {
+        Vec::new()
+    };
+    let non_unique_atomic: &[AtomicU64] = AtomicU64::from_mut_slice(&mut non_unique_bm);
+    let track_non_unique = !non_unique_atomic.is_empty();
 
     ranges.par_iter().zip(chunk_write.par_iter()).for_each_init(
         || {
@@ -1781,63 +3024,105 @@ fn build_hash_csr<P: PackedPs>(
             let pptr = ps_ptr;
             let mut write_pos = init_write;
             let mut buf_len = [0u8; NUM_PARTITIONS];
+            let mut out_word_idx = usize::MAX;
+            let mut out_word_mask = 0u64;
 
-            for_each_canonical_kmer_2bit_opt(
-                seq,
-                start,
-                end,
-                wl,
-                spaced_mask,
-                soft_mask,
-                |canon, pos, strand| {
-                let h = fmix64(canon);
-                let p_glob = (h >> 56) as usize;
-                if !full_parts && (p_glob < part_start || p_glob >= part_end) {
-                    return;
-                }
-                let lp = if full_parts {
-                    p_glob
-                } else {
-                    p_glob - part_start
+            macro_rules! scatter_hash {
+                ($fwd:expr) => {
+                    for_each_canonical_kmer_2bit_opt::<$fwd, _>(
+                        seq,
+                        start,
+                        end,
+                        wl,
+                        spaced_mask,
+                        soft_mask,
+                        |canon, pos, strand| {
+                            let h = fmix64(canon);
+                            let p_glob = (h >> 56) as usize;
+                            if !full_parts && (p_glob < part_start || p_glob >= part_end) {
+                                if track_non_unique {
+                                    let w = (pos as usize) >> 6;
+                                    if w != out_word_idx {
+                                        if out_word_idx != usize::MAX {
+                                            unsafe {
+                                                non_unique_atomic.get_unchecked(out_word_idx)
+                                            }
+                                            .fetch_or(out_word_mask, Ordering::Relaxed);
+                                        }
+                                        out_word_idx = w;
+                                        out_word_mask = 1u64 << (pos & 63);
+                                    } else {
+                                        out_word_mask |= 1u64 << (pos & 63);
+                                    }
+                                }
+                                return;
+                            }
+                            if !$fwd && strand == 2 && track_non_unique {
+                                unsafe { non_unique_atomic.get_unchecked((pos as usize) >> 6) }
+                                    .fetch_or(1u64 << (pos & 63), Ordering::Relaxed);
+                            }
+                            let lp = if full_parts {
+                                p_glob
+                            } else {
+                                p_glob - part_start
+                            };
+                            unsafe {
+                                let idx = *buf_len.get_unchecked(lp) as usize;
+                                *buf_k.get_unchecked_mut(lp).get_unchecked_mut(idx) =
+                                    h.rotate_left(32);
+                                *buf_p.get_unchecked_mut(lp).get_unchecked_mut(idx) =
+                                    P::pack(pos, strand);
+                                let next_len = idx + 1;
+                                if next_len == STAGE_CAP {
+                                    let dst = *write_pos.get_unchecked(lp);
+                                    let local_dst = dst - *part_offsets.get_unchecked(lp);
+                                    std::ptr::copy_nonoverlapping(
+                                        buf_k.get_unchecked(lp).as_ptr(),
+                                        key_ptrs.get_unchecked(lp).0.add(local_dst),
+                                        STAGE_CAP,
+                                    );
+                                    std::ptr::copy_nonoverlapping(
+                                        buf_p.get_unchecked(lp).as_ptr(),
+                                        pptr.0.add(dst),
+                                        STAGE_CAP,
+                                    );
+                                    *write_pos.get_unchecked_mut(lp) = dst + STAGE_CAP;
+                                    *buf_len.get_unchecked_mut(lp) = 0;
+                                } else {
+                                    *buf_len.get_unchecked_mut(lp) = next_len as u8;
+                                }
+                            }
+                        },
+                    );
                 };
-                let idx = buf_len[lp] as usize;
-                buf_k[lp][idx] = h.rotate_left(32);
-                buf_p[lp][idx] = P::pack(pos, strand);
-                let next_len = idx + 1;
-                if next_len == STAGE_CAP {
-                    let dst = write_pos[lp];
-                    let local_dst = dst - part_offsets[lp];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            buf_k[lp].as_ptr(),
-                            key_ptrs[lp].0.add(local_dst),
-                            STAGE_CAP,
-                        );
-                        std::ptr::copy_nonoverlapping(
-                            buf_p[lp].as_ptr(),
-                            pptr.0.add(dst),
-                            STAGE_CAP,
-                        );
-                    }
-                    write_pos[lp] = dst + STAGE_CAP;
-                    buf_len[lp] = 0;
-                } else {
-                    buf_len[lp] = next_len as u8;
-                }
-            });
+            }
+            if forward_only {
+                scatter_hash!(true);
+            } else {
+                scatter_hash!(false);
+            }
+
+            if !full_parts && out_word_idx != usize::MAX {
+                unsafe { non_unique_atomic.get_unchecked(out_word_idx) }
+                    .fetch_or(out_word_mask, Ordering::Relaxed);
+            }
 
             for lp in 0..n_parts {
-                let rem = buf_len[lp] as usize;
+                let rem = unsafe { *buf_len.get_unchecked(lp) } as usize;
                 if rem > 0 {
-                    let dst = write_pos[lp];
-                    let local_dst = dst - part_offsets[lp];
+                    let dst = unsafe { *write_pos.get_unchecked(lp) };
+                    let local_dst = dst - unsafe { *part_offsets.get_unchecked(lp) };
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            buf_k[lp].as_ptr(),
-                            key_ptrs[lp].0.add(local_dst),
+                            buf_k.get_unchecked(lp).as_ptr(),
+                            key_ptrs.get_unchecked(lp).0.add(local_dst),
                             rem,
                         );
-                        std::ptr::copy_nonoverlapping(buf_p[lp].as_ptr(), pptr.0.add(dst), rem);
+                        std::ptr::copy_nonoverlapping(
+                            buf_p.get_unchecked(lp).as_ptr(),
+                            pptr.0.add(dst),
+                            rem,
+                        );
                     }
                 }
             }
@@ -1850,17 +3135,43 @@ fn build_hash_csr<P: PackedPs>(
     }
     unsafe { pos_strand.set_len(total_kmers) };
 
-    // Pass 2: Rayon-parallel fine-bucketing, single sort by `(h_rot, ps)`, exact 64-bit
-    // per-strand freq_limit filtering, direct 32-bit tag compaction, and immediate drop of `pk`.
+    // Pass 2: Rayon-parallel fine-bucketing, branchless cumulative sorting (`cnt = 2..=6`), exact
+    // 64-bit per-strand freq_limit filtering, direct 32-bit tag compaction, const-specialized
+    // partition-owned Blocked Bloom construction (BMI2-dispatched on x86_64), duplicate-only
+    // `non_unique_bm` marking, and immediate drop of `pk`.
     let off_len = n_parts * (sub_buckets + 1);
     let mut offsets: Vec<u32> = Vec::with_capacity(off_len);
     let mut tags: Vec<u32> = Vec::with_capacity(total_kmers + 8);
+
+    let bloom_params = choose_bloom_params(total_kmers, n_parts, freq_limit);
+    let (bloom_sub_bits, bloom_k_h_u8) = bloom_params.unwrap_or((0, 0));
+    let bloom_k_h = bloom_k_h_u8 as usize;
+    debug_assert!(bloom_k_h <= BLOOM_CHOOSE_MAX_K_H);
+    let bloom_sub_shift = 24 - bloom_sub_bits;
+    let bloom_sub_mask = (1usize << bloom_sub_bits) - 1;
+    let mut bloom_blocks: Vec<BloomBlock> = if bloom_params.is_some() {
+        vec![BloomBlock([0u64; 8]); n_parts << bloom_sub_bits]
+    } else {
+        Vec::new()
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    let use_bmi2 = std::arch::is_x86_feature_detected!("bmi2");
+
     let part_p_slices = split_by_offsets_mut(&mut pos_strand, &part_offsets);
     let part_tag_slices =
         split_by_offsets_mut(&mut tags.spare_capacity_mut()[..total_kmers], &part_offsets);
     let part_off_slices: Vec<&mut [MaybeUninit<u32>]> = offsets.spare_capacity_mut()[..off_len]
         .chunks_exact_mut(sub_buckets + 1)
         .collect();
+    let part_bloom_slices: Vec<Option<&mut [BloomBlock]>> = if bloom_params.is_some() {
+        bloom_blocks
+            .chunks_exact_mut(1usize << bloom_sub_bits)
+            .map(Some)
+            .collect()
+    } else {
+        (0..n_parts).map(|_| None).collect()
+    };
 
     let kept_entries: usize = (0..n_parts)
         .into_par_iter()
@@ -1868,185 +3179,177 @@ fn build_hash_csr<P: PackedPs>(
         .zip(part_p_slices.into_par_iter())
         .zip(part_tag_slices.into_par_iter())
         .zip(part_off_slices.into_par_iter())
+        .zip(part_bloom_slices.into_par_iter())
         .map_init(
             || {
                 (
-                    vec![0u32; sub_buckets],
                     vec![0u32; sub_buckets],
                     Vec::<u64>::new(),
                     Vec::<P>::new(),
                     Vec::<(u64, P)>::new(),
                 )
             },
-            |(sub_counts, sub_write, scratch_k, scratch_p, sort_buf_k),
-             ((((lp, pk), pp), ptag), poff)| {
+            |(sub_off, scratch_k, scratch_p, sort_buf_k),
+             (((((lp, pk), pp), ptag), poff), pbloom)| {
                 let part_off = part_offsets[lp];
-                let n = pk.len();
-                if n == 0 {
-                    for slot in poff.iter_mut() {
-                        slot.write(part_off as u32);
-                    }
-                    drop(pk);
-                    return 0usize;
-                }
-
-                sub_counts.fill(0);
-                for &h_rot in pk.iter() {
-                    let sub = (((h_rot as u32) >> sub_shift_hi) as usize) & sub_mask;
-                    unsafe {
-                        *sub_counts.get_unchecked_mut(sub) += 1;
-                    }
-                }
-
-                let mut acc = 0u32;
-                for s in 0..sub_buckets {
-                    unsafe {
-                        *sub_write.get_unchecked_mut(s) = acc;
-                        acc += *sub_counts.get_unchecked(s);
-                    }
-                }
-
-                if scratch_k.len() < n {
-                    let new_len = n + (n >> 3) + 1024;
-                    scratch_k.resize(new_len, 0);
-                    scratch_p.resize(new_len, P::default());
-                }
-                for i in 0..n {
-                    unsafe {
-                        let h_rot = *pk.get_unchecked(i);
-                        let sub = (((h_rot as u32) >> sub_shift_hi) as usize) & sub_mask;
-                        let dst = *sub_write.get_unchecked(sub) as usize;
-                        *scratch_k.get_unchecked_mut(dst) = h_rot;
-                        *scratch_p.get_unchecked_mut(dst) = *pp.get_unchecked(i);
-                        *sub_write.get_unchecked_mut(sub) = (dst + 1) as u32;
-                    }
-                }
-
-                // Release this partition's 64-bit hashes immediately before writing 32-bit tags.
-                drop(pk);
-
-                let tag_ptr = ptag.as_mut_ptr() as *mut u32;
-                let mut write_idx = 0usize;
-                let mut sub_start = 0usize;
-                for (slot, &cnt_u32) in poff.iter_mut().zip(sub_counts.iter()) {
-                    slot.write((part_off + write_idx) as u32);
-                    let cnt = cnt_u32 as usize;
-                    if cnt == 0 {
-                        continue;
-                    }
-                    let sub_end = sub_start + cnt;
-                    if cnt == 1 {
-                        if freq_limit >= 1 {
-                            unsafe {
-                                *tag_ptr.add(write_idx) =
-                                    (*scratch_k.get_unchecked(sub_start) >> 32) as u32;
-                                *pp.get_unchecked_mut(write_idx) =
-                                    *scratch_p.get_unchecked(sub_start);
-                            }
-                            write_idx += 1;
+                let bloom_ptr = pbloom.map_or(std::ptr::null_mut(), |s| s.as_mut_ptr());
+                macro_rules! dispatch_kh {
+                    ($fn_name:ident) => {
+                        if bloom_k_h == 4 {
+                            $fn_name::<P, 4>(
+                                part_off,
+                                pk,
+                                pp,
+                                ptag,
+                                poff,
+                                bloom_ptr,
+                                sub_buckets,
+                                sub_shift_hi,
+                                sub_mask,
+                                freq_limit,
+                                forward_only,
+                                bloom_sub_shift,
+                                bloom_sub_mask,
+                                non_unique_atomic,
+                                sub_off,
+                                scratch_k,
+                                scratch_p,
+                                sort_buf_k,
+                            )
+                        } else if bloom_k_h == 6 {
+                            $fn_name::<P, 6>(
+                                part_off,
+                                pk,
+                                pp,
+                                ptag,
+                                poff,
+                                bloom_ptr,
+                                sub_buckets,
+                                sub_shift_hi,
+                                sub_mask,
+                                freq_limit,
+                                forward_only,
+                                bloom_sub_shift,
+                                bloom_sub_mask,
+                                non_unique_atomic,
+                                sub_off,
+                                scratch_k,
+                                scratch_p,
+                                sort_buf_k,
+                            )
+                        } else if bloom_k_h == 0 {
+                            $fn_name::<P, 0>(
+                                part_off,
+                                pk,
+                                pp,
+                                ptag,
+                                poff,
+                                bloom_ptr,
+                                sub_buckets,
+                                sub_shift_hi,
+                                sub_mask,
+                                freq_limit,
+                                forward_only,
+                                bloom_sub_shift,
+                                bloom_sub_mask,
+                                non_unique_atomic,
+                                sub_off,
+                                scratch_k,
+                                scratch_p,
+                                sort_buf_k,
+                            )
+                        } else if bloom_k_h == 5 {
+                            $fn_name::<P, 5>(
+                                part_off,
+                                pk,
+                                pp,
+                                ptag,
+                                poff,
+                                bloom_ptr,
+                                sub_buckets,
+                                sub_shift_hi,
+                                sub_mask,
+                                freq_limit,
+                                forward_only,
+                                bloom_sub_shift,
+                                bloom_sub_mask,
+                                non_unique_atomic,
+                                sub_off,
+                                scratch_k,
+                                scratch_p,
+                                sort_buf_k,
+                            )
+                        } else if bloom_k_h == 3 {
+                            $fn_name::<P, 3>(
+                                part_off,
+                                pk,
+                                pp,
+                                ptag,
+                                poff,
+                                bloom_ptr,
+                                sub_buckets,
+                                sub_shift_hi,
+                                sub_mask,
+                                freq_limit,
+                                forward_only,
+                                bloom_sub_shift,
+                                bloom_sub_mask,
+                                non_unique_atomic,
+                                sub_off,
+                                scratch_k,
+                                scratch_p,
+                                sort_buf_k,
+                            )
+                        } else if bloom_k_h == 2 {
+                            $fn_name::<P, 2>(
+                                part_off,
+                                pk,
+                                pp,
+                                ptag,
+                                poff,
+                                bloom_ptr,
+                                sub_buckets,
+                                sub_shift_hi,
+                                sub_mask,
+                                freq_limit,
+                                forward_only,
+                                bloom_sub_shift,
+                                bloom_sub_mask,
+                                non_unique_atomic,
+                                sub_off,
+                                scratch_k,
+                                scratch_p,
+                                sort_buf_k,
+                            )
+                        } else {
+                            $fn_name::<P, 1>(
+                                part_off,
+                                pk,
+                                pp,
+                                ptag,
+                                poff,
+                                bloom_ptr,
+                                sub_buckets,
+                                sub_shift_hi,
+                                sub_mask,
+                                freq_limit,
+                                forward_only,
+                                bloom_sub_shift,
+                                bloom_sub_mask,
+                                non_unique_atomic,
+                                sub_off,
+                                scratch_k,
+                                scratch_p,
+                                sort_buf_k,
+                            )
                         }
-                        sub_start = sub_end;
-                        continue;
-                    }
-
-                    // Single sort by `(h_rot, pos_strand)` simultaneously groups identical 64-bit
-                    // keys contiguously AND orders kept entries by ascending 32-bit `tag`.
-                    if cnt <= 24 {
-                        insertion_sort_pair(
-                            &mut scratch_k[sub_start..sub_end],
-                            &mut scratch_p[sub_start..sub_end],
-                        );
-                    } else {
-                        sort_buf_k.clear();
-                        sort_buf_k.reserve(cnt);
-                        for idx in sub_start..sub_end {
-                            unsafe {
-                                sort_buf_k.push((
-                                    *scratch_k.get_unchecked(idx),
-                                    *scratch_p.get_unchecked(idx),
-                                ));
-                            }
-                        }
-                        sort_buf_k.sort_unstable();
-                        for (off, &(h_rot, ps)) in sort_buf_k.iter().enumerate() {
-                            unsafe {
-                                *scratch_k.get_unchecked_mut(sub_start + off) = h_rot;
-                                *scratch_p.get_unchecked_mut(sub_start + off) = ps;
-                            }
-                        }
-                    }
-
-                    if (cnt as u64) <= freq_limit {
-                        for idx in sub_start..sub_end {
-                            unsafe {
-                                *tag_ptr.add(write_idx) =
-                                    (*scratch_k.get_unchecked(idx) >> 32) as u32;
-                                *pp.get_unchecked_mut(write_idx) = *scratch_p.get_unchecked(idx);
-                            }
-                            write_idx += 1;
-                        }
-                    } else {
-                        // Exact 64-bit per-strand freq_limit filtering across runs of identical `h_rot`.
-                        let mut r = sub_start;
-                        while r < sub_end {
-                            let h_rot = unsafe { *scratch_k.get_unchecked(r) };
-                            let mut r_end = r + 1;
-                            let mut cnt0 = 0u64;
-                            let mut cnt1 = 0u64;
-                            if unsafe { scratch_p.get_unchecked(r).strand_bit() } == 0 {
-                                cnt0 += 1;
-                            } else {
-                                cnt1 += 1;
-                            }
-                            while r_end < sub_end
-                                && unsafe { *scratch_k.get_unchecked(r_end) } == h_rot
-                            {
-                                if unsafe { scratch_p.get_unchecked(r_end).strand_bit() } == 0 {
-                                    cnt0 += 1;
-                                } else {
-                                    cnt1 += 1;
-                                }
-                                r_end += 1;
-                            }
-                            let keep0 = cnt0 <= freq_limit;
-                            let keep1 = cnt1 <= freq_limit;
-                            if keep0 || keep1 {
-                                let tag = (h_rot >> 32) as u32;
-                                if keep0 && keep1 {
-                                    for &ps in &scratch_p[r..r_end] {
-                                        unsafe {
-                                            *tag_ptr.add(write_idx) = tag;
-                                            *pp.get_unchecked_mut(write_idx) = ps;
-                                        }
-                                        write_idx += 1;
-                                    }
-                                } else {
-                                    for &ps in &scratch_p[r..r_end] {
-                                        let is_keep =
-                                            if ps.strand_bit() == 0 { keep0 } else { keep1 };
-                                        if is_keep {
-                                            unsafe {
-                                                *tag_ptr.add(write_idx) = tag;
-                                                *pp.get_unchecked_mut(write_idx) = ps;
-                                            }
-                                            write_idx += 1;
-                                        }
-                                    }
-                                }
-                            }
-                            r = r_end;
-                        }
-                    }
-
-                    sub_start = sub_end;
+                    };
                 }
-                poff[sub_buckets].write((part_off + write_idx) as u32);
-                // Zero-initialize any slack entries at the tail of this partition so `tags` is
-                // 100% initialized across `[0 .. total_kmers + 8)` for wide AVX2 loads.
-                for slot in &mut ptag[write_idx..n] {
-                    slot.write(0);
+                #[cfg(target_arch = "x86_64")]
+                if use_bmi2 {
+                    return unsafe { dispatch_kh!(process_hash_partition_bmi2) };
                 }
-                write_idx
+                unsafe { dispatch_kh!(process_hash_partition_scalar) }
             },
         )
         .sum();
@@ -2064,6 +3367,13 @@ fn build_hash_csr<P: PackedPs>(
         tags.set_len(total_kmers + 8);
     }
 
+    let bloom = bloom_params.map(|(sb, kh)| BlockedBloom {
+        blocks: bloom_blocks,
+        sub_bits: sb,
+        block_shift: 56 - sb,
+        k_h: kh,
+    });
+
     Ok(RefIndex {
         word_length: wl,
         freq_limit,
@@ -2080,7 +3390,11 @@ fn build_hash_csr<P: PackedPs>(
             offsets,
             tags,
             pos_strand: P::into_vec(pos_strand),
+            bloom,
         },
+        unique_bm: non_unique_bm,
+        unique_bm_xor: u64::MAX,
+        forward_only,
     })
 }
 
@@ -2207,5 +3521,527 @@ mod tests {
                 assert_eq!(actual, expected, "mismatch for end={end}, target={target}");
             }
         }
+    }
+
+    #[test]
+    fn inv_fmix64_exact_roundtrip() {
+        let edges = [
+            0u64,
+            1,
+            2,
+            3,
+            u64::MAX,
+            u64::MAX - 1,
+            1u64 << 63,
+            0x5555_5555_5555_5555,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x0123_4567_89AB_CDEF,
+        ];
+        for &x in &edges {
+            assert_eq!(inv_fmix64(fmix64(x)), x);
+            assert_eq!(fmix64(inv_fmix64(x)), x);
+        }
+        let mut rng = 0x1337_C0DE_DEAD_BEEFu64;
+        for _ in 0..10_000 {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            assert_eq!(inv_fmix64(fmix64(rng)), rng);
+        }
+    }
+
+    #[test]
+    fn is_palindrome_key_contiguous_and_spaced() {
+        use crate::spaced::SpacedSeed;
+
+        let mut rng = 0x4242_4242_1234_5678u64;
+        let alphabet = *b"ACGT";
+        let mut rand_seq = |wl: usize| -> Vec<u8> {
+            (0..wl)
+                .map(|_| {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    alphabet[((rng >> 32) & 3) as usize]
+                })
+                .collect()
+        };
+
+        // Contiguous wl = 4, 12, 15, 16, 32
+        for wl in [4usize, 12, 15, 16, 32] {
+            let mask = kmer_mask(wl);
+            assert_eq!(can_key_be_palindrome(wl, None), (wl & 1) == 0);
+            for _ in 0..200 {
+                let s = rand_seq(wl);
+                let (kf, kr) = encode_kmer(&s);
+                let canon = kf.min(kr);
+                assert_eq!(is_palindrome_key(canon, wl, mask), kf == kr);
+            }
+            if (wl & 1) == 0 {
+                // Construct an explicit palindrome.
+                let half = rand_seq(wl / 2);
+                let mut pal = half.clone();
+                for &b in half.iter().rev() {
+                    pal.push(match b {
+                        b'A' => b'T',
+                        b'C' => b'G',
+                        b'G' => b'C',
+                        _ => b'A',
+                    });
+                }
+                let (kf, kr) = encode_kmer(&pal);
+                assert_eq!(kf, kr);
+                assert!(is_palindrome_key(kf, wl, mask));
+            }
+        }
+
+        // Spaced seeds: even (`w14s20`), odd with center `'0'` (`11011`, `1100011`), odd with center `'1'` (`11111`)
+        for (pat, expect_can_pal) in [
+            ("w14s20", true),
+            ("11011", true),
+            ("1100011", true),
+            ("1101011", false),
+        ] {
+            let sp = SpacedSeed::parse(pat).unwrap();
+            let sm = sp.gapped_mask_2bit();
+            assert_eq!(
+                can_key_be_palindrome(sp.span, sm),
+                expect_can_pal,
+                "pat={pat}"
+            );
+            let eff_mask = sm.unwrap_or_else(|| kmer_mask(sp.span));
+            for _ in 0..200 {
+                let s = rand_seq(sp.span);
+                let (kf, kr) = encode_kmer(&s);
+                let sf = kf & eff_mask;
+                let sr = kr & eff_mask;
+                assert_eq!(
+                    is_palindrome_key(sf.min(sr), sp.span, eff_mask),
+                    sf == sr,
+                    "pat={pat}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sorting_networks_01_principle_and_pass2_parity() {
+        // Exhaustively verify all 2^n binary inputs (Knuth 0-1 principle) for n = 2..=6.
+        for mask in 0u32..(1 << 5) {
+            let mut k = [0u64; 5];
+            let mut p = [0u32; 5];
+            for i in 0..5 {
+                k[i] = ((mask >> i) & 1) as u64;
+                p[i] = (4 - i) as u32;
+            }
+            let mut expected: Vec<(u64, u32)> = k.iter().copied().zip(p.iter().copied()).collect();
+            expected.sort();
+            let (mut k0, mut k1, mut k2, mut k3, mut k4) = (k[0], k[1], k[2], k[3], k[4]);
+            let (mut p0, mut p1, mut p2, mut p3, mut p4) = (p[0], p[1], p[2], p[3], p[4]);
+            cas_pair(&mut k0, &mut p0, &mut k1, &mut p1);
+            cas_pair(&mut k3, &mut p3, &mut k4, &mut p4);
+            cas_pair(&mut k2, &mut p2, &mut k4, &mut p4);
+            cas_pair(&mut k2, &mut p2, &mut k3, &mut p3);
+            cas_pair(&mut k0, &mut p0, &mut k3, &mut p3);
+            cas_pair(&mut k0, &mut p0, &mut k2, &mut p2);
+            cas_pair(&mut k1, &mut p1, &mut k4, &mut p4);
+            cas_pair(&mut k1, &mut p1, &mut k3, &mut p3);
+            cas_pair(&mut k1, &mut p1, &mut k2, &mut p2);
+            let actual = [(k0, p0), (k1, p1), (k2, p2), (k3, p3), (k4, p4)];
+            assert_eq!(actual.as_slice(), expected.as_slice());
+        }
+        for mask in 0u32..(1 << 6) {
+            let mut k = [0u64; 6];
+            let mut p = [0u32; 6];
+            for i in 0..6 {
+                k[i] = ((mask >> i) & 1) as u64;
+                p[i] = (5 - i) as u32;
+            }
+            let mut expected: Vec<(u64, u32)> = k.iter().copied().zip(p.iter().copied()).collect();
+            expected.sort();
+            let (mut k0, mut k1, mut k2, mut k3, mut k4, mut k5) =
+                (k[0], k[1], k[2], k[3], k[4], k[5]);
+            let (mut p0, mut p1, mut p2, mut p3, mut p4, mut p5) =
+                (p[0], p[1], p[2], p[3], p[4], p[5]);
+            cas_pair(&mut k1, &mut p1, &mut k2, &mut p2);
+            cas_pair(&mut k4, &mut p4, &mut k5, &mut p5);
+            cas_pair(&mut k0, &mut p0, &mut k2, &mut p2);
+            cas_pair(&mut k3, &mut p3, &mut k5, &mut p5);
+            cas_pair(&mut k0, &mut p0, &mut k1, &mut p1);
+            cas_pair(&mut k3, &mut p3, &mut k4, &mut p4);
+            cas_pair(&mut k2, &mut p2, &mut k5, &mut p5);
+            cas_pair(&mut k0, &mut p0, &mut k3, &mut p3);
+            cas_pair(&mut k1, &mut p1, &mut k4, &mut p4);
+            cas_pair(&mut k2, &mut p2, &mut k4, &mut p4);
+            cas_pair(&mut k1, &mut p1, &mut k3, &mut p3);
+            cas_pair(&mut k2, &mut p2, &mut k3, &mut p3);
+            let actual = [(k0, p0), (k1, p1), (k2, p2), (k3, p3), (k4, p4), (k5, p5)];
+            assert_eq!(actual.as_slice(), expected.as_slice());
+        }
+
+        // Verify full Pass 2 HashCsr bucket ordering parity across buckets of size 1..=30.
+        let alphabet = *b"ACGT";
+        let mut rng = 0x9988_7766_5544_3322u64;
+        let seq: Vec<u8> = (0..100_000)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                alphabet[((rng >> 32) & 3) as usize]
+            })
+            .collect();
+        let g = Genome::from_records("r", [("r0", seq.as_slice())]);
+        let idx = RefIndex::build(&g, 16, 100, true).unwrap();
+        let RefIndexKind::HashCsr {
+            offsets,
+            tags,
+            pos_strand,
+            ..
+        } = &idx.kind
+        else {
+            panic!("expected HashCsr");
+        };
+        let mut max_cnt = 0usize;
+        let mask16 = kmer_mask(16);
+        let h_rot_at = |pos: usize| -> u64 {
+            let mut kf = 0u64;
+            let mut kr = 0u64;
+            for k in 0..16usize {
+                let b = g.seq.base_2bit(pos + k) as u64;
+                kf = ((kf << 2) | b) & mask16;
+                kr = (kr >> 2) | ((b ^ 3) << 30);
+            }
+            fmix64(kf.min(kr)).rotate_left(32)
+        };
+        for w in offsets.windows(2) {
+            let s = w[0] as usize;
+            let e = w[1] as usize;
+            if e > s {
+                max_cnt = max_cnt.max(e - s);
+                for i in s + 1..e {
+                    assert!(
+                        tags[i - 1] <= tags[i],
+                        "tags not sorted in bucket [{s}..{e})"
+                    );
+                    let (p_prev, s_prev) = pos_strand.get_unpacked(i - 1);
+                    let (p_cur, s_cur) = pos_strand.get_unpacked(i);
+                    let a = (h_rot_at(p_prev as usize), (p_prev << 1) | s_prev as u64);
+                    let b = (h_rot_at(p_cur as usize), (p_cur << 1) | s_cur as u64);
+                    assert!(a < b, "Pass 2 pair ordering mismatch in bucket [{s}..{e})");
+                }
+            }
+        }
+        assert!(
+            max_cnt >= 6,
+            "expected multi-entry buckets >= 6, got {max_cnt}"
+        );
+    }
+
+    #[test]
+    fn blocked_bloom_zero_false_negatives_and_fpr_single_and_multislab() {
+        // Test all k_h = 1..=8 directly on BlockedBloom.
+        for k_h in 1u8..=8 {
+            let mut blocks = vec![BloomBlock([0u64; 8]); 64];
+            let mut inserted = Vec::new();
+            for i in 0u32..500 {
+                let h = fmix64(i as u64 + 1);
+                let blk = (h >> 58) as usize;
+                let tag = h as u32;
+                insert_in_bloom_block(&mut blocks[blk], tag, k_h as usize);
+                inserted.push((blk, tag));
+            }
+            let bloom = BlockedBloom {
+                blocks,
+                sub_bits: 0,
+                block_shift: 58,
+                k_h,
+            };
+            for &(blk, tag) in &inserted {
+                assert!(
+                    unsafe { bloom.contains_unchecked(blk, tag) },
+                    "FN at k_h={k_h}"
+                );
+            }
+            let mut fps = 0usize;
+            for i in 10_000u32..15_000 {
+                let h = fmix64(i as u64);
+                if unsafe { bloom.contains_unchecked((h >> 58) as usize, h as u32) } {
+                    fps += 1;
+                }
+            }
+            assert!(fps < 1_500, "unexpectedly high FPR {fps}/5000 at k_h={k_h}");
+        }
+
+        // Build full HashCsr (> 4,096 kmers per 1/4 slab) with a dropped high-frequency repeat
+        // and verify 0 FN on single-slab AND 4-slab multi-slab.
+        let alphabet = *b"ACGT";
+        let mut rng = 0xAA55_AA55_1122_3344u64;
+        let mut seq: Vec<u8> = (0..24_000)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                alphabet[((rng >> 32) & 3) as usize]
+            })
+            .collect();
+        let drop_k = b"AAAACCCCGGGGTTTT";
+        for k in 0..6 {
+            seq[200 + k * 40..200 + k * 40 + 16].copy_from_slice(drop_k);
+        }
+        let g = Genome::from_records("b", [("b0", seq.as_slice())]);
+        let (dkf, dkr) = encode_kmer(drop_k);
+        let drop_canon = dkf.min(dkr);
+
+        for (ps, pe) in [(0u16, 256u16), (0, 64), (64, 128), (128, 192), (192, 256)] {
+            let idx = RefIndex::build_partitions_with_mask(&g, ps, pe, 16, None, 3, true).unwrap();
+            let RefIndexKind::HashCsr {
+                bloom: Some(ref bloom),
+                ..
+            } = idx.kind
+            else {
+                panic!("expected BlockedBloom to be enabled for [{ps}..{pe})");
+            };
+            // Every valid k-mer in this slab with count <= 3 MUST be present in Bloom & lookup.
+            let mut kept_checked = 0usize;
+            for_each_canonical_kmer_2bit::<false, _>(
+                &g.seq,
+                0,
+                g.seq.len - 15,
+                16,
+                true,
+                |canon, _, _| {
+                    let h = fmix64(canon);
+                    let p = (h >> 56) as u16;
+                    if p < ps || p >= pe {
+                        return;
+                    }
+                    if canon == drop_canon {
+                        assert!(idx.lookup(canon).is_empty());
+                        return;
+                    }
+                    let blk =
+                        ((h >> bloom.block_shift) as usize) - ((ps as usize) << bloom.sub_bits);
+                    let hits = idx.lookup(canon);
+                    if !hits.is_empty() {
+                        assert!(unsafe { bloom.contains_unchecked(blk, h as u32) });
+                        kept_checked += 1;
+                    }
+                },
+            );
+            assert!(kept_checked > 2_000);
+        }
+    }
+
+    #[test]
+    fn unique_bm_exact_vs_naive_counts_across_all_modes() {
+        use crate::spaced::SpacedSeed;
+        use std::collections::HashMap;
+
+        let alphabet = *b"ACGT";
+        let mut rng = 0x55AA_1234_9876_FEDCu64;
+        let mut seq: Vec<u8> = (0..10_000)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                alphabet[((rng >> 32) & 3) as usize]
+            })
+            .collect();
+        // Inject duplicates, reverse-complement duplicate, palindrome, N, and lowercase.
+        seq[100..116].copy_from_slice(b"ACGTACGTACGTACGT"); // palindrome
+        seq[300..316].copy_from_slice(b"AAACCCGGGTTTACGT");
+        seq[500..516].copy_from_slice(b"ACGTAAACCCGGGTTT"); // revcomp of above
+        seq[700..716].copy_from_slice(b"TTTTGGGGCCCCAAAA");
+        seq[900..916].copy_from_slice(b"TTTTGGGGCCCCAAAA"); // fwd dup
+        seq[1_100..1_110].fill(b'N');
+        seq[1_300..1_320].copy_from_slice(b"acgtacgtacgtacgtacgt");
+
+        let g = Genome::from_records("u", [("u0", seq.as_slice())]);
+        let spaced = SpacedSeed::parse("w14s20").unwrap();
+
+        let configs: Vec<(usize, Option<u64>, u16, u16, u64, bool)> = vec![
+            (8, None, 0, 256, 2, false),   // DirectCsr canonical
+            (8, None, 0, 256, 2, true),    // DirectCsr forward-only
+            (16, None, 0, 256, 2, false),  // HashCsr canonical
+            (16, None, 64, 192, 2, false), // HashCsr multi-slab canonical
+            (16, None, 0, 256, 2, true),   // HashCsr forward-only
+            (spaced.span, spaced.gapped_mask_2bit(), 0, 256, 2, false), // Spaced canonical
+        ];
+
+        for (wl, sm, ps, pe, fl, fwd_only) in configs {
+            let idx = RefIndex::build_partitions_with_mask_and_strand(
+                &g, ps, pe, wl, sm, fl, true, fwd_only,
+            )
+            .unwrap();
+            let eff_mask = sm.unwrap_or_else(|| kmer_mask(wl));
+
+            // Compute exact naive counts of every valid k-mer in this slab.
+            let mut key_counts: HashMap<u64, usize> = HashMap::new();
+            let mut pos_key: HashMap<usize, u64> = HashMap::new();
+            let mut record = |key: u64, pos: u64, _strand: u64| {
+                let p = if idx.is_direct() {
+                    let sub_bits = (2 * wl - 8) as u32;
+                    (key >> sub_bits) as u16
+                } else {
+                    (fmix64(key) >> 56) as u16
+                };
+                if p >= ps && p < pe {
+                    *key_counts.entry(key).or_insert(0) += 1;
+                    pos_key.insert(pos as usize, key);
+                }
+            };
+            if fwd_only {
+                for_each_canonical_kmer_2bit_opt::<true, _>(
+                    &g.seq,
+                    0,
+                    g.seq.len - wl + 1,
+                    wl,
+                    sm,
+                    true,
+                    &mut record,
+                );
+            } else {
+                for_each_canonical_kmer_2bit_opt::<false, _>(
+                    &g.seq,
+                    0,
+                    g.seq.len - wl + 1,
+                    wl,
+                    sm,
+                    true,
+                    &mut record,
+                );
+            }
+
+            for pos in 0..g.seq.len {
+                let actual =
+                    (((idx.unique_bm[pos >> 6] ^ idx.unique_bm_xor) >> (pos & 63)) & 1) != 0;
+                let expected = match pos_key.get(&pos) {
+                    Some(&k) => {
+                        let cnt = key_counts[&k];
+                        let pal = !fwd_only && is_palindrome_key(k, wl, eff_mask);
+                        cnt == 1 && !pal
+                    }
+                    None => false,
+                };
+                assert_eq!(
+                    actual,
+                    expected,
+                    "unique_bm mismatch at pos={pos}, wl={wl}, spaced={}, slab=[{ps}..{pe}), fwd_only={fwd_only}",
+                    sm.is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn freq_limit_zero_exact_direct_and_hash_canon_and_fwd() {
+        let g = Genome::from_records(
+            "z",
+            [(
+                "z0",
+                b"ACGTACGTCCGGTTAAACGTTTGGCCAAAACCCGGGTTTACGTACGT".as_slice(),
+            )],
+        );
+        for wl in [8usize, 16] {
+            for fwd_only in [false, true] {
+                let idx =
+                    RefIndex::build_with_mask_and_strand(&g, wl, None, 0, true, fwd_only).unwrap();
+                assert_eq!(idx.kept_entries, 0);
+                assert!(idx.total_kmers > 0);
+                assert!(idx.unique_bm.is_empty());
+                if let RefIndexKind::HashCsr { ref bloom, .. } = idx.kind {
+                    assert!(bloom.is_none());
+                }
+                let (kf, kr) = encode_kmer(&g.seq.to_ascii_vec()[0..wl]);
+                let key = if fwd_only { kf } else { kf.min(kr) };
+                assert!(idx.lookup(key).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn choose_bloom_params_scales_proportionally_for_multislab() {
+        // 16.0 MiB (sb=10, k_h=6) on gorilla_chr21 (15.70M kmers, 256 parts)
+        assert_eq!(choose_bloom_params(15_703_781, 256, 20), Some((10, 6)));
+        // 32.0 MiB (sb=11, k_h=4) on mouse_chr16 single-slab (50.62M kmers, 256 parts)
+        assert_eq!(choose_bloom_params(50_617_016, 256, 20), Some((11, 4)));
+        // 10.75 MiB (sb=11, k_h=4) on mouse_chr16 3-slab (17.00M kmers, 86 parts)
+        assert_eq!(choose_bloom_params(17_004_154, 86, 20), Some((11, 4)));
+        // 6.50 MiB (sb=11, k_h=4) on mouse_chr16 5-slab (10.28M kmers, 52 parts)
+        assert_eq!(choose_bloom_params(10_281_581, 52, 20), Some((11, 4)));
+        // Disabled for tiny refs or freq_limit == 0
+        assert_eq!(choose_bloom_params(1_000, 256, 20), None);
+        assert_eq!(choose_bloom_params(50_617_016, 256, 0), None);
+    }
+
+    #[test]
+    fn sort_small_2_to_6_exhaustive_permutations_and_ties() {
+        fn next_perm(a: &mut [usize]) -> bool {
+            let n = a.len();
+            if n < 2 {
+                return false;
+            }
+            let mut i = n - 2;
+            while a[i] >= a[i + 1] {
+                if i == 0 {
+                    return false;
+                }
+                i -= 1;
+            }
+            let mut j = n - 1;
+            while a[j] <= a[i] {
+                j -= 1;
+            }
+            a.swap(i, j);
+            a[i + 1..].reverse();
+            true
+        }
+
+        // 1. Exhaustive n! permutations for n = 2..=6 (2+6+24+120+720 = 872 permutations)
+        //    with both distinct keys and duplicate keys + reverse tie-break `ps`.
+        let mut perm_count = 0usize;
+        for n in 2..=6 {
+            let mut perm: Vec<usize> = (0..n).collect();
+            loop {
+                perm_count += 1;
+                // Distinct keys (including extreme u64 boundaries)
+                let base_keys = [
+                    0u64,
+                    1,
+                    0x7FFF_FFFF_FFFF_FFFF,
+                    0x8000_0000_0000_0000,
+                    u64::MAX - 1,
+                    u64::MAX,
+                ];
+                let mut sk: Vec<u64> = perm.iter().map(|&idx| base_keys[idx]).collect();
+                let mut sp: Vec<u32> = perm.iter().map(|&idx| ((n - idx) as u32) << 1).collect();
+                let mut expected: Vec<(u64, u32)> =
+                    sk.iter().copied().zip(sp.iter().copied()).collect();
+                expected.sort();
+                unsafe { sort_small_2_to_6(sk.as_mut_ptr(), sp.as_mut_ptr(), n) };
+                let got: Vec<(u64, u32)> = sk.into_iter().zip(sp).collect();
+                assert_eq!(got, expected, "distinct perm failed for n={n}");
+
+                // Duplicate keys with distinct `ps` tie-breakers (tests 128-bit comparator)
+                let dup_keys = [10u64, 10, 20, 20, 30, 30];
+                let mut sk_d: Vec<u64> = perm.iter().map(|&idx| dup_keys[idx]).collect();
+                let mut sp_d: Vec<u32> = perm.iter().map(|&idx| (idx as u32) * 3 + 1).collect();
+                let mut expected_d: Vec<(u64, u32)> =
+                    sk_d.iter().copied().zip(sp_d.iter().copied()).collect();
+                expected_d.sort();
+                unsafe { sort_small_2_to_6(sk_d.as_mut_ptr(), sp_d.as_mut_ptr(), n) };
+                let got_d: Vec<(u64, u32)> = sk_d.into_iter().zip(sp_d).collect();
+                assert_eq!(got_d, expected_d, "dup-tie perm failed for n={n}");
+
+                if !next_perm(&mut perm) {
+                    break;
+                }
+            }
+
+            // 2. All 2^n Knuth 0-1 binary patterns with reverse tie-break `ps`.
+            for mask in 0..(1usize << n) {
+                let mut sk: Vec<u64> = (0..n).map(|i| ((mask >> i) & 1) as u64).collect();
+                let mut sp: Vec<u32> = (0..n).map(|i| ((n - i) as u32) << 1).collect();
+                let mut expected: Vec<(u64, u32)> =
+                    sk.iter().copied().zip(sp.iter().copied()).collect();
+                expected.sort();
+                unsafe { sort_small_2_to_6(sk.as_mut_ptr(), sp.as_mut_ptr(), n) };
+                let got: Vec<(u64, u32)> = sk.into_iter().zip(sp).collect();
+                assert_eq!(got, expected, "0-1 pattern mask={mask:#b} failed for n={n}");
+            }
+        }
+        assert_eq!(perm_count, 2 + 6 + 24 + 120 + 720);
     }
 }

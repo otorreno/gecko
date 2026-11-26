@@ -116,7 +116,9 @@ pub fn resolve_backend(
     config: &CompareConfig,
     cache_dir: Option<&Path>,
 ) -> Result<SelectedBackend> {
-    let gpu_eligible = cache_dir.is_none() && (8..=32).contains(&config.word_length);
+    let gpu_eligible = cache_dir.is_none()
+        && (8..=32).contains(&config.word_length)
+        && config.two_hit_window.is_none();
     match requested {
         BackendArg::Cpu => Ok(SelectedBackend::Cpu),
         BackendArg::Cuda => {
@@ -129,6 +131,9 @@ pub fn resolve_backend(
                     config.word_length
                 );
             }
+            if config.two_hit_window.is_some() {
+                bail!("--two-hit is currently supported on `--backend cpu`");
+            }
             Ok(SelectedBackend::Cuda)
         }
         BackendArg::Wgpu => {
@@ -140,6 +145,9 @@ pub fn resolve_backend(
                     "WGPU backend requires word_length in 8..=32 (got {}); use --backend cpu",
                     config.word_length
                 );
+            }
+            if config.two_hit_window.is_some() {
+                bail!("--two-hit is currently supported on `--backend cpu`");
             }
             Ok(SelectedBackend::Wgpu)
         }

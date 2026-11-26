@@ -10,6 +10,11 @@ use crate::error::{GeckoError, Result};
 /// Stored as `0x00` so uppercasing (`b & 0xDF`) preserves separators identically.
 pub const SEQ_SEP: u8 = 0u8;
 
+/// Block shift for `PackedSeq::special_block_bm` (1 bit per 512 bp = 256 B/Mb).
+pub(crate) const SPECIAL_BLOCK_SHIFT: usize = 9;
+/// Block size in bases for `PackedSeq::special_block_bm` (512 bp).
+pub(crate) const SPECIAL_BLOCK_SIZE: usize = 1 << SPECIAL_BLOCK_SHIFT;
+
 const BASE_DECODE_UPPER: [u8; 4] = *b"ACGT";
 const BASE_DECODE_LOWER: [u8; 4] = *b"acgt";
 
@@ -46,6 +51,9 @@ pub struct PackedSeq {
     /// Sorted, coalesced `[start, end)` union of `n_runs`, `sep_pos`, and `iupac` — allows the
     /// extension loop to compute exact `N`/separator-free spans in a single lookup.
     pub special_runs: Vec<(u64, u64)>,
+    /// 1-bit-per-512-bp summary bitmap of `special_runs` (padded with 1 trailing `0u64` word,
+    /// or empty when `special_runs` is empty) for O(1) branchless special-free window checks.
+    pub(crate) special_block_bm: Vec<u64>,
 }
 
 impl PackedSeq {
@@ -68,6 +76,57 @@ impl PackedSeq {
             + self.sep_pos.capacity() * std::mem::size_of::<u64>()
             + self.iupac.capacity() * std::mem::size_of::<(u64, u8)>()
             + self.special_runs.capacity() * std::mem::size_of::<(u64, u64)>()
+            + self.special_block_bm.capacity() * std::mem::size_of::<u64>()
+    }
+
+    /// Branchless O(1) check whether any 512-bp block overlapping `[lo, hi)` contains a special
+    /// base (`'N'`, `SEQ_SEP`, or IUPAC). Zero false negatives.
+    ///
+    /// Caller must ensure `lo < hi && hi <= self.len && hi - lo <= SPECIAL_BLOCK_SIZE`.
+    #[inline(always)]
+    pub(crate) fn has_special_in_short_range(&self, lo: usize, hi: usize) -> bool {
+        if self.special_block_bm.is_empty() {
+            return false;
+        }
+        debug_assert!(lo < hi && hi <= self.len && hi - lo <= SPECIAL_BLOCK_SIZE);
+        let b0 = lo >> SPECIAL_BLOCK_SHIFT;
+        let b1 = (hi - 1) >> SPECIAL_BLOCK_SHIFT;
+        // Safety: `b0 <= b1 <= (self.len - 1) >> 9`, so `b0 >> 6` and `b1 >> 6` are < `bm.len()`.
+        let w0 = unsafe { *self.special_block_bm.get_unchecked(b0 >> 6) };
+        let w1 = unsafe { *self.special_block_bm.get_unchecked(b1 >> 6) };
+        (((w0 >> (b0 & 63)) | (w1 >> (b1 & 63))) & 1) != 0
+    }
+
+    /// Check whether any 512-bp block overlapping `[lo, hi)` contains a special base (`'N'`,
+    /// `SEQ_SEP`, or IUPAC). Zero false negatives.
+    #[inline]
+    pub fn has_special_in_range(&self, lo: usize, hi: usize) -> bool {
+        if self.special_block_bm.is_empty() {
+            return false;
+        }
+        let lo = lo.min(self.len);
+        let hi = hi.min(self.len);
+        if lo >= hi {
+            return false;
+        }
+        let b0 = lo >> SPECIAL_BLOCK_SHIFT;
+        let b1 = (hi - 1) >> SPECIAL_BLOCK_SHIFT;
+        let w0 = b0 >> 6;
+        let w1 = b1 >> 6;
+        let bit0 = b0 & 63;
+        let bit1 = b1 & 63;
+        if w0 == w1 {
+            let mask = (u64::MAX << bit0) & (u64::MAX >> (63 - bit1));
+            (self.special_block_bm[w0] & mask) != 0
+        } else {
+            if (self.special_block_bm[w0] & (u64::MAX << bit0)) != 0 {
+                return true;
+            }
+            if self.special_block_bm[w0 + 1..w1].iter().any(|&w| w != 0) {
+                return true;
+            }
+            (self.special_block_bm[w1] & (u64::MAX >> (63 - bit1))) != 0
+        }
     }
 
     /// Return the 2-bit base value (`0..=3`) at coordinate `pos`.
@@ -245,26 +304,46 @@ impl PackedSeq {
         let len = self.len;
         let n_words = len.div_ceil(32);
         let mut bits = Vec::with_capacity(n_words + 2);
-
         let full_words = len / 32;
-        for w in 0..full_words {
-            let src_start = len - (w + 1) * 32;
-            let fwd = self.load_32(src_start);
-            // Complementing 2-bit bases (A=00<->T=11, C=01<->G=10) is bitwise NOT!
-            bits.push(!reverse_32_2bit(fwd));
-        }
-        let rem = len % 32;
-        if rem > 0 {
-            let mut last = 0u64;
-            for k in 0..rem {
-                let src_pos = rem - 1 - k;
-                let comp = (self.base_2bit(src_pos) ^ 3) as u64;
-                last |= comp << (2 * k);
+
+        {
+            let spare = &mut bits.spare_capacity_mut()[..n_words + 2];
+            if full_words >= 65_536 && rayon::current_num_threads() > 1 {
+                use rayon::prelude::*;
+                const CHUNK_WORDS: usize = 16_384;
+                spare[..full_words]
+                    .par_chunks_mut(CHUNK_WORDS)
+                    .enumerate()
+                    .for_each(|(chunk_idx, dst)| {
+                        let base_w = chunk_idx * CHUNK_WORDS;
+                        for (off, slot) in dst.iter_mut().enumerate() {
+                            let w = base_w + off;
+                            let src_start = len - (w + 1) * 32;
+                            // Complementing 2-bit bases (A=00<->T=11, C=01<->G=10) is bitwise NOT!
+                            slot.write(!reverse_32_2bit(self.load_32(src_start)));
+                        }
+                    });
+            } else {
+                for (w, slot) in spare[..full_words].iter_mut().enumerate() {
+                    let src_start = len - (w + 1) * 32;
+                    slot.write(!reverse_32_2bit(self.load_32(src_start)));
+                }
             }
-            bits.push(last);
+            let rem = len % 32;
+            if rem > 0 {
+                let mut last = 0u64;
+                for k in 0..rem {
+                    let src_pos = rem - 1 - k;
+                    let comp = (self.base_2bit(src_pos) ^ 3) as u64;
+                    last |= comp << (2 * k);
+                }
+                spare[full_words].write(last);
+            }
+            spare[n_words].write(0);
+            spare[n_words + 1].write(0);
         }
-        bits.push(0);
-        bits.push(0);
+        // Safety: all `n_words + 2` slots in `spare` were initialized above.
+        unsafe { bits.set_len(n_words + 2) };
 
         let len_u64 = len as u64;
         let mirror_runs = |runs: &[(u64, u64)]| -> Vec<(u64, u64)> {
@@ -277,6 +356,7 @@ impl PackedSeq {
         let n_runs = mirror_runs(&self.n_runs);
         let soft_runs = mirror_runs(&self.soft_runs);
         let special_runs = mirror_runs(&self.special_runs);
+        let special_block_bm = build_special_block_bm(len, &special_runs);
         let sep_pos: Vec<u64> = self
             .sep_pos
             .iter()
@@ -298,6 +378,7 @@ impl PackedSeq {
             sep_pos,
             iupac,
             special_runs,
+            special_block_bm,
         }
     }
 
@@ -826,6 +907,7 @@ impl PackedSeqBuilder {
         self.bits.push(0);
 
         let special_runs = build_special_runs(&self.n_runs, &self.sep_pos, &self.iupac);
+        let special_block_bm = build_special_block_bm(self.len, &special_runs);
 
         PackedSeq {
             len: self.len,
@@ -835,8 +917,40 @@ impl PackedSeqBuilder {
             sep_pos: self.sep_pos,
             iupac: self.iupac,
             special_runs,
+            special_block_bm,
         }
     }
+}
+
+/// Build a 1-bit-per-512-bp summary bitmap over `special_runs` (with 1 trailing `0u64` word),
+/// returning an empty `Vec` when `special_runs` is empty or `len == 0`.
+fn build_special_block_bm(len: usize, special_runs: &[(u64, u64)]) -> Vec<u64> {
+    if special_runs.is_empty() || len == 0 {
+        return Vec::new();
+    }
+    let n_blocks = len.div_ceil(SPECIAL_BLOCK_SIZE);
+    let mut words = vec![0u64; n_blocks.div_ceil(64) + 1];
+    for &(s, e) in special_runs {
+        let start = (s as usize).min(len);
+        let end = (e as usize).min(len);
+        if start >= end {
+            continue;
+        }
+        let b_s = start >> SPECIAL_BLOCK_SHIFT;
+        let b_e = (end - 1) >> SPECIAL_BLOCK_SHIFT;
+        let w_s = b_s >> 6;
+        let w_e = b_e >> 6;
+        let bit_s = b_s & 63;
+        let bit_e = b_e & 63;
+        if w_s == w_e {
+            words[w_s] |= (u64::MAX << bit_s) & (u64::MAX >> (63 - bit_e));
+        } else {
+            words[w_s] |= u64::MAX << bit_s;
+            words[w_s + 1..w_e].fill(u64::MAX);
+            words[w_e] |= u64::MAX >> (63 - bit_e);
+        }
+    }
+    words
 }
 
 fn build_special_runs(
@@ -1136,9 +1250,23 @@ impl Genome {
                 total_bases += added;
             }
             for (id, header, mut rec_builder) in chunk.records {
-                if merged.is_none() {
+                if let Some(m) = merged.as_mut() {
+                    m.push_sep();
+                    let start_with_sep = m.len as u64;
+                    let added = rec_builder.len as u64;
+                    m.append_builder(&rec_builder);
+                    records.push(SeqRecord {
+                        id,
+                        header,
+                        start_with_sep,
+                        start_no_sep: total_bases,
+                        len: added,
+                    });
+                    total_bases += added;
+                } else {
                     // Reuse the very first record's builder directly without copying its bits.
-                    let extra_words = (file_len / 32 + 4).saturating_sub(rec_builder.bits.capacity());
+                    let extra_words =
+                        (file_len / 32 + 4).saturating_sub(rec_builder.bits.capacity());
                     if extra_words > 0 {
                         rec_builder.bits.reserve(extra_words);
                     }
@@ -1149,20 +1277,6 @@ impl Genome {
                         header,
                         start_with_sep: 0,
                         start_no_sep: 0,
-                        len: added,
-                    });
-                    total_bases += added;
-                } else {
-                    let m = merged.as_mut().unwrap();
-                    m.push_sep();
-                    let start_with_sep = m.len as u64;
-                    let added = rec_builder.len as u64;
-                    m.append_builder(&rec_builder);
-                    records.push(SeqRecord {
-                        id,
-                        header,
-                        start_with_sep,
-                        start_no_sep: total_bases,
                         len: added,
                     });
                     total_bases += added;
@@ -1740,5 +1854,128 @@ mod tests {
         assert_eq!(par.seq.sep_pos, ser.seq.sep_pos);
         assert_eq!(par.seq.iupac, ser.seq.iupac);
         assert_eq!(par.seq.special_runs, ser.seq.special_runs);
+        assert_eq!(par.seq.special_block_bm, ser.seq.special_block_bm);
+    }
+
+    #[test]
+    fn special_block_bm_exact_forward_and_reverse_complement() {
+        // Empty and clean sequences have empty bitmap.
+        let empty = Genome::from_records("e", [("e0", b"".as_slice())]);
+        assert!(empty.seq.special_block_bm.is_empty());
+        assert!(!empty.seq.has_special_in_range(0, 0));
+
+        let clean = Genome::from_records("c", [("c0", vec![b'A'; 2000])]);
+        assert!(clean.seq.special_block_bm.is_empty());
+        assert!(!clean.seq.has_special_in_short_range(0, 512));
+        assert!(!clean.seq.has_special_in_range(0, 2000));
+
+        // Non-512-multiple length with specials at exact block boundaries 511, 512, 513,
+        // plus a multi-word run spanning > 64 blocks (32,768+ bp).
+        let len = 40_013usize;
+        let mut raw = vec![b'A'; len];
+        raw[511] = b'N';
+        raw[512] = b'R';
+        raw[513] = b'N';
+        raw[1024] = b'*';
+        raw[3_000..37_000].fill(b'N'); // spans multiple u64 bitmap words (> 64 * 512)
+        raw[len - 1] = b'N';
+
+        let g = Genome::from_records("s", [("s0", raw.as_slice())]);
+        let grc = g.reverse_complement();
+
+        for seq in [&g.seq, &grc.seq] {
+            let mut exact_blocks = vec![false; seq.len.div_ceil(SPECIAL_BLOCK_SIZE)];
+            for &(s, e) in &seq.special_runs {
+                for p in s as usize..e as usize {
+                    exact_blocks[p >> SPECIAL_BLOCK_SHIFT] = true;
+                }
+            }
+            for (b, &expected) in exact_blocks.iter().enumerate() {
+                let lo = b * SPECIAL_BLOCK_SIZE;
+                let hi = ((b + 1) * SPECIAL_BLOCK_SIZE).min(seq.len);
+                assert_eq!(
+                    seq.has_special_in_short_range(lo, hi),
+                    expected,
+                    "short-range mismatch on block {b}"
+                );
+                assert_eq!(
+                    seq.has_special_in_range(lo, hi),
+                    expected,
+                    "range mismatch on block {b}"
+                );
+            }
+            // Cross-boundary checks around 511/512/513 and mirrored positions.
+            for lo in [0usize, 500, 511, 512, 513, 1020, 2990, 36_990, len - 64] {
+                for span in [1usize, 16, 160, 512] {
+                    let hi = (lo + span).min(seq.len);
+                    if lo >= hi {
+                        continue;
+                    }
+                    let b0 = lo >> SPECIAL_BLOCK_SHIFT;
+                    let b1 = (hi - 1) >> SPECIAL_BLOCK_SHIFT;
+                    let expected = exact_blocks[b0..=b1].iter().any(|&x| x);
+                    assert_eq!(seq.has_special_in_short_range(lo, hi), expected);
+                    assert_eq!(seq.has_special_in_range(lo, hi), expected);
+                }
+            }
+            // Wide multi-word range checks.
+            assert!(seq.has_special_in_range(0, seq.len));
+            let expected_mid = exact_blocks[(1500 >> 9)..=((2500 - 1) >> 9)]
+                .iter()
+                .any(|&x| x);
+            assert_eq!(seq.has_special_in_range(1500, 2500), expected_mid);
+        }
+    }
+
+    #[test]
+    fn reverse_complement_exact_across_lengths_including_parallel_threshold() {
+        let alphabet = *b"ACGT";
+        let comp = |b: u8| match b {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            _ => unreachable!(),
+        };
+        for &len in &[0usize, 1, 31, 32, 33, 64, 65, 2_100_005] {
+            let mut raw = Vec::with_capacity(len);
+            let mut x = 0x1234_5678_9ABC_DEF0u64 ^ (len as u64);
+            for _ in 0..len {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                raw.push(alphabet[((x >> 32) & 3) as usize]);
+            }
+            let g = Genome::from_records("rc", [("r0", raw.as_slice())]);
+            let rc = g.seq.reverse_complement();
+            assert_eq!(rc.len, len);
+            assert_eq!(rc.bits.len(), len.div_ceil(32) + 2);
+            assert_eq!(rc.bits[rc.bits.len() - 1], 0);
+            assert_eq!(rc.bits[rc.bits.len() - 2], 0);
+            if len <= 1024 {
+                for i in 0..len {
+                    assert_eq!(rc.byte_upper_at(i), comp(raw[len - 1 - i]));
+                }
+            } else {
+                // Verify start, boundaries around parallel 16384-word chunks, and tail.
+                for &i in &[
+                    0,
+                    1,
+                    31,
+                    32,
+                    33,
+                    524_287,
+                    524_288,
+                    524_289,
+                    1_048_576,
+                    len - 33,
+                    len - 32,
+                    len - 1,
+                ] {
+                    assert_eq!(rc.byte_upper_at(i), comp(raw[len - 1 - i]), "pos {i}");
+                }
+                // Double reverse complement must be bit-exact with original.
+                let rc2 = rc.reverse_complement();
+                assert_eq!(rc2.bits, g.seq.bits);
+            }
+        }
     }
 }

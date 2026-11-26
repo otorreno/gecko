@@ -396,7 +396,14 @@ mod tests {
             "q",
             [(
                 "q0",
-                format!("{}{}{}{}{}", next_dna(150), fwd, next_dna(150), rev, next_dna(150)),
+                format!(
+                    "{}{}{}{}{}",
+                    next_dna(150),
+                    fwd,
+                    next_dna(150),
+                    rev,
+                    next_dna(150)
+                ),
             )],
         );
         let reference = Genome::from_records(
@@ -433,7 +440,10 @@ mod tests {
             let mut f_gpu = gpu_res.fragments.clone();
             f_cpu.sort_by_key(key);
             f_gpu.sort_by_key(key);
-            assert_eq!(f_gpu, f_cpu, "WGPU spaced-seed fragments must match CPU bit-for-bit");
+            assert_eq!(
+                f_gpu, f_cpu,
+                "WGPU spaced-seed fragments must match CPU bit-for-bit"
+            );
         }
     }
 }

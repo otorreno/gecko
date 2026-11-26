@@ -1,16 +1,25 @@
 /*
  * cuda_index.cu
  *
- * Stage 1: Word-level 2-bit GPU reverse-complement generation, 2-bit canonical
- * k-mer extraction, CUB DeviceRadixSort::SortPairs, exact per-strand freq_limit
- * compaction + 1-bit dropped-position bitmap, and 2-pass suffix-min bucket table.
+ * Stage 1: Word-level 2-bit GPU reverse-complement generation, CTA-cooperative
+ * coalesced 2-bit canonical k-mer extraction (Direct-CSR uint32_t for wl <= 12
+ * and Hash-CSR uint64_t), bit-bounded CUB DeviceRadixSort::SortPairs, exact
+ * per-strand freq_limit compaction + global/single-slab 1-bit dropped bitmap,
+ * inline 1-bit unique non-palindromic ref k-mer bitmap (F16), fused
+ * TransformInputIterator tag selection, and warp-aggregated pure-GPU CSR scan.
  */
 
 #include <utility>
-#include <vector>
 #include <cub/cub.cuh>
 
 #include "cuda_common.cuh"
+
+struct ExtractTagOp {
+    int tag_shift;
+    __host__ __device__ __forceinline__ uint32_t operator()(const uint64_t &k) const {
+        return (uint32_t)(k >> tag_shift);
+    }
+};
 
 static __global__ void revcomp_2bit_kernel(
     const uint64_t * __restrict__ src_bits,
@@ -74,7 +83,6 @@ static __global__ void count_valid_kmers_kernel(
 
     uint64_t scan_from = (c_start >= (uint64_t)(wl - 1)) ? (c_start - (uint64_t)(wl - 1)) : 0ULL;
     if (!seq.invalid_bm) {
-        /* Fast path: every base is valid */
         uint64_t first_emit = (c_start >= (uint64_t)(wl - 1)) ? c_start : (uint64_t)(wl - 1);
         chunk_counts[cid] = (c_end > first_emit) ? (uint32_t)(c_end - first_emit) : 0U;
         return;
@@ -91,13 +99,11 @@ static __global__ void count_valid_kmers_kernel(
         uint32_t avail_mask = (avail == 32U) ? 0xFFFFFFFFU : ((1U << avail) - 1U);
         uint32_t inv_masked = inv_word & avail_mask;
         if (inv_masked == avail_mask) {
-            /* Entire slice is invalid (N gap or soft-masked repeat) */
             valid = 0;
             i += avail;
             continue;
         }
         if (inv_masked == 0U) {
-            /* Entire slice is valid */
             int prev_valid = valid;
             valid += (int)avail;
             if (valid >= wl) {
@@ -185,100 +191,173 @@ static __global__ void count_valid_kmers_slab_kernel(
     chunk_counts[cid] = cnt;
 }
 
-static __global__ void extract_kmers_kernel(
+/* F15: CTA-cooperative coalesced k-mer extractor (1 CTA = 1 4,096-bp chunk,
+ * 4 sequential 1,024-bp waves, compile-time r=0..3 register staging => 0 B stack,
+ * 12.1 KiB smem for Hash-CSR / 8.1 KiB for Direct-CSR => 100% smem occupancy). */
+template <typename KeyT, bool IS_DIRECT>
+static __global__ void extract_kmers_coalesced_kernel(
     GpuSeqView seq,
     int wl,
-    uint64_t seed_mask,
+    uint64_t eff_mask,
     uint32_t part_start,
     uint32_t part_end,
-    uint32_t num_chunks,
     const uint32_t * __restrict__ chunk_offsets,
-    uint64_t * __restrict__ out_keys,
+    KeyT * __restrict__ out_keys,
     uint32_t * __restrict__ out_vals
 ) {
-    uint32_t cid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cid >= num_chunks) return;
+    uint32_t cid = blockIdx.x;
+    uint32_t chunk_dst = chunk_offsets[cid];
+    if (chunk_dst == chunk_offsets[cid + 1U]) return; /* uniform across CTA */
+
+    __shared__ KeyT s_keys[1024];
+    __shared__ uint32_t s_vals[1024];
+    __shared__ uint32_t s_warp_totals[8];
+    __shared__ uint32_t s_warp_prefix[8];
+    __shared__ uint32_t s_wave_total;
 
     uint64_t c_start = (uint64_t)cid * GECKO_EXTRACT_CHUNK_BP;
     uint64_t c_end = c_start + GECKO_EXTRACT_CHUNK_BP;
     if (c_end > seq.len) c_end = seq.len;
 
-    uint64_t mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
-    uint64_t eff_mask = (seed_mask != 0ULL) ? seed_mask : mask;
-    bool part_filter = (part_start != 0U || part_end != 256U);
-    int rc_shift = 2 * (wl - 1);
-    uint64_t scan_from = (c_start >= (uint64_t)(wl - 1)) ? (c_start - (uint64_t)(wl - 1)) : 0ULL;
+    uint64_t span_mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
+    uint32_t valid_mask_wl = (wl == 32) ? 0xFFFFFFFFU : ((1U << wl) - 1U);
+    int rev_rshift = 64 - 2 * wl;
+    bool part_filter = !IS_DIRECT && (part_start != 0U || part_end != 256U);
 
-    uint64_t kf = 0, kr = 0;
-    int valid = 0;
-    uint32_t dst = chunk_offsets[cid];
+    uint32_t tid = threadIdx.x;
+    uint32_t warp_id = tid >> 5;
+    uint32_t lane = tid & 31U;
 
-    uint64_t i = scan_from;
-    while (i < c_end) {
-        uint32_t w_idx = (uint32_t)(i >> 5);
-        uint32_t lane = (uint32_t)(i & 31ULL);
-        uint32_t avail = (uint32_t)((32U - lane < c_end - i) ? (32U - lane) : (c_end - i));
-        uint32_t inv_word = seq.invalid_bm ? (__ldg(&seq.invalid_bm[w_idx]) >> lane) : 0U;
-        uint32_t avail_mask = (avail == 32U) ? 0xFFFFFFFFU : ((1U << avail) - 1U);
-        if ((inv_word & avail_mask) == avail_mask) {
-            valid = 0;
-            kf = 0;
-            kr = 0;
-            i += avail;
-            continue;
-        }
-        uint64_t bword = __ldg(&seq.bits[w_idx]) >> (lane << 1);
-        for (uint32_t k = 0; k < avail; k++) {
-            uint64_t b = bword & 3ULL;
-            bword >>= 2;
-            if (((inv_word >> k) & 1U) == 0U) {
-                kf = ((kf << 2) | b) & mask;
-                kr = (kr >> 2) | ((b ^ 3ULL) << rc_shift);
-                if (++valid >= wl && (i + k) >= c_start) {
+    for (uint32_t wave = 0U; wave < 4U; wave++) {
+        uint64_t w_start = c_start + (uint64_t)wave * 1024ULL;
+        if (w_start >= c_end) break; /* 100% uniform across CTA */
+        uint64_t w_end = w_start + 1024ULL;
+        if (w_end > c_end) w_end = c_end;
+
+        uint64_t t_start = w_start + (uint64_t)tid * 4ULL;
+        KeyT lk[4];
+        uint32_t lv[4];
+        uint32_t ok_mask = 0U;
+
+        #pragma unroll
+        for (uint32_t r = 0U; r < 4U; r++) {
+            uint64_t cur_i = t_start + r;
+            if (cur_i < w_end && cur_i >= (uint64_t)(wl - 1)) {
+                uint32_t pos = (uint32_t)(cur_i + 1ULL - (uint64_t)wl);
+                if (!seq.invalid_bm || (load_32_1bit(seq.invalid_bm, pos) & valid_mask_wl) == 0U) {
+                    uint64_t w_lsb = load_32_2bit(seq.bits, pos);
+                    uint64_t kf = reverse_32_2bit_dev(w_lsb) >> rev_rshift;
+                    uint64_t kr = (~w_lsb) & span_mask;
                     uint64_t sf = kf & eff_mask;
                     uint64_t sr = kr & eff_mask;
                     uint32_t strand = (sf <= sr) ? 0U : 1U;
-                    uint64_t key = strand ? sr : sf;
-                    uint64_t h = fmix64(key);
-                    if (part_filter) {
-                        uint32_t p = (uint32_t)(h >> 56);
-                        if (p < part_start || p >= part_end) continue;
+                    uint64_t canon = strand ? sr : sf;
+                    if constexpr (IS_DIRECT) {
+                        lk[r] = (KeyT)canon;
+                        lv[r] = (pos << 1) | strand;
+                        ok_mask |= (1U << r);
+                    } else {
+                        uint64_t h = fmix64(canon);
+                        if (!part_filter ||
+                            (((uint32_t)(h >> 56) >= part_start) && ((uint32_t)(h >> 56) < part_end))) {
+                            lk[r] = (KeyT)h;
+                            lv[r] = (pos << 1) | strand;
+                            ok_mask |= (1U << r);
+                        }
                     }
-                    uint32_t start_pos = (uint32_t)((i + k) + 1ULL - (uint64_t)wl);
-                    out_keys[dst] = h;
-                    out_vals[dst] = (start_pos << 1) | strand;
-                    dst++;
                 }
-            } else {
-                valid = 0;
-                kf = 0;
-                kr = 0;
             }
         }
-        i += avail;
+
+        uint32_t local_cnt = (uint32_t)__popc(ok_mask);
+
+        uint32_t scan = local_cnt;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            uint32_t n = __shfl_up_sync(0xFFFFFFFFU, scan, off);
+            if (lane >= (uint32_t)off) scan += n;
+        }
+        uint32_t warp_excl = scan - local_cnt;
+        if (lane == 31U) s_warp_totals[warp_id] = scan;
+        __syncthreads(); /* Sync #1: unconditional */
+
+        if (warp_id == 0U) {
+            uint32_t wt = (lane < 8U) ? s_warp_totals[lane] : 0U;
+            uint32_t orig_wt = wt;
+            #pragma unroll
+            for (int off = 1; off < 8; off <<= 1) {
+                uint32_t n = __shfl_up_sync(0xFFFFFFFFU, wt, off);
+                if (lane >= (uint32_t)off) wt += n;
+            }
+            if (lane < 8U) s_warp_prefix[lane] = wt - orig_wt;
+            if (lane == 7U) s_wave_total = wt;
+        }
+        __syncthreads(); /* Sync #2: unconditional */
+
+        uint32_t my_off = s_warp_prefix[warp_id] + warp_excl;
+        uint32_t wave_total = s_wave_total;
+
+        uint32_t dst_s = my_off;
+        #pragma unroll
+        for (uint32_t r = 0U; r < 4U; r++) {
+            if ((ok_mask >> r) & 1U) {
+                s_keys[dst_s] = lk[r];
+                s_vals[dst_s] = lv[r];
+                dst_s++;
+            }
+        }
+        __syncthreads(); /* Sync #3: unconditional */
+
+        for (uint32_t idx = tid; idx < wave_total; idx += 256U) {
+            out_keys[chunk_dst + idx] = s_keys[idx];
+            out_vals[chunk_dst + idx] = s_vals[idx];
+        }
+        chunk_dst += wave_total;
+        __syncthreads(); /* Sync #4: unconditional before next wave reuses smem */
     }
 }
 
+template <typename KeyT, bool IS_DIRECT>
 static __global__ void mark_freq_filter_kernel(
-    const uint64_t * __restrict__ keys,
+    const KeyT * __restrict__ keys,
     const uint32_t * __restrict__ vals,
     uint32_t n,
     uint32_t freq_limit,
-    uint8_t * __restrict__ keep_flags
+    int wl,
+    uint64_t eff_mask,
+    uint8_t * __restrict__ keep_flags,
+    uint32_t * __restrict__ ref_unique_bm
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    uint64_t k = keys[i];
-    if (i > 0 && keys[i - 1] == k) return;
+    KeyT k = keys[i];
+    if (i > 0U && keys[i - 1U] == k) return;
 
-    if (i + 1 >= n || keys[i + 1] != k) {
+    if (i + 1U >= n || keys[i + 1U] != k) {
         keep_flags[i] = 1;
+        if (ref_unique_bm) {
+            uint32_t v = vals[i];
+            bool is_pal = false;
+            if ((v & 1U) == 0U) {
+                if constexpr (IS_DIRECT) {
+                    if ((wl & 1) == 0) {
+                        is_pal = is_palindromic_canon((uint64_t)k, wl, eff_mask);
+                    }
+                } else {
+                    is_pal = is_palindromic_canon(fmix64_inv((uint64_t)k), wl, eff_mask);
+                }
+            }
+            if (!is_pal) {
+                uint32_t pos = v >> 1;
+                atomicOr(&ref_unique_bm[pos >> 5], 1U << (pos & 31U));
+            }
+        }
         return;
     }
 
-    uint32_t step = 1;
-    uint32_t hi = i + 1;
+    uint32_t step = 1U;
+    uint32_t hi = i + 1U;
     while (hi < n && keys[hi] == k) {
         step <<= 1;
         uint32_t next = i + step;
@@ -287,7 +366,7 @@ static __global__ void mark_freq_filter_kernel(
     uint32_t lo = i + (step >> 1);
     while (lo < hi) {
         uint32_t mid = lo + ((hi - lo) >> 1);
-        if (keys[mid] == k) lo = mid + 1;
+        if (keys[mid] == k) lo = mid + 1U;
         else hi = mid;
     }
     uint32_t run_end = lo;
@@ -298,7 +377,7 @@ static __global__ void mark_freq_filter_kernel(
         return;
     }
 
-    uint32_t c0 = 0, c1 = 0;
+    uint32_t c0 = 0U, c1 = 0U;
     for (uint32_t m = i; m < run_end; m++) {
         if (vals[m] & 1U) c1++;
         else c0++;
@@ -315,66 +394,78 @@ static __global__ void mark_dropped_bitmap_kernel(
     const uint32_t * __restrict__ vals,
     const uint8_t * __restrict__ keep_flags,
     uint32_t n_valid,
-    uint32_t * __restrict__ dropped_bitmap
+    uint32_t * __restrict__ dropped_bitmap,
+    uint32_t * __restrict__ any_dropped
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_valid) return;
     if (keep_flags[i] == 0) {
         uint32_t pos = vals[i] >> 1;
         atomicOr(&dropped_bitmap[pos >> 5], 1U << (pos & 31U));
+        if (any_dropped && *any_dropped == 0U) {
+            *any_dropped = 1U;
+        }
     }
 }
 
-static __global__ void mark_bucket_starts_and_tags_kernel(
-    const uint64_t * __restrict__ keys,
+/* F15 + F16: Warp-aggregated bucket count kernel via sm_70+ __match_any_sync.
+ * Also writes 32-bit tags and 1-bit ref_unique_bm inline on the zero-drop fast path (freq_limit >= n_valid). */
+template <typename KeyT, bool IS_DIRECT>
+static __global__ void count_kept_per_bucket_kernel(
+    const KeyT * __restrict__ keys,
+    const uint32_t * __restrict__ vals,       /* non-null ONLY when keep_flags == nullptr */
+    const uint8_t * __restrict__ keep_flags,  /* non-null when freq_limit < n_valid */
     uint32_t n,
     int shift_bits,
     int tag_shift,
     uint32_t bucket_base,
-    uint32_t * __restrict__ bucket_off,
-    uint32_t * __restrict__ out_tags
+    int wl,
+    uint64_t eff_mask,
+    uint32_t * __restrict__ bucket_counts,    /* length num_buckets + 1, pre-zeroed */
+    uint32_t * __restrict__ out_tags,         /* non-null ONLY for Hash-CSR && no_freq_drops */
+    uint32_t * __restrict__ ref_unique_bm     /* non-null ONLY for Hash-CSR contiguous && no_freq_drops */
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    uint64_t k = keys[i];
-    out_tags[i] = (uint32_t)(k >> tag_shift);
-    uint32_t b = (uint32_t)(k >> shift_bits) - bucket_base;
-    if (i == 0 || b != ((uint32_t)(keys[i - 1] >> shift_bits) - bucket_base)) {
-        bucket_off[b] = i;
+    if (keep_flags && keep_flags[i] == 0) return;
+
+    KeyT k = keys[i];
+    uint32_t b = IS_DIRECT
+                     ? (uint32_t)k
+                     : ((uint32_t)((uint64_t)k >> shift_bits) - bucket_base);
+
+    uint32_t active = __activemask();
+    uint32_t same = __match_any_sync(active, b);
+    int leader = __ffs(same) - 1;
+    if ((int)(threadIdx.x & 31U) == leader) {
+        atomicAdd(&bucket_counts[b], (uint32_t)__popc(same));
     }
-}
 
-static __global__ void suffix_min_block_kernel(
-    uint32_t * __restrict__ arr,
-    uint32_t n,
-    uint32_t * __restrict__ block_mins
-) {
-    const uint32_t BS = 256;
-    __shared__ uint32_t s[BS];
-    uint32_t idx = blockIdx.x * BS + threadIdx.x;
-    s[threadIdx.x] = (idx < n) ? arr[idx] : 0xFFFFFFFFU;
-    __syncthreads();
-
-    for (uint32_t off = 1; off < BS; off <<= 1) {
-        uint32_t other = (threadIdx.x + off < BS) ? s[threadIdx.x + off] : 0xFFFFFFFFU;
-        __syncthreads();
-        if (other < s[threadIdx.x]) s[threadIdx.x] = other;
-        __syncthreads();
+    if constexpr (!IS_DIRECT) {
+        if (out_tags) {
+            out_tags[i] = (uint32_t)((uint64_t)k >> tag_shift);
+        }
     }
-    if (idx < n) arr[idx] = s[threadIdx.x];
-    if (threadIdx.x == 0) block_mins[blockIdx.x] = s[0];
-}
 
-static __global__ void suffix_min_apply_kernel(
-    uint32_t * __restrict__ arr,
-    uint32_t n,
-    const uint32_t * __restrict__ block_suf_mins,
-    uint32_t num_blocks
-) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n || blockIdx.x + 1 >= num_blocks) return;
-    uint32_t next_min = block_suf_mins[blockIdx.x + 1];
-    if (next_min < arr[idx]) arr[idx] = next_min;
+    if (ref_unique_bm && vals) {
+        if ((i == 0U || keys[i - 1U] != k) && (i + 1U >= n || keys[i + 1U] != k)) {
+            uint32_t v = vals[i];
+            bool is_pal = false;
+            if ((v & 1U) == 0U) {
+                if constexpr (IS_DIRECT) {
+                    if ((wl & 1) == 0) {
+                        is_pal = is_palindromic_canon((uint64_t)k, wl, eff_mask);
+                    }
+                } else {
+                    is_pal = is_palindromic_canon(fmix64_inv((uint64_t)k), wl, eff_mask);
+                }
+            }
+            if (!is_pal) {
+                uint32_t pos = v >> 1;
+                atomicOr(&ref_unique_bm[pos >> 5], 1U << (pos & 31U));
+            }
+        }
+    }
 }
 
 void gpu_build_revcomp_2bit(
@@ -397,26 +488,164 @@ void gpu_build_revcomp_2bit(
 
 uint64_t gpu_count_valid_kmers(
     const GpuSeqView &seqY,
-    int wl
+    int wl,
+    void *&d_cub_temp,
+    size_t &cub_temp_cap,
+    uint32_t *&out_d_chunk_offsets,
+    uint32_t &out_num_chunks
 ) {
+    out_d_chunk_offsets = nullptr;
+    out_num_chunks = 0U;
     uint64_t lenY = seqY.len;
     if (lenY < (uint64_t)wl) return 0ULL;
     uint32_t num_chunks = (uint32_t)((lenY + GECKO_EXTRACT_CHUNK_BP - 1) / GECKO_EXTRACT_CHUNK_BP);
-    if (num_chunks == 0) return 0ULL;
+    if (num_chunks == 0U) return 0ULL;
 
     uint32_t *d_chunk_counts = nullptr;
+    uint32_t *d_chunk_offsets = nullptr;
     CUDA_CHECK_VOID(cudaMalloc(&d_chunk_counts, (size_t)num_chunks * sizeof(uint32_t)));
-    count_valid_kmers_kernel<<<(num_chunks + 255) / 256, 256>>>(
+    CUDA_CHECK_VOID(cudaMalloc(&d_chunk_offsets, (size_t)(num_chunks + 1U) * sizeof(uint32_t)));
+
+    count_valid_kmers_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
         seqY, wl, num_chunks, d_chunk_counts);
     CUDA_CHECK_VOID(cudaGetLastError());
 
-    std::vector<uint32_t> h_counts(num_chunks);
-    CUDA_CHECK_VOID(cudaMemcpy(h_counts.data(), d_chunk_counts, (size_t)num_chunks * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    size_t temp_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes, d_chunk_counts, d_chunk_offsets, (int)num_chunks);
+    gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, temp_bytes);
+    cub::DeviceScan::ExclusiveSum(d_cub_temp, temp_bytes, d_chunk_counts, d_chunk_offsets, (int)num_chunks);
+
+    uint32_t last_off = 0U, last_cnt = 0U;
+    CUDA_CHECK_VOID(cudaMemcpy(&last_off, d_chunk_offsets + (num_chunks - 1U), sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK_VOID(cudaMemcpy(&last_cnt, d_chunk_counts + (num_chunks - 1U), sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    uint32_t total = last_off + last_cnt;
+    CUDA_CHECK_VOID(cudaMemcpy(d_chunk_offsets + num_chunks, &total, sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK_VOID(cudaFree(d_chunk_counts));
 
-    uint64_t total = 0ULL;
-    for (uint32_t c : h_counts) total += (uint64_t)c;
-    return total;
+    out_d_chunk_offsets = d_chunk_offsets;
+    out_num_chunks = num_chunks;
+    return (uint64_t)total;
+}
+
+static inline int compute_slab_sort_end_bit(uint32_t part_start, uint32_t part_end) {
+    if (part_start == 0U && part_end == 256U) return 64;
+    if (part_end <= part_start) return 64;
+    uint32_t diff_mask = part_start ^ (part_end - 1U);
+    int shared_top_bits = (diff_mask == 0U) ? 8 : (__builtin_clz(diff_mask) - 24);
+    if (shared_top_bits < 0) shared_top_bits = 0;
+    if (shared_top_bits > 8) shared_top_bits = 8;
+    return 64 - shared_top_bits;
+}
+
+uint32_t *gpu_build_global_dropped_bitmap(
+    const GpuSeqView &seqY,
+    int wl,
+    uint64_t seed_mask,
+    uint32_t freq_limit,
+    uint32_t num_slabs,
+    void *&d_cub_temp,
+    size_t &cub_temp_cap
+) {
+    uint64_t lenY = seqY.len;
+    if (freq_limit == 0U || lenY < (uint64_t)wl || num_slabs <= 1U) return nullptr;
+
+    uint64_t span_mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
+    uint64_t eff_mask = (seed_mask != 0ULL) ? seed_mask : span_mask;
+    if (eff_mask != span_mask) return nullptr; /* spaced seeds always skip L/R */
+
+    uint32_t num_chunks = (uint32_t)((lenY + GECKO_EXTRACT_CHUNK_BP - 1) / GECKO_EXTRACT_CHUNK_BP);
+    if (num_chunks == 0U) return nullptr;
+
+    size_t bm_words = (size_t)((lenY + 31ULL) / 32ULL) + 2;
+    uint32_t *d_global_bm = nullptr;
+    uint32_t *d_any_dropped = nullptr;
+    CUDA_CHECK_VOID(cudaMalloc(&d_global_bm, bm_words * sizeof(uint32_t)));
+    CUDA_CHECK_VOID(cudaMemset(d_global_bm, 0, bm_words * sizeof(uint32_t)));
+    CUDA_CHECK_VOID(cudaMalloc(&d_any_dropped, sizeof(uint32_t)));
+    CUDA_CHECK_VOID(cudaMemset(d_any_dropped, 0, sizeof(uint32_t)));
+
+    uint32_t *d_chunk_counts = nullptr;
+    uint32_t *d_chunk_offsets = nullptr;
+    CUDA_CHECK_VOID(cudaMalloc(&d_chunk_counts, (size_t)num_chunks * sizeof(uint32_t)));
+    CUDA_CHECK_VOID(cudaMalloc(&d_chunk_offsets, (size_t)(num_chunks + 1U) * sizeof(uint32_t)));
+
+    for (uint32_t slab = 0U; slab < num_slabs; slab++) {
+        uint32_t part_start = (slab * 256U) / num_slabs;
+        uint32_t part_end = ((slab + 1U) * 256U) / num_slabs;
+        if (part_start >= part_end) continue;
+
+        count_valid_kmers_slab_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
+            seqY, wl, eff_mask, part_start, part_end, num_chunks, d_chunk_counts);
+        CUDA_CHECK_VOID(cudaGetLastError());
+
+        size_t scan_bytes = 0;
+        cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_chunk_counts, d_chunk_offsets, (int)num_chunks);
+        gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
+        cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_chunk_counts, d_chunk_offsets, (int)num_chunks);
+
+        uint32_t last_off = 0U, last_cnt = 0U;
+        CUDA_CHECK_VOID(cudaMemcpy(&last_off, d_chunk_offsets + (num_chunks - 1U), sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK_VOID(cudaMemcpy(&last_cnt, d_chunk_counts + (num_chunks - 1U), sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        uint32_t n_valid = last_off + last_cnt;
+        if (n_valid == 0U) continue;
+        CUDA_CHECK_VOID(cudaMemcpy(d_chunk_offsets + num_chunks, &n_valid, sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+        uint64_t *d_keys_a = nullptr, *d_keys_b = nullptr;
+        uint32_t *d_vals_a = nullptr, *d_vals_b = nullptr;
+        CUDA_CHECK_VOID(cudaMalloc(&d_keys_a, (size_t)n_valid * sizeof(uint64_t)));
+        CUDA_CHECK_VOID(cudaMalloc(&d_vals_a, (size_t)n_valid * sizeof(uint32_t)));
+
+        extract_kmers_coalesced_kernel<uint64_t, false><<<num_chunks, 256>>>(
+            seqY, wl, eff_mask, part_start, part_end, d_chunk_offsets, d_keys_a, d_vals_a);
+        CUDA_CHECK_VOID(cudaGetLastError());
+
+        CUDA_CHECK_VOID(cudaMalloc(&d_keys_b, (size_t)n_valid * sizeof(uint64_t)));
+        CUDA_CHECK_VOID(cudaMalloc(&d_vals_b, (size_t)n_valid * sizeof(uint32_t)));
+        cub::DoubleBuffer<uint64_t> db_keys(d_keys_a, d_keys_b);
+        cub::DoubleBuffer<uint32_t> db_vals(d_vals_a, d_vals_b);
+
+        if (n_valid > 1U) {
+            int sort_end_bit = compute_slab_sort_end_bit(part_start, part_end);
+            size_t sort_bytes = 0;
+            cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, db_keys, db_vals, (int)n_valid, 0, sort_end_bit);
+            gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sort_bytes);
+            cub::DeviceRadixSort::SortPairs(d_cub_temp, sort_bytes, db_keys, db_vals, (int)n_valid, 0, sort_end_bit);
+        }
+
+        uint64_t *d_sorted_keys = db_keys.Current();
+        uint32_t *d_sorted_vals = db_vals.Current();
+        CUDA_CHECK_VOID(cudaFree(db_keys.Alternate()));
+        CUDA_CHECK_VOID(cudaFree(db_vals.Alternate()));
+
+        uint8_t *d_keep = nullptr;
+        CUDA_CHECK_VOID(cudaMalloc(&d_keep, (size_t)n_valid * sizeof(uint8_t)));
+        CUDA_CHECK_VOID(cudaMemset(d_keep, 0, (size_t)n_valid * sizeof(uint8_t)));
+
+        mark_freq_filter_kernel<uint64_t, false><<<(n_valid + 255U) / 256U, 256>>>(
+            d_sorted_keys, d_sorted_vals, n_valid, freq_limit, wl, eff_mask, d_keep, nullptr);
+        CUDA_CHECK_VOID(cudaGetLastError());
+
+        mark_dropped_bitmap_kernel<<<(n_valid + 255U) / 256U, 256>>>(
+            d_sorted_vals, d_keep, n_valid, d_global_bm, d_any_dropped);
+        CUDA_CHECK_VOID(cudaGetLastError());
+
+        CUDA_CHECK_VOID(cudaFree(d_keep));
+        CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+        CUDA_CHECK_VOID(cudaFree(d_sorted_vals));
+    }
+
+    CUDA_CHECK_VOID(cudaFree(d_chunk_counts));
+    CUDA_CHECK_VOID(cudaFree(d_chunk_offsets));
+
+    uint32_t h_any_dropped = 0U;
+    CUDA_CHECK_VOID(cudaMemcpy(&h_any_dropped, d_any_dropped, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK_VOID(cudaFree(d_any_dropped));
+
+    if (h_any_dropped == 0U) {
+        CUDA_CHECK_VOID(cudaFree(d_global_bm));
+        return nullptr;
+    }
+    return d_global_bm;
 }
 
 GpuRefIndex gpu_build_ref_index(
@@ -424,177 +653,374 @@ GpuRefIndex gpu_build_ref_index(
     int wl,
     uint64_t seed_mask,
     uint32_t freq_limit,
+    void *&d_cub_temp,
+    size_t &cub_temp_cap,
     uint32_t part_start,
-    uint32_t part_end
+    uint32_t part_end,
+    const uint32_t *precomp_chunk_offsets,
+    uint32_t precomp_n_valid,
+    bool build_dropped_bm
 ) {
     GpuRefIndex idx{};
     idx.part_start = part_start;
     idx.part_end = part_end;
+
+    uint64_t span_mask = (wl == 32) ? ~0ULL : ((1ULL << (2 * wl)) - 1ULL);
+    uint64_t eff_mask = (seed_mask != 0ULL) ? seed_mask : span_mask;
+    bool is_spaced = (eff_mask != span_mask);
     bool part_filter = (part_start != 0U || part_end != 256U);
     uint32_t n_parts = (part_end > part_start) ? (part_end - part_start) : 1U;
-
     uint64_t lenY = seqY.len;
+    idx.has_global_dropped_bm = (!part_filter || freq_limit == 0U || (uint64_t)freq_limit >= lenY);
     uint32_t num_chunks = (uint32_t)((lenY + GECKO_EXTRACT_CHUNK_BP - 1) / GECKO_EXTRACT_CHUNK_BP);
-    uint32_t *d_chunk_counts = nullptr, *d_chunk_offsets = nullptr;
-    CUDA_CHECK_VOID(cudaMalloc(&d_chunk_counts, (size_t)(num_chunks > 0 ? num_chunks : 1) * sizeof(uint32_t)));
-    CUDA_CHECK_VOID(cudaMalloc(&d_chunk_offsets, (size_t)(num_chunks + 1) * sizeof(uint32_t)));
 
-    void *d_cub_temp = nullptr;
-    size_t cub_temp_cap = 0;
-    auto ensure_idx_temp = [&](size_t needed) {
-        if (needed <= cub_temp_cap) return;
-        if (d_cub_temp) {
-            CUDA_CHECK_VOID(cudaFree(d_cub_temp));
-            d_cub_temp = nullptr;
-            cub_temp_cap = 0;
-        }
-        CUDA_CHECK_VOID(cudaMalloc(&d_cub_temp, needed));
-        cub_temp_cap = needed;
-    };
+    const uint32_t *d_chunk_offsets_ro = nullptr;
+    uint32_t *d_chunk_offsets_owned = nullptr;
 
-    if (num_chunks > 0) {
+    if (precomp_chunk_offsets != nullptr && !part_filter) {
+        d_chunk_offsets_ro = precomp_chunk_offsets;
+        idx.n_valid = precomp_n_valid;
+    } else if (num_chunks > 0U) {
+        uint32_t *d_chunk_counts = nullptr;
+        CUDA_CHECK_VOID(cudaMalloc(&d_chunk_counts, (size_t)num_chunks * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMalloc(&d_chunk_offsets_owned, (size_t)(num_chunks + 1U) * sizeof(uint32_t)));
+
         if (part_filter) {
-            count_valid_kmers_slab_kernel<<<(num_chunks + 255) / 256, 256>>>(
-                seqY, wl, seed_mask, part_start, part_end, num_chunks, d_chunk_counts);
+            count_valid_kmers_slab_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
+                seqY, wl, eff_mask, part_start, part_end, num_chunks, d_chunk_counts);
         } else {
-            count_valid_kmers_kernel<<<(num_chunks + 255) / 256, 256>>>(
+            count_valid_kmers_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
                 seqY, wl, num_chunks, d_chunk_counts);
         }
         CUDA_CHECK_VOID(cudaGetLastError());
 
-        size_t temp_bytes = 0;
-        cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes, d_chunk_counts, d_chunk_offsets, num_chunks);
-        ensure_idx_temp(temp_bytes);
-        cub::DeviceScan::ExclusiveSum(d_cub_temp, temp_bytes, d_chunk_counts, d_chunk_offsets, num_chunks);
+        size_t scan_bytes = 0;
+        cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_chunk_counts, d_chunk_offsets_owned, (int)num_chunks);
+        gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
+        cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_chunk_counts, d_chunk_offsets_owned, (int)num_chunks);
 
-        uint32_t last_off = 0, last_cnt = 0;
-        CUDA_CHECK_VOID(cudaMemcpy(&last_off, d_chunk_offsets + (num_chunks - 1), sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK_VOID(cudaMemcpy(&last_cnt, d_chunk_counts + (num_chunks - 1), sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        uint32_t last_off = 0U, last_cnt = 0U;
+        CUDA_CHECK_VOID(cudaMemcpy(&last_off, d_chunk_offsets_owned + (num_chunks - 1U), sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK_VOID(cudaMemcpy(&last_cnt, d_chunk_counts + (num_chunks - 1U), sizeof(uint32_t), cudaMemcpyDeviceToHost));
         idx.n_valid = last_off + last_cnt;
+        CUDA_CHECK_VOID(cudaMemcpy(d_chunk_offsets_owned + num_chunks, &idx.n_valid, sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK_VOID(cudaFree(d_chunk_counts));
+        d_chunk_offsets_ro = d_chunk_offsets_owned;
     }
-    CUDA_CHECK_VOID(cudaFree(d_chunk_counts));
 
-    size_t n_alloc = (idx.n_valid > 0) ? (size_t)idx.n_valid : 1;
+    /* Empty sequence / slab / freq_limit == 0 fast exit (count <= 0 => 0 k-mers kept) */
+    if (freq_limit == 0U || idx.n_valid == 0U) {
+        if (d_chunk_offsets_owned) CUDA_CHECK_VOID(cudaFree(d_chunk_offsets_owned));
+        int bucket_bits = 14;
+        uint32_t sub_bits = (uint32_t)(bucket_bits - 8);
+        uint32_t bucket_base = part_start << sub_bits;
+        uint32_t num_buckets = n_parts << sub_bits;
+        CUDA_CHECK_VOID(cudaMalloc(&idx.d_bucket_off, (size_t)(num_buckets + 1U) * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMemset(idx.d_bucket_off, 0, (size_t)(num_buckets + 1U) * sizeof(uint32_t)));
+        idx.d_tags = nullptr;
+        idx.d_vals = nullptr;
+        idx.d_ref_unique_bm = nullptr;
+        idx.d_dropped_bitmap = nullptr;
+        idx.owns_dropped_bitmap = false;
+        idx.has_global_dropped_bm = true;
+        idx.n_kept = 0U;
+        idx.num_buckets = num_buckets;
+        idx.bucket_bits = bucket_bits;
+        idx.shift_bits = 64 - bucket_bits;
+        idx.tag_shift = idx.shift_bits - 32;
+        idx.bucket_base = bucket_base;
+        idx.is_direct_csr = false;
+        return idx;
+    }
+
+    bool no_freq_drops = (freq_limit >= idx.n_valid);
+
+    /* F14: Direct-CSR for contiguous wl in 8..=12 (single-slab, non-empty).
+     * Never check seed_mask == 0ULL (bridge normalizes seed_mask = span_mask)! */
+    bool is_direct = !is_spaced && !part_filter && idx.n_valid > 0U
+                     && wl >= 8 && wl <= 12
+                     && (wl <= 10 || ((1ULL << (2 * wl)) <= 4ULL * (uint64_t)idx.n_valid));
+
+    if (is_direct) {
+        size_t n_alloc = (size_t)idx.n_valid;
+        uint32_t *d_keys_a = nullptr, *d_keys_b = nullptr;
+        uint32_t *d_vals_a = nullptr, *d_vals_b = nullptr;
+        CUDA_CHECK_VOID(cudaMalloc(&d_keys_a, n_alloc * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMalloc(&d_vals_a, n_alloc * sizeof(uint32_t)));
+
+        extract_kmers_coalesced_kernel<uint32_t, true><<<num_chunks, 256>>>(
+            seqY, wl, eff_mask, 0U, 256U, d_chunk_offsets_ro, d_keys_a, d_vals_a);
+        CUDA_CHECK_VOID(cudaGetLastError());
+        if (d_chunk_offsets_owned) {
+            CUDA_CHECK_VOID(cudaFree(d_chunk_offsets_owned));
+            d_chunk_offsets_owned = nullptr;
+        }
+
+        CUDA_CHECK_VOID(cudaMalloc(&d_keys_b, n_alloc * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMalloc(&d_vals_b, n_alloc * sizeof(uint32_t)));
+        cub::DoubleBuffer<uint32_t> db_keys(d_keys_a, d_keys_b);
+        cub::DoubleBuffer<uint32_t> db_vals(d_vals_a, d_vals_b);
+
+        if (idx.n_valid > 1U) {
+            size_t sort_bytes = 0;
+            cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, db_keys, db_vals, (int)idx.n_valid, 0, 2 * wl);
+            gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sort_bytes);
+            cub::DeviceRadixSort::SortPairs(d_cub_temp, sort_bytes, db_keys, db_vals, (int)idx.n_valid, 0, 2 * wl);
+        }
+
+        uint32_t *d_sorted_keys = db_keys.Current();
+        uint32_t *d_sorted_vals = db_vals.Current();
+        uint32_t *d_alt_vals = db_vals.Alternate();
+        CUDA_CHECK_VOID(cudaFree(db_keys.Alternate()));
+
+        uint32_t num_buckets = 1U << (2 * wl);
+        uint32_t *d_bucket_off = nullptr;
+        CUDA_CHECK_VOID(cudaMalloc(&d_bucket_off, (size_t)(num_buckets + 1U) * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMemset(d_bucket_off, 0, (size_t)(num_buckets + 1U) * sizeof(uint32_t)));
+
+        uint32_t *d_final_vals = nullptr;
+        if (!no_freq_drops) {
+            uint8_t *d_keep = nullptr;
+            uint32_t *d_num_out = nullptr;
+            CUDA_CHECK_VOID(cudaMalloc(&d_keep, n_alloc * sizeof(uint8_t)));
+            CUDA_CHECK_VOID(cudaMemset(d_keep, 0, n_alloc * sizeof(uint8_t)));
+            CUDA_CHECK_VOID(cudaMalloc(&d_num_out, sizeof(uint32_t)));
+
+            mark_freq_filter_kernel<uint32_t, true><<<(idx.n_valid + 255U) / 256U, 256>>>(
+                d_sorted_keys, d_sorted_vals, idx.n_valid, freq_limit, wl, eff_mask, d_keep, nullptr);
+            CUDA_CHECK_VOID(cudaGetLastError());
+
+            size_t sel_bytes = 0;
+            cub::DeviceSelect::Flagged(nullptr, sel_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
+            gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sel_bytes);
+            cub::DeviceSelect::Flagged(d_cub_temp, sel_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
+            CUDA_CHECK_VOID(cudaMemcpy(&idx.n_kept, d_num_out, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+            if (build_dropped_bm && idx.n_kept < idx.n_valid && lenY > 0ULL) {
+                size_t bm_words = (size_t)((lenY + 31ULL) / 32ULL) + 2;
+                CUDA_CHECK_VOID(cudaMalloc(&idx.d_dropped_bitmap, bm_words * sizeof(uint32_t)));
+                CUDA_CHECK_VOID(cudaMemset(idx.d_dropped_bitmap, 0, bm_words * sizeof(uint32_t)));
+                idx.owns_dropped_bitmap = true;
+                mark_dropped_bitmap_kernel<<<(idx.n_valid + 255U) / 256U, 256>>>(
+                    d_sorted_vals, d_keep, idx.n_valid, idx.d_dropped_bitmap, nullptr);
+                CUDA_CHECK_VOID(cudaGetLastError());
+            }
+
+            CUDA_CHECK_VOID(cudaFree(d_sorted_vals));
+            CUDA_CHECK_VOID(cudaFree(d_num_out));
+            d_final_vals = d_alt_vals;
+
+            if (idx.n_kept > 0U) {
+                count_kept_per_bucket_kernel<uint32_t, true><<<(idx.n_valid + 255U) / 256U, 256>>>(
+                    d_sorted_keys, nullptr, d_keep, idx.n_valid,
+                    0, 0, 0U, wl, eff_mask, d_bucket_off, nullptr, nullptr);
+                CUDA_CHECK_VOID(cudaGetLastError());
+                CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+                CUDA_CHECK_VOID(cudaFree(d_keep));
+
+                size_t scan_bytes = 0;
+                cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+                gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
+                cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+            } else {
+                CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+                CUDA_CHECK_VOID(cudaFree(d_keep));
+            }
+        } else {
+            CUDA_CHECK_VOID(cudaFree(d_alt_vals));
+            d_final_vals = d_sorted_vals;
+            idx.n_kept = idx.n_valid;
+
+            count_kept_per_bucket_kernel<uint32_t, true><<<(idx.n_valid + 255U) / 256U, 256>>>(
+                d_sorted_keys, nullptr, nullptr, idx.n_valid,
+                0, 0, 0U, wl, eff_mask, d_bucket_off, nullptr, nullptr);
+            CUDA_CHECK_VOID(cudaGetLastError());
+            CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+
+            size_t scan_bytes = 0;
+            cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+            gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
+            cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+        }
+
+        idx.d_tags = nullptr;
+        idx.d_vals = d_final_vals;
+        idx.d_bucket_off = d_bucket_off;
+        idx.d_ref_unique_bm = nullptr;
+        idx.num_buckets = num_buckets;
+        idx.bucket_bits = 2 * wl;
+        idx.shift_bits = 0;
+        idx.tag_shift = 0;
+        idx.bucket_base = 0U;
+        idx.is_direct_csr = true;
+        return idx;
+    }
+
+    /* ---- Hash-CSR Path (uint64_t keys, 32-bit tags, F16 ref_unique_bm) ---- */
+    size_t n_alloc = (size_t)idx.n_valid;
     uint64_t *d_keys_a = nullptr, *d_keys_b = nullptr;
     uint32_t *d_vals_a = nullptr, *d_vals_b = nullptr;
     CUDA_CHECK_VOID(cudaMalloc(&d_keys_a, n_alloc * sizeof(uint64_t)));
     CUDA_CHECK_VOID(cudaMalloc(&d_vals_a, n_alloc * sizeof(uint32_t)));
 
-    if (idx.n_valid > 0) {
-        extract_kmers_kernel<<<(num_chunks + 255) / 256, 256>>>(
-            seqY, wl, seed_mask, part_start, part_end, num_chunks, d_chunk_offsets, d_keys_a, d_vals_a);
-        CUDA_CHECK_VOID(cudaGetLastError());
+    extract_kmers_coalesced_kernel<uint64_t, false><<<num_chunks, 256>>>(
+        seqY, wl, eff_mask, part_start, part_end, d_chunk_offsets_ro, d_keys_a, d_vals_a);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    if (d_chunk_offsets_owned) {
+        CUDA_CHECK_VOID(cudaFree(d_chunk_offsets_owned));
+        d_chunk_offsets_owned = nullptr;
     }
-    CUDA_CHECK_VOID(cudaFree(d_chunk_offsets));
 
     CUDA_CHECK_VOID(cudaMalloc(&d_keys_b, n_alloc * sizeof(uint64_t)));
     CUDA_CHECK_VOID(cudaMalloc(&d_vals_b, n_alloc * sizeof(uint32_t)));
     cub::DoubleBuffer<uint64_t> db_keys(d_keys_a, d_keys_b);
     cub::DoubleBuffer<uint32_t> db_vals(d_vals_a, d_vals_b);
 
-    if (idx.n_valid > 1) {
-        size_t temp_bytes = 0;
-        cub::DeviceRadixSort::SortPairs(nullptr, temp_bytes, db_keys, db_vals, (int)idx.n_valid);
-        ensure_idx_temp(temp_bytes);
-        cub::DeviceRadixSort::SortPairs(d_cub_temp, temp_bytes, db_keys, db_vals, (int)idx.n_valid);
+    if (idx.n_valid > 1U) {
+        int sort_end_bit = compute_slab_sort_end_bit(part_start, part_end);
+        size_t sort_bytes = 0;
+        cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, db_keys, db_vals, (int)idx.n_valid, 0, sort_end_bit);
+        gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sort_bytes);
+        cub::DeviceRadixSort::SortPairs(d_cub_temp, sort_bytes, db_keys, db_vals, (int)idx.n_valid, 0, sort_end_bit);
     }
 
     uint64_t *d_sorted_keys = db_keys.Current();
     uint32_t *d_sorted_vals = db_vals.Current();
-    uint64_t *d_alt_keys = db_keys.Alternate();
     uint32_t *d_alt_vals = db_vals.Alternate();
+    /* F15: Free alternate 64-bit key buffer immediately — we NEVER compact 64-bit keys! */
+    CUDA_CHECK_VOID(cudaFree(db_keys.Alternate()));
 
-    idx.n_kept = idx.n_valid;
-    if (freq_limit > 0 && idx.n_valid > 0) {
+    /* F16: Allocate 1-bit unique non-palindromic ref k-mer bitmap for contiguous Hash-CSR */
+    if (!is_spaced && lenY > 0ULL) {
+        size_t bm_words = (size_t)((lenY + 31ULL) / 32ULL) + 2;
+        CUDA_CHECK_VOID(cudaMalloc(&idx.d_ref_unique_bm, bm_words * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMemset(idx.d_ref_unique_bm, 0, bm_words * sizeof(uint32_t)));
+    }
+
+    uint32_t *d_final_vals = nullptr;
+    uint32_t *d_bucket_off = nullptr;
+    uint32_t *d_tags = nullptr;
+    int bucket_bits = 14;
+    uint32_t num_buckets = 0U;
+    int shift_bits = 0;
+    int tag_shift = 0;
+    uint32_t bucket_base = 0U;
+
+    if (!no_freq_drops) {
         uint8_t *d_keep = nullptr;
         uint32_t *d_num_out = nullptr;
         CUDA_CHECK_VOID(cudaMalloc(&d_keep, n_alloc * sizeof(uint8_t)));
         CUDA_CHECK_VOID(cudaMemset(d_keep, 0, n_alloc * sizeof(uint8_t)));
         CUDA_CHECK_VOID(cudaMalloc(&d_num_out, sizeof(uint32_t)));
 
-        mark_freq_filter_kernel<<<(idx.n_valid + 255) / 256, 256>>>(
-            d_sorted_keys, d_sorted_vals, idx.n_valid, freq_limit, d_keep);
+        mark_freq_filter_kernel<uint64_t, false><<<(idx.n_valid + 255U) / 256U, 256>>>(
+            d_sorted_keys, d_sorted_vals, idx.n_valid, freq_limit, wl, eff_mask,
+            d_keep, idx.d_ref_unique_bm);
+        CUDA_CHECK_VOID(cudaGetLastError());
 
-        size_t temp_bytes = 0, temp_bytes2 = 0;
-        cub::DeviceSelect::Flagged(nullptr, temp_bytes, d_sorted_keys, d_keep, d_alt_keys, d_num_out, (int)idx.n_valid);
-        cub::DeviceSelect::Flagged(nullptr, temp_bytes2, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
-        size_t need_sel = (temp_bytes2 > temp_bytes) ? temp_bytes2 : temp_bytes;
-        ensure_idx_temp(need_sel);
-        cub::DeviceSelect::Flagged(d_cub_temp, temp_bytes, d_sorted_keys, d_keep, d_alt_keys, d_num_out, (int)idx.n_valid);
-        cub::DeviceSelect::Flagged(d_cub_temp, temp_bytes2, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
+        size_t sel_val_bytes = 0;
+        cub::DeviceSelect::Flagged(nullptr, sel_val_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
+        gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sel_val_bytes);
+        cub::DeviceSelect::Flagged(d_cub_temp, sel_val_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
         CUDA_CHECK_VOID(cudaMemcpy(&idx.n_kept, d_num_out, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-        /* Dropped-position bitmap is only used for single-slab left/right-maximal skipping. */
-        if (!part_filter && idx.n_kept < idx.n_valid && lenY > 0) {
-            size_t bitmap_words = (size_t)((lenY + 31ULL) / 32ULL);
-            CUDA_CHECK_VOID(cudaMalloc(&idx.d_dropped_bitmap, bitmap_words * sizeof(uint32_t)));
-            CUDA_CHECK_VOID(cudaMemset(idx.d_dropped_bitmap, 0, bitmap_words * sizeof(uint32_t)));
-            mark_dropped_bitmap_kernel<<<(idx.n_valid + 255) / 256, 256>>>(
-                d_sorted_vals, d_keep, idx.n_valid, idx.d_dropped_bitmap);
+        if (build_dropped_bm && !part_filter && idx.n_kept < idx.n_valid && lenY > 0ULL) {
+            size_t bm_words = (size_t)((lenY + 31ULL) / 32ULL) + 2;
+            CUDA_CHECK_VOID(cudaMalloc(&idx.d_dropped_bitmap, bm_words * sizeof(uint32_t)));
+            CUDA_CHECK_VOID(cudaMemset(idx.d_dropped_bitmap, 0, bm_words * sizeof(uint32_t)));
+            idx.owns_dropped_bitmap = true;
+            mark_dropped_bitmap_kernel<<<(idx.n_valid + 255U) / 256U, 256>>>(
+                d_sorted_vals, d_keep, idx.n_valid, idx.d_dropped_bitmap, nullptr);
             CUDA_CHECK_VOID(cudaGetLastError());
         }
 
-        CUDA_CHECK_VOID(cudaFree(d_keep));
-        CUDA_CHECK_VOID(cudaFree(d_num_out));
-        std::swap(d_sorted_keys, d_alt_keys);
-        std::swap(d_sorted_vals, d_alt_vals);
-    }
-    if (d_cub_temp) CUDA_CHECK_VOID(cudaFree(d_cub_temp));
-    CUDA_CHECK_VOID(cudaFree(d_alt_keys));
-    CUDA_CHECK_VOID(cudaFree(d_alt_vals));
+        /* Release uncompacted vals BEFORE allocating d_bucket_off & d_tags */
+        CUDA_CHECK_VOID(cudaFree(d_sorted_vals));
+        d_final_vals = d_alt_vals;
 
-    /* Scale n_kept to its 256-partition equivalent so bucket load stays ~3-4 entries in slab mode,
-     * while allocating only n_parts << (bucket_bits - 8) buckets starting at bucket_base. */
-    uint64_t equiv_kept = ((uint64_t)idx.n_kept * 256ULL) / (uint64_t)n_parts;
-    int bucket_bits = 14;
-    while (bucket_bits < 26 && (1ULL << bucket_bits) * 4ULL < equiv_kept) bucket_bits++;
-    uint32_t sub_bits = (uint32_t)(bucket_bits - 8);
-    uint32_t bucket_base = part_start << sub_bits;
-    uint32_t num_buckets = n_parts << sub_bits;
-    int shift_bits = 64 - bucket_bits;
-    int tag_shift = shift_bits - 32; /* always >= 6 since bucket_bits <= 26 */
+        uint64_t equiv_kept = ((uint64_t)idx.n_kept * 256ULL) / (uint64_t)n_parts;
+        while (bucket_bits < 26 && (1ULL << bucket_bits) * 4ULL < equiv_kept) bucket_bits++;
+        uint32_t sub_bits = (uint32_t)(bucket_bits - 8);
+        bucket_base = part_start << sub_bits;
+        num_buckets = n_parts << sub_bits;
+        shift_bits = 64 - bucket_bits;
+        tag_shift = shift_bits - 32;
 
-    uint32_t *d_bucket_off = nullptr;
-    CUDA_CHECK_VOID(cudaMalloc(&d_bucket_off, (size_t)(num_buckets + 1) * sizeof(uint32_t)));
-    CUDA_CHECK_VOID(cudaMemset(d_bucket_off, 0xFF, (size_t)num_buckets * sizeof(uint32_t)));
-    CUDA_CHECK_VOID(cudaMemcpy(d_bucket_off + num_buckets, &idx.n_kept, sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK_VOID(cudaMalloc(&d_bucket_off, (size_t)(num_buckets + 1U) * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMemset(d_bucket_off, 0, (size_t)(num_buckets + 1U) * sizeof(uint32_t)));
+        size_t tag_alloc = (idx.n_kept > 0U) ? (size_t)idx.n_kept : 1;
+        CUDA_CHECK_VOID(cudaMalloc(&d_tags, tag_alloc * sizeof(uint32_t)));
 
-    uint32_t *d_tags = nullptr;
-    size_t tag_alloc = (idx.n_kept > 0) ? (size_t)idx.n_kept : 1;
-    CUDA_CHECK_VOID(cudaMalloc(&d_tags, tag_alloc * sizeof(uint32_t)));
+        if (idx.n_kept > 0U) {
+            cub::TransformInputIterator<uint32_t, ExtractTagOp, const uint64_t *> tag_iter(
+                d_sorted_keys, ExtractTagOp{tag_shift});
+            size_t sel_tag_bytes = 0;
+            cub::DeviceSelect::Flagged(nullptr, sel_tag_bytes, tag_iter, d_keep, d_tags, d_num_out, (int)idx.n_valid);
+            gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sel_tag_bytes);
+            cub::DeviceSelect::Flagged(d_cub_temp, sel_tag_bytes, tag_iter, d_keep, d_tags, d_num_out, (int)idx.n_valid);
 
-    if (idx.n_kept > 0) {
-        mark_bucket_starts_and_tags_kernel<<<(idx.n_kept + 255) / 256, 256>>>(
-            d_sorted_keys, idx.n_kept, shift_bits, tag_shift, bucket_base, d_bucket_off, d_tags);
-        CUDA_CHECK_VOID(cudaGetLastError());
+            count_kept_per_bucket_kernel<uint64_t, false><<<(idx.n_valid + 255U) / 256U, 256>>>(
+                d_sorted_keys, nullptr, d_keep, idx.n_valid,
+                shift_bits, tag_shift, bucket_base, wl, eff_mask,
+                d_bucket_off, nullptr, nullptr);
+            CUDA_CHECK_VOID(cudaGetLastError());
 
-        uint32_t n_b_blocks = (num_buckets + 1 + 255) / 256;
-        uint32_t *d_block_mins = nullptr;
-        CUDA_CHECK_VOID(cudaMalloc(&d_block_mins, (size_t)n_b_blocks * sizeof(uint32_t)));
-        suffix_min_block_kernel<<<n_b_blocks, 256>>>(d_bucket_off, num_buckets + 1, d_block_mins);
+            CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+            CUDA_CHECK_VOID(cudaFree(d_keep));
+            CUDA_CHECK_VOID(cudaFree(d_num_out));
 
-        std::vector<uint32_t> h_bmins(n_b_blocks);
-        CUDA_CHECK_VOID(cudaMemcpy(h_bmins.data(), d_block_mins, (size_t)n_b_blocks * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        for (int64_t bi = (int64_t)n_b_blocks - 2; bi >= 0; bi--) {
-            if (h_bmins[bi + 1] < h_bmins[bi]) h_bmins[bi] = h_bmins[bi + 1];
+            size_t scan_bytes = 0;
+            cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+            gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
+            cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+        } else {
+            CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+            CUDA_CHECK_VOID(cudaFree(d_keep));
+            CUDA_CHECK_VOID(cudaFree(d_num_out));
+            if (idx.d_ref_unique_bm) {
+                CUDA_CHECK_VOID(cudaFree(idx.d_ref_unique_bm));
+                idx.d_ref_unique_bm = nullptr;
+            }
         }
-        CUDA_CHECK_VOID(cudaMemcpy(d_block_mins, h_bmins.data(), (size_t)n_b_blocks * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        suffix_min_apply_kernel<<<n_b_blocks, 256>>>(d_bucket_off, num_buckets + 1, d_block_mins, n_b_blocks);
-        CUDA_CHECK_VOID(cudaFree(d_block_mins));
     } else {
-        CUDA_CHECK_VOID(cudaMemset(d_bucket_off, 0, (size_t)(num_buckets + 1) * sizeof(uint32_t)));
-    }
+        CUDA_CHECK_VOID(cudaFree(d_alt_vals));
+        d_final_vals = d_sorted_vals;
+        idx.n_kept = idx.n_valid;
 
-    /* Free 64-bit keys immediately — steady-state VRAM stores only 32-bit tags (~50% smaller) */
-    CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+        uint64_t equiv_kept = ((uint64_t)idx.n_kept * 256ULL) / (uint64_t)n_parts;
+        while (bucket_bits < 26 && (1ULL << bucket_bits) * 4ULL < equiv_kept) bucket_bits++;
+        uint32_t sub_bits = (uint32_t)(bucket_bits - 8);
+        bucket_base = part_start << sub_bits;
+        num_buckets = n_parts << sub_bits;
+        shift_bits = 64 - bucket_bits;
+        tag_shift = shift_bits - 32;
+
+        CUDA_CHECK_VOID(cudaMalloc(&d_bucket_off, (size_t)(num_buckets + 1U) * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMemset(d_bucket_off, 0, (size_t)(num_buckets + 1U) * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMalloc(&d_tags, (size_t)idx.n_kept * sizeof(uint32_t)));
+
+        count_kept_per_bucket_kernel<uint64_t, false><<<(idx.n_valid + 255U) / 256U, 256>>>(
+            d_sorted_keys, d_final_vals, nullptr, idx.n_valid,
+            shift_bits, tag_shift, bucket_base, wl, eff_mask,
+            d_bucket_off, d_tags, idx.d_ref_unique_bm);
+        CUDA_CHECK_VOID(cudaGetLastError());
+        CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+
+        size_t scan_bytes = 0;
+        cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+        gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
+        cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+    }
 
     idx.d_tags = d_tags;
-    idx.d_vals = d_sorted_vals;
+    idx.d_vals = d_final_vals;
     idx.d_bucket_off = d_bucket_off;
+    idx.num_buckets = num_buckets;
     idx.bucket_bits = bucket_bits;
     idx.shift_bits = shift_bits;
     idx.tag_shift = tag_shift;
     idx.bucket_base = bucket_base;
+    idx.is_direct_csr = false;
     return idx;
 }
 
@@ -602,6 +1028,7 @@ void gpu_free_ref_index(GpuRefIndex &idx) {
     if (idx.d_tags) CUDA_CHECK_VOID(cudaFree(idx.d_tags));
     if (idx.d_vals) CUDA_CHECK_VOID(cudaFree(idx.d_vals));
     if (idx.d_bucket_off) CUDA_CHECK_VOID(cudaFree(idx.d_bucket_off));
-    if (idx.d_dropped_bitmap) CUDA_CHECK_VOID(cudaFree(idx.d_dropped_bitmap));
+    if (idx.owns_dropped_bitmap && idx.d_dropped_bitmap) CUDA_CHECK_VOID(cudaFree(idx.d_dropped_bitmap));
+    if (idx.d_ref_unique_bm) CUDA_CHECK_VOID(cudaFree(idx.d_ref_unique_bm));
     idx = {};
 }

@@ -116,9 +116,8 @@ pub fn resolve_backend(
     config: &CompareConfig,
     cache_dir: Option<&Path>,
 ) -> Result<SelectedBackend> {
-    let gpu_eligible = cache_dir.is_none()
-        && (8..=32).contains(&config.word_length)
-        && config.two_hit_window.is_none();
+    let cuda_eligible = cache_dir.is_none() && (8..=32).contains(&config.word_length);
+    let wgpu_eligible = cuda_eligible && config.two_hit_window.is_none();
     match requested {
         BackendArg::Cpu => Ok(SelectedBackend::Cpu),
         BackendArg::Cuda => {
@@ -130,9 +129,6 @@ pub fn resolve_backend(
                     "CUDA backend requires word_length in 8..=32 (got {}); use --backend cpu",
                     config.word_length
                 );
-            }
-            if config.two_hit_window.is_some() {
-                bail!("--two-hit is currently supported on `--backend cpu`");
             }
             Ok(SelectedBackend::Cuda)
         }
@@ -147,18 +143,16 @@ pub fn resolve_backend(
                 );
             }
             if config.two_hit_window.is_some() {
-                bail!("--two-hit is currently supported on `--backend cpu`");
+                bail!("--two-hit is currently supported on `--backend cpu` and `--backend cuda`");
             }
             Ok(SelectedBackend::Wgpu)
         }
         BackendArg::Auto => {
-            if gpu_eligible {
-                if probe_cuda_info().is_ok() {
-                    return Ok(SelectedBackend::Cuda);
-                }
-                if probe_wgpu_info(allow_software_gpu).is_ok() {
-                    return Ok(SelectedBackend::Wgpu);
-                }
+            if cuda_eligible && probe_cuda_info().is_ok() {
+                return Ok(SelectedBackend::Cuda);
+            }
+            if wgpu_eligible && probe_wgpu_info(allow_software_gpu).is_ok() {
+                return Ok(SelectedBackend::Wgpu);
             }
             Ok(SelectedBackend::Cpu)
         }
@@ -174,7 +168,10 @@ pub fn run_compare_from_paths(
     requested: BackendArg,
     allow_software_gpu: bool,
 ) -> Result<BackendRunOutput> {
+    let prof = gecko_core::profile_enabled();
+    let t_res = prof.then(Instant::now);
     let selected = resolve_backend(requested, allow_software_gpu, config, cache_dir)?;
+    let resolve_ms = t_res.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
     match selected {
         SelectedBackend::Cuda => {
@@ -184,6 +181,12 @@ pub fn run_compare_from_paths(
                 let (query, reference, result, info) =
                     gecko_cuda::compare_cuda_paths_overlapped(query_path, ref_path, config)?;
                 let total_compute = t0.elapsed().as_secs_f64();
+                if prof {
+                    eprintln!(
+                        "[gecko-cuda-profile] cli_dispatch resolve_ms={resolve_ms:.2} total_comp_ms={:.2}",
+                        total_compute * 1000.0
+                    );
+                }
                 let label = format!(
                     "cuda ({}, SM {}.{})",
                     info.name, info.sm_major, info.sm_minor
@@ -199,6 +202,7 @@ pub fn run_compare_from_paths(
             }
             #[cfg(not(feature = "cuda"))]
             {
+                let _ = (prof, resolve_ms);
                 bail!("CUDA backend not compiled in (rebuild with `--features cuda`)");
             }
         }

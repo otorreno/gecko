@@ -34,11 +34,10 @@ pub fn profile_enabled() -> bool {
     })
 }
 
-/// CPU seeding mechanism selection (`--seeding exact|minimizer|auto`).
+/// CPU/CUDA seeding mechanism selection (`--seeding exact|minimizer|auto`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SeedingMode {
     /// Stride-1 exact canonical `RefIndex` seeding (Direct-CSR / Hash-CSR).
-    #[default]
     Exact,
     /// Shift-invariant canonical minimizer super-seeding ($k' < k, w = k - k' + 1$) with exact-$k$
     /// verification and exact `freq_limit` resolution for contiguous $k \ge 18$ (falls back to
@@ -46,6 +45,7 @@ pub enum SeedingMode {
     Minimizer,
     /// Automatically select `Minimizer` for contiguous $k \ge 18$ (without spaced seeds,
     /// `--two-hit`, or `.gidx` caching) and `Exact` otherwise.
+    #[default]
     Auto,
 }
 
@@ -98,7 +98,7 @@ impl Default for CompareConfig {
             memory_budget: 2 * 1024 * 1024 * 1024,
             compare_reverse: true,
             scoring: Scoring::default(),
-            seeding_mode: SeedingMode::Exact,
+            seeding_mode: SeedingMode::Auto,
             two_hit_window: None,
             collect_coverage: true,
         }
@@ -1382,6 +1382,7 @@ mod tests {
                     min_similarity: 60.0,
                     freq_limit: 20,
                     compare_reverse,
+                    seeding_mode: SeedingMode::Exact,
                     ..Default::default()
                 };
                 let single = compare_genomes(&q, &r, &cfg, None).unwrap();

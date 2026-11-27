@@ -1,11 +1,12 @@
 /*
  * cuda_index.cu
  *
- * Stage 1: Word-level 2-bit GPU reverse-complement generation, CTA-cooperative
- * coalesced 2-bit canonical k-mer extraction (Direct-CSR uint32_t for wl <= 12
- * and Hash-CSR uint64_t), bit-bounded CUB DeviceRadixSort::SortPairs, exact
- * per-strand freq_limit compaction + global/single-slab 1-bit dropped bitmap,
- * inline 1-bit unique non-palindromic ref k-mer bitmap (F16), fused
+ * Stage 1: Word-level 2-bit GPU reverse-complement generation, warp-cooperative
+ * GPU run-to-bitmap materialization (W3-F12b), CTA-cooperative coalesced 2-bit
+ * canonical k-mer extraction (Direct-CSR uint32_t for wl <= 12 and Hash-CSR
+ * uint64_t), bit-bounded CUB DeviceRadixSort::SortPairs, exact per-strand
+ * freq_limit compaction + fused word-coalesced 1-bit dropped bitmap + inverted
+ * 1-bit non-unique/palindromic ref k-mer bitmap (W3-F13a), fused
  * thrust::transform_iterator tag selection, and warp-aggregated pure-GPU CSR scan.
  */
 
@@ -66,6 +67,55 @@ static __global__ void rev_bitmap_kernel(
         uint32_t rem = (uint32_t)(len & 31ULL);
         uint32_t fwd = __ldg(&src_bm[0]);
         dst_bm[w] = __brev(fwd) >> (32U - rem);
+    }
+}
+
+/* W3-F12b: Warp-cooperative GPU run-to-bitmap kernel.
+ * Boundary partial words use atomicOr; strictly interior words belong exclusively
+ * to this run (32-bp aligned splits + disjoint sorted runs) and use direct 0xFFFFFFFFU
+ * stores. Long runs (> 16 interior words) are filled cooperatively across all 32 warp lanes. */
+static __global__ void fill_runs_bitmap_kernel(
+    const GeckoRun * __restrict__ runs,
+    uint32_t n_runs,
+    uint32_t len,
+    uint32_t * __restrict__ bm
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t inner_lo = 0U, inner_hi = 0U;
+    bool has_long = false;
+
+    if (idx < n_runs) {
+        GeckoRun r = runs[idx];
+        uint32_t w_s, mask_s, w_e, mask_e;
+        if (gecko_run_word_span(r.start, r.end, len,
+                                w_s, mask_s, w_e, mask_e, inner_lo, inner_hi)) {
+            atomicOr(&bm[w_s], mask_s);
+            if (w_s != w_e) {
+                atomicOr(&bm[w_e], mask_e);
+                if (inner_hi > inner_lo) {
+                    if (inner_hi - inner_lo <= 16U) {
+                        for (uint32_t w = inner_lo; w < inner_hi; w++) {
+                            bm[w] = 0xFFFFFFFFU;
+                        }
+                    } else {
+                        has_long = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /* sm_75+ ITS safety: ALL 32 lanes reach __ballot_sync/__shfl_sync — NO early return above! */
+    uint32_t lane = threadIdx.x & 31U;
+    uint32_t long_mask = __ballot_sync(0xFFFFFFFFU, has_long);
+    while (long_mask != 0U) {
+        int src = __ffs(long_mask) - 1;
+        long_mask &= long_mask - 1U;
+        uint32_t lo = __shfl_sync(0xFFFFFFFFU, inner_lo, src);
+        uint32_t hi = __shfl_sync(0xFFFFFFFFU, inner_hi, src);
+        for (uint32_t w = lo + lane; w < hi; w += 32U) {
+            bm[w] = 0xFFFFFFFFU;
+        }
     }
 }
 
@@ -318,6 +368,10 @@ static __global__ void extract_kmers_coalesced_kernel(
     }
 }
 
+/* W3-F13a: Fused frequency filter + inverted ref_non_unique_bm + word-coalesced dropped_bitmap.
+ * - Non-leaders of run_len >= 2 mark ref_non_unique_bm in O(1) parallel.
+ * - ~90% unique non-palindromic k-mers (run_len == 1) do ZERO vals[i] loads and ZERO atomics.
+ * - Accepts keep_flags == nullptr for gpu_build_global_dropped_bitmap (eliminates d_keep). */
 template <typename KeyT, bool IS_DIRECT>
 static __global__ void mark_freq_filter_kernel(
     const KeyT * __restrict__ keys,
@@ -326,35 +380,43 @@ static __global__ void mark_freq_filter_kernel(
     uint32_t freq_limit,
     int wl,
     uint64_t eff_mask,
-    uint8_t * __restrict__ keep_flags,
-    uint32_t * __restrict__ ref_unique_bm
+    uint8_t * __restrict__ keep_flags,         /* may be nullptr (global_dropped_bm mode) */
+    uint32_t * __restrict__ ref_non_unique_bm, /* single-slab contiguous Hash-CSR only */
+    uint32_t * __restrict__ dropped_bitmap,    /* non-null when building dropped bitmap */
+    uint32_t * __restrict__ any_dropped        /* non-null only in gpu_build_global_dropped_bitmap */
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     KeyT k = keys[i];
-    if (i > 0U && keys[i - 1U] == k) return;
+    bool same_prev = (i > 0U && keys[i - 1U] == k);
+    if (same_prev) {
+        if (ref_non_unique_bm) {
+            uint32_t pos = vals[i] >> 1;
+            atomicOr(&ref_non_unique_bm[pos >> 5], 1U << (pos & 31U));
+        }
+        return;
+    }
 
-    if (i + 1U >= n || keys[i + 1U] != k) {
-        keep_flags[i] = 1;
-        if (ref_unique_bm) {
-            uint32_t v = vals[i];
-            bool is_pal = false;
-            if ((v & 1U) == 0U) {
-                if constexpr (IS_DIRECT) {
-                    if ((wl & 1) == 0) {
-                        is_pal = is_palindromic_canon((uint64_t)k, wl, eff_mask);
-                    }
-                } else {
-                    is_pal = is_palindromic_canon(fmix64_inv((uint64_t)k), wl, eff_mask);
-                }
-            }
-            if (!is_pal) {
-                uint32_t pos = v >> 1;
-                atomicOr(&ref_unique_bm[pos >> 5], 1U << (pos & 31U));
+    bool same_next = (i + 1U < n && keys[i + 1U] == k);
+    if (!same_next) {
+        if (keep_flags) keep_flags[i] = 1;
+        if (ref_non_unique_bm && ((wl & 1) == 0)) {
+            bool is_pal = IS_DIRECT
+                ? is_palindromic_canon((uint64_t)k, wl, eff_mask)
+                : is_palindromic_canon(fmix64_inv((uint64_t)k), wl, eff_mask);
+            if (is_pal) {
+                uint32_t pos = vals[i] >> 1;
+                atomicOr(&ref_non_unique_bm[pos >> 5], 1U << (pos & 31U));
             }
         }
         return;
+    }
+
+    /* Run leader of run_len >= 2: mark leader's own bit in ref_non_unique_bm */
+    if (ref_non_unique_bm) {
+        uint32_t pos = vals[i] >> 1;
+        atomicOr(&ref_non_unique_bm[pos >> 5], 1U << (pos & 31U));
     }
 
     uint32_t step = 1U;
@@ -374,7 +436,9 @@ static __global__ void mark_freq_filter_kernel(
     uint32_t run_len = run_end - i;
 
     if (run_len <= freq_limit) {
-        for (uint32_t m = i; m < run_end; m++) keep_flags[m] = 1;
+        if (keep_flags) {
+            for (uint32_t m = i; m < run_end; m++) keep_flags[m] = 1;
+        }
         return;
     }
 
@@ -382,35 +446,47 @@ static __global__ void mark_freq_filter_kernel(
     for (uint32_t m = i; m < run_end; m++) {
         if (vals[m] & 1U) c1++;
         else c0++;
-        if (c0 > freq_limit && c1 > freq_limit) return;
+        /* break (NOT return) so dropped_bitmap + any_dropped are still marked for every element! */
+        if (c0 > freq_limit && c1 > freq_limit) break;
     }
     uint8_t k0 = (c0 <= freq_limit) ? 1 : 0;
     uint8_t k1 = (c1 <= freq_limit) ? 1 : 0;
-    for (uint32_t m = i; m < run_end; m++) {
-        keep_flags[m] = (vals[m] & 1U) ? k1 : k0;
-    }
-}
 
-static __global__ void mark_dropped_bitmap_kernel(
-    const uint32_t * __restrict__ vals,
-    const uint8_t * __restrict__ keep_flags,
-    uint32_t n_valid,
-    uint32_t * __restrict__ dropped_bitmap,
-    uint32_t * __restrict__ any_dropped
-) {
-    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_valid) return;
-    if (keep_flags[i] == 0) {
-        uint32_t pos = vals[i] >> 1;
-        atomicOr(&dropped_bitmap[pos >> 5], 1U << (pos & 31U));
+    if (dropped_bitmap && (!k0 || !k1)) {
         if (any_dropped && *any_dropped == 0U) {
             *any_dropped = 1U;
+        }
+        /* Single merged pass: set keep_flags (pre-zeroed) + word-coalesced dropped_bitmap REDG */
+        uint32_t cur_w = 0xFFFFFFFFU;
+        uint32_t cur_mask = 0U;
+        for (uint32_t m = i; m < run_end; m++) {
+            uint32_t v = vals[m];
+            uint8_t keep = (v & 1U) ? k1 : k0;
+            if (keep_flags && keep) keep_flags[m] = 1;
+            if (!keep) {
+                uint32_t pos = v >> 1;
+                uint32_t w = pos >> 5;
+                uint32_t bit = 1U << (pos & 31U);
+                if (w == cur_w) {
+                    cur_mask |= bit;
+                } else {
+                    if (cur_mask != 0U) atomicOr(&dropped_bitmap[cur_w], cur_mask);
+                    cur_w = w;
+                    cur_mask = bit;
+                }
+            }
+        }
+        if (cur_mask != 0U) atomicOr(&dropped_bitmap[cur_w], cur_mask);
+    } else if (keep_flags && (k0 || k1)) {
+        for (uint32_t m = i; m < run_end; m++) {
+            uint8_t keep = (vals[m] & 1U) ? k1 : k0;
+            if (keep) keep_flags[m] = 1;
         }
     }
 }
 
-/* F15 + F16: Warp-aggregated bucket count kernel via sm_70+ __match_any_sync.
- * Also writes 32-bit tags and 1-bit ref_unique_bm inline on the zero-drop fast path (freq_limit >= n_valid). */
+/* F15 + W3-F13a: Warp-aggregated bucket count kernel via sm_70+ __match_any_sync.
+ * Also writes 32-bit tags and inverted 1-bit ref_non_unique_bm inline on the zero-drop fast path. */
 template <typename KeyT, bool IS_DIRECT>
 static __global__ void count_kept_per_bucket_kernel(
     const KeyT * __restrict__ keys,
@@ -424,7 +500,7 @@ static __global__ void count_kept_per_bucket_kernel(
     uint64_t eff_mask,
     uint32_t * __restrict__ bucket_counts,    /* length num_buckets + 1, pre-zeroed */
     uint32_t * __restrict__ out_tags,         /* non-null ONLY for Hash-CSR && no_freq_drops */
-    uint32_t * __restrict__ ref_unique_bm     /* non-null ONLY for Hash-CSR contiguous && no_freq_drops */
+    uint32_t * __restrict__ ref_non_unique_bm /* non-null ONLY for single-slab contiguous Hash-CSR && no_freq_drops */
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -448,25 +524,32 @@ static __global__ void count_kept_per_bucket_kernel(
         }
     }
 
-    if (ref_unique_bm && vals) {
-        if ((i == 0U || keys[i - 1U] != k) && (i + 1U >= n || keys[i + 1U] != k)) {
-            uint32_t v = vals[i];
-            bool is_pal = false;
-            if ((v & 1U) == 0U) {
-                if constexpr (IS_DIRECT) {
-                    if ((wl & 1) == 0) {
-                        is_pal = is_palindromic_canon((uint64_t)k, wl, eff_mask);
-                    }
-                } else {
-                    is_pal = is_palindromic_canon(fmix64_inv((uint64_t)k), wl, eff_mask);
-                }
-            }
-            if (!is_pal) {
-                uint32_t pos = v >> 1;
-                atomicOr(&ref_unique_bm[pos >> 5], 1U << (pos & 31U));
-            }
+    if (ref_non_unique_bm && vals) {
+        bool non_unique = (i > 0U && keys[i - 1U] == k) || (i + 1U < n && keys[i + 1U] == k);
+        if (!non_unique && ((wl & 1) == 0)) {
+            non_unique = IS_DIRECT
+                ? is_palindromic_canon((uint64_t)k, wl, eff_mask)
+                : is_palindromic_canon(fmix64_inv((uint64_t)k), wl, eff_mask);
+        }
+        if (non_unique) {
+            uint32_t pos = vals[i] >> 1;
+            atomicOr(&ref_non_unique_bm[pos >> 5], 1U << (pos & 31U));
         }
     }
+}
+
+int gpu_fill_runs_bitmap(
+    const GeckoRun *d_runs,
+    uint32_t n_runs,
+    uint64_t len,
+    uint32_t *d_bm,
+    cudaStream_t stream
+) {
+    if (!d_runs || !d_bm || n_runs == 0U || len == 0ULL) return 0;
+    uint32_t grid = (n_runs + 255U) / 256U;
+    fill_runs_bitmap_kernel<<<grid, 256, 0, stream>>>(d_runs, n_runs, (uint32_t)len, d_bm);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
 }
 
 void gpu_build_revcomp_2bit(
@@ -474,9 +557,11 @@ void gpu_build_revcomp_2bit(
     uint64_t *d_dst_bits,
     const uint32_t *d_src_special_bm,
     uint32_t *d_dst_special_bm,
-    uint64_t len
+    uint64_t len,
+    GeckoCudaProfile *prof
 ) {
     if (len == 0) return;
+    CudaEventScope ev(prof, prof ? &prof->revcomp_ms : nullptr);
     uint32_t n_words = (uint32_t)((len + 31ULL) / 32ULL);
     uint32_t grid = (n_words + 255U) / 256U;
     revcomp_2bit_kernel<<<grid, 256>>>(d_src_bits, d_dst_bits, len, n_words);
@@ -493,7 +578,8 @@ uint64_t gpu_count_valid_kmers(
     void *&d_cub_temp,
     size_t &cub_temp_cap,
     uint32_t *&out_d_chunk_offsets,
-    uint32_t &out_num_chunks
+    uint32_t &out_num_chunks,
+    GeckoCudaProfile *prof
 ) {
     out_d_chunk_offsets = nullptr;
     out_num_chunks = 0U;
@@ -507,14 +593,17 @@ uint64_t gpu_count_valid_kmers(
     CUDA_CHECK_VOID(cudaMalloc(&d_chunk_counts, (size_t)num_chunks * sizeof(uint32_t)));
     CUDA_CHECK_VOID(cudaMalloc(&d_chunk_offsets, (size_t)(num_chunks + 1U) * sizeof(uint32_t)));
 
-    count_valid_kmers_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
-        seqY, wl, num_chunks, d_chunk_counts);
-    CUDA_CHECK_VOID(cudaGetLastError());
-
     size_t temp_bytes = 0;
     cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes, d_chunk_counts, d_chunk_offsets, (int)num_chunks);
     gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, temp_bytes);
-    cub::DeviceScan::ExclusiveSum(d_cub_temp, temp_bytes, d_chunk_counts, d_chunk_offsets, (int)num_chunks);
+
+    {
+        CudaEventScope ev(prof, prof ? &prof->count_valid_ms : nullptr);
+        count_valid_kmers_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
+            seqY, wl, num_chunks, d_chunk_counts);
+        CUDA_CHECK_VOID(cudaGetLastError());
+        cub::DeviceScan::ExclusiveSum(d_cub_temp, temp_bytes, d_chunk_counts, d_chunk_offsets, (int)num_chunks);
+    }
 
     uint32_t last_off = 0U, last_cnt = 0U;
     CUDA_CHECK_VOID(cudaMemcpy(&last_off, d_chunk_offsets + (num_chunks - 1U), sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -545,7 +634,8 @@ uint32_t *gpu_build_global_dropped_bitmap(
     uint32_t freq_limit,
     uint32_t num_slabs,
     void *&d_cub_temp,
-    size_t &cub_temp_cap
+    size_t &cub_temp_cap,
+    GeckoCudaProfile *prof
 ) {
     uint64_t lenY = seqY.len;
     if (freq_limit == 0U || lenY < (uint64_t)wl || num_slabs <= 1U) return nullptr;
@@ -574,6 +664,8 @@ uint32_t *gpu_build_global_dropped_bitmap(
         uint32_t part_start = (slab * 256U) / num_slabs;
         uint32_t part_end = ((slab + 1U) * 256U) / num_slabs;
         if (part_start >= part_end) continue;
+
+        CudaEventScope ev_slab(prof, prof ? &prof->global_dropped_ms : nullptr);
 
         count_valid_kmers_slab_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
             seqY, wl, eff_mask, part_start, part_end, num_chunks, d_chunk_counts);
@@ -618,19 +710,12 @@ uint32_t *gpu_build_global_dropped_bitmap(
         CUDA_CHECK_VOID(cudaFree(db_keys.Alternate()));
         CUDA_CHECK_VOID(cudaFree(db_vals.Alternate()));
 
-        uint8_t *d_keep = nullptr;
-        CUDA_CHECK_VOID(cudaMalloc(&d_keep, (size_t)n_valid * sizeof(uint8_t)));
-        CUDA_CHECK_VOID(cudaMemset(d_keep, 0, (size_t)n_valid * sizeof(uint8_t)));
-
+        /* W3-F13a: Fused single-pass global dropped bitmap marking (zero d_keep allocation!) */
         mark_freq_filter_kernel<uint64_t, false><<<(n_valid + 255U) / 256U, 256>>>(
-            d_sorted_keys, d_sorted_vals, n_valid, freq_limit, wl, eff_mask, d_keep, nullptr);
+            d_sorted_keys, d_sorted_vals, n_valid, freq_limit, wl, eff_mask,
+            nullptr, nullptr, d_global_bm, d_any_dropped);
         CUDA_CHECK_VOID(cudaGetLastError());
 
-        mark_dropped_bitmap_kernel<<<(n_valid + 255U) / 256U, 256>>>(
-            d_sorted_vals, d_keep, n_valid, d_global_bm, d_any_dropped);
-        CUDA_CHECK_VOID(cudaGetLastError());
-
-        CUDA_CHECK_VOID(cudaFree(d_keep));
         CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
         CUDA_CHECK_VOID(cudaFree(d_sorted_vals));
     }
@@ -660,7 +745,8 @@ GpuRefIndex gpu_build_ref_index(
     uint32_t part_end,
     const uint32_t *precomp_chunk_offsets,
     uint32_t precomp_n_valid,
-    bool build_dropped_bm
+    bool build_dropped_bm,
+    GeckoCudaProfile *prof
 ) {
     GpuRefIndex idx{};
     idx.part_start = part_start;
@@ -686,19 +772,22 @@ GpuRefIndex gpu_build_ref_index(
         CUDA_CHECK_VOID(cudaMalloc(&d_chunk_counts, (size_t)num_chunks * sizeof(uint32_t)));
         CUDA_CHECK_VOID(cudaMalloc(&d_chunk_offsets_owned, (size_t)(num_chunks + 1U) * sizeof(uint32_t)));
 
-        if (part_filter) {
-            count_valid_kmers_slab_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
-                seqY, wl, eff_mask, part_start, part_end, num_chunks, d_chunk_counts);
-        } else {
-            count_valid_kmers_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
-                seqY, wl, num_chunks, d_chunk_counts);
-        }
-        CUDA_CHECK_VOID(cudaGetLastError());
-
         size_t scan_bytes = 0;
         cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_chunk_counts, d_chunk_offsets_owned, (int)num_chunks);
         gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
-        cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_chunk_counts, d_chunk_offsets_owned, (int)num_chunks);
+
+        {
+            CudaEventScope ev(prof, prof ? &prof->count_valid_ms : nullptr);
+            if (part_filter) {
+                count_valid_kmers_slab_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
+                    seqY, wl, eff_mask, part_start, part_end, num_chunks, d_chunk_counts);
+            } else {
+                count_valid_kmers_kernel<<<(num_chunks + 255U) / 256U, 256>>>(
+                    seqY, wl, num_chunks, d_chunk_counts);
+            }
+            CUDA_CHECK_VOID(cudaGetLastError());
+            cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_chunk_counts, d_chunk_offsets_owned, (int)num_chunks);
+        }
 
         uint32_t last_off = 0U, last_cnt = 0U;
         CUDA_CHECK_VOID(cudaMemcpy(&last_off, d_chunk_offsets_owned + (num_chunks - 1U), sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -720,7 +809,7 @@ GpuRefIndex gpu_build_ref_index(
         CUDA_CHECK_VOID(cudaMemset(idx.d_bucket_off, 0, (size_t)(num_buckets + 1U) * sizeof(uint32_t)));
         idx.d_tags = nullptr;
         idx.d_vals = nullptr;
-        idx.d_ref_unique_bm = nullptr;
+        idx.d_ref_non_unique_bm = nullptr;
         idx.d_dropped_bitmap = nullptr;
         idx.owns_dropped_bitmap = false;
         idx.has_global_dropped_bm = true;
@@ -749,9 +838,12 @@ GpuRefIndex gpu_build_ref_index(
         CUDA_CHECK_VOID(cudaMalloc(&d_keys_a, n_alloc * sizeof(uint32_t)));
         CUDA_CHECK_VOID(cudaMalloc(&d_vals_a, n_alloc * sizeof(uint32_t)));
 
-        extract_kmers_coalesced_kernel<uint32_t, true><<<num_chunks, 256>>>(
-            seqY, wl, eff_mask, 0U, 256U, d_chunk_offsets_ro, d_keys_a, d_vals_a);
-        CUDA_CHECK_VOID(cudaGetLastError());
+        {
+            CudaEventScope ev(prof, prof ? &prof->extract_kmers_ms : nullptr);
+            extract_kmers_coalesced_kernel<uint32_t, true><<<num_chunks, 256>>>(
+                seqY, wl, eff_mask, 0U, 256U, d_chunk_offsets_ro, d_keys_a, d_vals_a);
+            CUDA_CHECK_VOID(cudaGetLastError());
+        }
         if (d_chunk_offsets_owned) {
             CUDA_CHECK_VOID(cudaFree(d_chunk_offsets_owned));
             d_chunk_offsets_owned = nullptr;
@@ -766,6 +858,7 @@ GpuRefIndex gpu_build_ref_index(
             size_t sort_bytes = 0;
             cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, db_keys, db_vals, (int)idx.n_valid, 0, 2 * wl);
             gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sort_bytes);
+            CudaEventScope ev(prof, prof ? &prof->sort_pairs_ms : nullptr);
             cub::DeviceRadixSort::SortPairs(d_cub_temp, sort_bytes, db_keys, db_vals, (int)idx.n_valid, 0, 2 * wl);
         }
 
@@ -787,24 +880,34 @@ GpuRefIndex gpu_build_ref_index(
             CUDA_CHECK_VOID(cudaMemset(d_keep, 0, n_alloc * sizeof(uint8_t)));
             CUDA_CHECK_VOID(cudaMalloc(&d_num_out, sizeof(uint32_t)));
 
-            mark_freq_filter_kernel<uint32_t, true><<<(idx.n_valid + 255U) / 256U, 256>>>(
-                d_sorted_keys, d_sorted_vals, idx.n_valid, freq_limit, wl, eff_mask, d_keep, nullptr);
-            CUDA_CHECK_VOID(cudaGetLastError());
-
-            size_t sel_bytes = 0;
-            cub::DeviceSelect::Flagged(nullptr, sel_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
-            gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sel_bytes);
-            cub::DeviceSelect::Flagged(d_cub_temp, sel_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
-            CUDA_CHECK_VOID(cudaMemcpy(&idx.n_kept, d_num_out, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-            if (build_dropped_bm && idx.n_kept < idx.n_valid && lenY > 0ULL) {
+            if (build_dropped_bm && lenY > 0ULL) {
                 size_t bm_words = (size_t)((lenY + 31ULL) / 32ULL) + 2;
                 CUDA_CHECK_VOID(cudaMalloc(&idx.d_dropped_bitmap, bm_words * sizeof(uint32_t)));
                 CUDA_CHECK_VOID(cudaMemset(idx.d_dropped_bitmap, 0, bm_words * sizeof(uint32_t)));
                 idx.owns_dropped_bitmap = true;
-                mark_dropped_bitmap_kernel<<<(idx.n_valid + 255U) / 256U, 256>>>(
-                    d_sorted_vals, d_keep, idx.n_valid, idx.d_dropped_bitmap, nullptr);
+            }
+
+            {
+                CudaEventScope ev(prof, prof ? &prof->freq_filter_ms : nullptr);
+                mark_freq_filter_kernel<uint32_t, true><<<(idx.n_valid + 255U) / 256U, 256>>>(
+                    d_sorted_keys, d_sorted_vals, idx.n_valid, freq_limit, wl, eff_mask,
+                    d_keep, nullptr, idx.d_dropped_bitmap, nullptr);
                 CUDA_CHECK_VOID(cudaGetLastError());
+            }
+
+            size_t sel_bytes = 0;
+            cub::DeviceSelect::Flagged(nullptr, sel_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
+            gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sel_bytes);
+            {
+                CudaEventScope ev(prof, prof ? &prof->select_vals_ms : nullptr);
+                cub::DeviceSelect::Flagged(d_cub_temp, sel_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
+            }
+            CUDA_CHECK_VOID(cudaMemcpy(&idx.n_kept, d_num_out, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+            if (idx.d_dropped_bitmap && idx.n_kept == idx.n_valid) {
+                CUDA_CHECK_VOID(cudaFree(idx.d_dropped_bitmap));
+                idx.d_dropped_bitmap = nullptr;
+                idx.owns_dropped_bitmap = false;
             }
 
             CUDA_CHECK_VOID(cudaFree(d_sorted_vals));
@@ -812,17 +915,19 @@ GpuRefIndex gpu_build_ref_index(
             d_final_vals = d_alt_vals;
 
             if (idx.n_kept > 0U) {
-                count_kept_per_bucket_kernel<uint32_t, true><<<(idx.n_valid + 255U) / 256U, 256>>>(
-                    d_sorted_keys, nullptr, d_keep, idx.n_valid,
-                    0, 0, 0U, wl, eff_mask, d_bucket_off, nullptr, nullptr);
-                CUDA_CHECK_VOID(cudaGetLastError());
-                CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
-                CUDA_CHECK_VOID(cudaFree(d_keep));
-
                 size_t scan_bytes = 0;
                 cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
                 gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
-                cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+                {
+                    CudaEventScope ev(prof, prof ? &prof->bucket_build_ms : nullptr);
+                    count_kept_per_bucket_kernel<uint32_t, true><<<(idx.n_valid + 255U) / 256U, 256>>>(
+                        d_sorted_keys, nullptr, d_keep, idx.n_valid,
+                        0, 0, 0U, wl, eff_mask, d_bucket_off, nullptr, nullptr);
+                    CUDA_CHECK_VOID(cudaGetLastError());
+                    cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+                }
+                CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+                CUDA_CHECK_VOID(cudaFree(d_keep));
             } else {
                 CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
                 CUDA_CHECK_VOID(cudaFree(d_keep));
@@ -832,22 +937,24 @@ GpuRefIndex gpu_build_ref_index(
             d_final_vals = d_sorted_vals;
             idx.n_kept = idx.n_valid;
 
-            count_kept_per_bucket_kernel<uint32_t, true><<<(idx.n_valid + 255U) / 256U, 256>>>(
-                d_sorted_keys, nullptr, nullptr, idx.n_valid,
-                0, 0, 0U, wl, eff_mask, d_bucket_off, nullptr, nullptr);
-            CUDA_CHECK_VOID(cudaGetLastError());
-            CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
-
             size_t scan_bytes = 0;
             cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
             gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
-            cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+            {
+                CudaEventScope ev(prof, prof ? &prof->bucket_build_ms : nullptr);
+                count_kept_per_bucket_kernel<uint32_t, true><<<(idx.n_valid + 255U) / 256U, 256>>>(
+                    d_sorted_keys, nullptr, nullptr, idx.n_valid,
+                    0, 0, 0U, wl, eff_mask, d_bucket_off, nullptr, nullptr);
+                CUDA_CHECK_VOID(cudaGetLastError());
+                cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+            }
+            CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
         }
 
         idx.d_tags = nullptr;
         idx.d_vals = d_final_vals;
         idx.d_bucket_off = d_bucket_off;
-        idx.d_ref_unique_bm = nullptr;
+        idx.d_ref_non_unique_bm = nullptr;
         idx.num_buckets = num_buckets;
         idx.bucket_bits = 2 * wl;
         idx.shift_bits = 0;
@@ -857,16 +964,19 @@ GpuRefIndex gpu_build_ref_index(
         return idx;
     }
 
-    /* ---- Hash-CSR Path (uint64_t keys, 32-bit tags, F16 ref_unique_bm) ---- */
+    /* ---- Hash-CSR Path (uint64_t keys, 32-bit tags, W3-F13a inverted ref_non_unique_bm) ---- */
     size_t n_alloc = (size_t)idx.n_valid;
     uint64_t *d_keys_a = nullptr, *d_keys_b = nullptr;
     uint32_t *d_vals_a = nullptr, *d_vals_b = nullptr;
     CUDA_CHECK_VOID(cudaMalloc(&d_keys_a, n_alloc * sizeof(uint64_t)));
     CUDA_CHECK_VOID(cudaMalloc(&d_vals_a, n_alloc * sizeof(uint32_t)));
 
-    extract_kmers_coalesced_kernel<uint64_t, false><<<num_chunks, 256>>>(
-        seqY, wl, eff_mask, part_start, part_end, d_chunk_offsets_ro, d_keys_a, d_vals_a);
-    CUDA_CHECK_VOID(cudaGetLastError());
+    {
+        CudaEventScope ev(prof, prof ? &prof->extract_kmers_ms : nullptr);
+        extract_kmers_coalesced_kernel<uint64_t, false><<<num_chunks, 256>>>(
+            seqY, wl, eff_mask, part_start, part_end, d_chunk_offsets_ro, d_keys_a, d_vals_a);
+        CUDA_CHECK_VOID(cudaGetLastError());
+    }
     if (d_chunk_offsets_owned) {
         CUDA_CHECK_VOID(cudaFree(d_chunk_offsets_owned));
         d_chunk_offsets_owned = nullptr;
@@ -882,6 +992,7 @@ GpuRefIndex gpu_build_ref_index(
         size_t sort_bytes = 0;
         cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, db_keys, db_vals, (int)idx.n_valid, 0, sort_end_bit);
         gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sort_bytes);
+        CudaEventScope ev(prof, prof ? &prof->sort_pairs_ms : nullptr);
         cub::DeviceRadixSort::SortPairs(d_cub_temp, sort_bytes, db_keys, db_vals, (int)idx.n_valid, 0, sort_end_bit);
     }
 
@@ -891,11 +1002,13 @@ GpuRefIndex gpu_build_ref_index(
     /* F15: Free alternate 64-bit key buffer immediately — we NEVER compact 64-bit keys! */
     CUDA_CHECK_VOID(cudaFree(db_keys.Alternate()));
 
-    /* F16: Allocate 1-bit unique non-palindromic ref k-mer bitmap for contiguous Hash-CSR */
-    if (!is_spaced && lenY > 0ULL) {
+    /* W3-F13a: Allocate inverted 1-bit non-unique/palindromic ref k-mer bitmap STRICTLY for
+     * single-slab contiguous Hash-CSR (!part_filter guarantees every valid ref k-mer is present
+     * in d_sorted_keys, so out-of-slab positions can never be falsely treated as unique). */
+    if (!is_spaced && !part_filter && lenY > 0ULL) {
         size_t bm_words = (size_t)((lenY + 31ULL) / 32ULL) + 2;
-        CUDA_CHECK_VOID(cudaMalloc(&idx.d_ref_unique_bm, bm_words * sizeof(uint32_t)));
-        CUDA_CHECK_VOID(cudaMemset(idx.d_ref_unique_bm, 0, bm_words * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMalloc(&idx.d_ref_non_unique_bm, bm_words * sizeof(uint32_t)));
+        CUDA_CHECK_VOID(cudaMemset(idx.d_ref_non_unique_bm, 0, bm_words * sizeof(uint32_t)));
     }
 
     uint32_t *d_final_vals = nullptr;
@@ -914,25 +1027,34 @@ GpuRefIndex gpu_build_ref_index(
         CUDA_CHECK_VOID(cudaMemset(d_keep, 0, n_alloc * sizeof(uint8_t)));
         CUDA_CHECK_VOID(cudaMalloc(&d_num_out, sizeof(uint32_t)));
 
-        mark_freq_filter_kernel<uint64_t, false><<<(idx.n_valid + 255U) / 256U, 256>>>(
-            d_sorted_keys, d_sorted_vals, idx.n_valid, freq_limit, wl, eff_mask,
-            d_keep, idx.d_ref_unique_bm);
-        CUDA_CHECK_VOID(cudaGetLastError());
-
-        size_t sel_val_bytes = 0;
-        cub::DeviceSelect::Flagged(nullptr, sel_val_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
-        gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sel_val_bytes);
-        cub::DeviceSelect::Flagged(d_cub_temp, sel_val_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
-        CUDA_CHECK_VOID(cudaMemcpy(&idx.n_kept, d_num_out, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-        if (build_dropped_bm && !part_filter && idx.n_kept < idx.n_valid && lenY > 0ULL) {
+        if (build_dropped_bm && !part_filter && !is_spaced && lenY > 0ULL) {
             size_t bm_words = (size_t)((lenY + 31ULL) / 32ULL) + 2;
             CUDA_CHECK_VOID(cudaMalloc(&idx.d_dropped_bitmap, bm_words * sizeof(uint32_t)));
             CUDA_CHECK_VOID(cudaMemset(idx.d_dropped_bitmap, 0, bm_words * sizeof(uint32_t)));
             idx.owns_dropped_bitmap = true;
-            mark_dropped_bitmap_kernel<<<(idx.n_valid + 255U) / 256U, 256>>>(
-                d_sorted_vals, d_keep, idx.n_valid, idx.d_dropped_bitmap, nullptr);
+        }
+
+        {
+            CudaEventScope ev(prof, prof ? &prof->freq_filter_ms : nullptr);
+            mark_freq_filter_kernel<uint64_t, false><<<(idx.n_valid + 255U) / 256U, 256>>>(
+                d_sorted_keys, d_sorted_vals, idx.n_valid, freq_limit, wl, eff_mask,
+                d_keep, idx.d_ref_non_unique_bm, idx.d_dropped_bitmap, nullptr);
             CUDA_CHECK_VOID(cudaGetLastError());
+        }
+
+        size_t sel_val_bytes = 0;
+        cub::DeviceSelect::Flagged(nullptr, sel_val_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
+        gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sel_val_bytes);
+        {
+            CudaEventScope ev(prof, prof ? &prof->select_vals_ms : nullptr);
+            cub::DeviceSelect::Flagged(d_cub_temp, sel_val_bytes, d_sorted_vals, d_keep, d_alt_vals, d_num_out, (int)idx.n_valid);
+        }
+        CUDA_CHECK_VOID(cudaMemcpy(&idx.n_kept, d_num_out, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+        if (idx.d_dropped_bitmap && idx.n_kept == idx.n_valid) {
+            CUDA_CHECK_VOID(cudaFree(idx.d_dropped_bitmap));
+            idx.d_dropped_bitmap = nullptr;
+            idx.owns_dropped_bitmap = false;
         }
 
         /* Release uncompacted vals BEFORE allocating d_bucket_off & d_tags */
@@ -957,29 +1079,34 @@ GpuRefIndex gpu_build_ref_index(
             size_t sel_tag_bytes = 0;
             cub::DeviceSelect::Flagged(nullptr, sel_tag_bytes, tag_iter, d_keep, d_tags, d_num_out, (int)idx.n_valid);
             gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sel_tag_bytes);
-            cub::DeviceSelect::Flagged(d_cub_temp, sel_tag_bytes, tag_iter, d_keep, d_tags, d_num_out, (int)idx.n_valid);
-
-            count_kept_per_bucket_kernel<uint64_t, false><<<(idx.n_valid + 255U) / 256U, 256>>>(
-                d_sorted_keys, nullptr, d_keep, idx.n_valid,
-                shift_bits, tag_shift, bucket_base, wl, eff_mask,
-                d_bucket_off, nullptr, nullptr);
-            CUDA_CHECK_VOID(cudaGetLastError());
-
-            CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
-            CUDA_CHECK_VOID(cudaFree(d_keep));
-            CUDA_CHECK_VOID(cudaFree(d_num_out));
+            {
+                CudaEventScope ev(prof, prof ? &prof->select_tags_ms : nullptr);
+                cub::DeviceSelect::Flagged(d_cub_temp, sel_tag_bytes, tag_iter, d_keep, d_tags, d_num_out, (int)idx.n_valid);
+            }
 
             size_t scan_bytes = 0;
             cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
             gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
-            cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+            {
+                CudaEventScope ev(prof, prof ? &prof->bucket_build_ms : nullptr);
+                count_kept_per_bucket_kernel<uint64_t, false><<<(idx.n_valid + 255U) / 256U, 256>>>(
+                    d_sorted_keys, nullptr, d_keep, idx.n_valid,
+                    shift_bits, tag_shift, bucket_base, wl, eff_mask,
+                    d_bucket_off, nullptr, nullptr);
+                CUDA_CHECK_VOID(cudaGetLastError());
+                cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+            }
+
+            CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
+            CUDA_CHECK_VOID(cudaFree(d_keep));
+            CUDA_CHECK_VOID(cudaFree(d_num_out));
         } else {
             CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
             CUDA_CHECK_VOID(cudaFree(d_keep));
             CUDA_CHECK_VOID(cudaFree(d_num_out));
-            if (idx.d_ref_unique_bm) {
-                CUDA_CHECK_VOID(cudaFree(idx.d_ref_unique_bm));
-                idx.d_ref_unique_bm = nullptr;
+            if (idx.d_ref_non_unique_bm) {
+                CUDA_CHECK_VOID(cudaFree(idx.d_ref_non_unique_bm));
+                idx.d_ref_non_unique_bm = nullptr;
             }
         }
     } else {
@@ -999,17 +1126,19 @@ GpuRefIndex gpu_build_ref_index(
         CUDA_CHECK_VOID(cudaMemset(d_bucket_off, 0, (size_t)(num_buckets + 1U) * sizeof(uint32_t)));
         CUDA_CHECK_VOID(cudaMalloc(&d_tags, (size_t)idx.n_kept * sizeof(uint32_t)));
 
-        count_kept_per_bucket_kernel<uint64_t, false><<<(idx.n_valid + 255U) / 256U, 256>>>(
-            d_sorted_keys, d_final_vals, nullptr, idx.n_valid,
-            shift_bits, tag_shift, bucket_base, wl, eff_mask,
-            d_bucket_off, d_tags, idx.d_ref_unique_bm);
-        CUDA_CHECK_VOID(cudaGetLastError());
-        CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
-
         size_t scan_bytes = 0;
         cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
         gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, scan_bytes);
-        cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+        {
+            CudaEventScope ev(prof, prof ? &prof->bucket_build_ms : nullptr);
+            count_kept_per_bucket_kernel<uint64_t, false><<<(idx.n_valid + 255U) / 256U, 256>>>(
+                d_sorted_keys, d_final_vals, nullptr, idx.n_valid,
+                shift_bits, tag_shift, bucket_base, wl, eff_mask,
+                d_bucket_off, d_tags, idx.d_ref_non_unique_bm);
+            CUDA_CHECK_VOID(cudaGetLastError());
+            cub::DeviceScan::ExclusiveSum(d_cub_temp, scan_bytes, d_bucket_off, d_bucket_off, (int)(num_buckets + 1U));
+        }
+        CUDA_CHECK_VOID(cudaFree(d_sorted_keys));
     }
 
     idx.d_tags = d_tags;
@@ -1025,10 +1154,10 @@ GpuRefIndex gpu_build_ref_index(
 }
 
 void gpu_free_ref_index(GpuRefIndex &idx) {
-    if (idx.d_tags) CUDA_CHECK_VOID(cudaFree(idx.d_tags));
-    if (idx.d_vals) CUDA_CHECK_VOID(cudaFree(idx.d_vals));
-    if (idx.d_bucket_off) CUDA_CHECK_VOID(cudaFree(idx.d_bucket_off));
-    if (idx.owns_dropped_bitmap && idx.d_dropped_bitmap) CUDA_CHECK_VOID(cudaFree(idx.d_dropped_bitmap));
-    if (idx.d_ref_unique_bm) CUDA_CHECK_VOID(cudaFree(idx.d_ref_unique_bm));
+    if (idx.d_tags) (void)cudaFree(idx.d_tags);
+    if (idx.d_vals) (void)cudaFree(idx.d_vals);
+    if (idx.d_bucket_off) (void)cudaFree(idx.d_bucket_off);
+    if (idx.owns_dropped_bitmap && idx.d_dropped_bitmap) (void)cudaFree(idx.d_dropped_bitmap);
+    if (idx.d_ref_non_unique_bm) (void)cudaFree(idx.d_ref_non_unique_bm);
     idx = {};
 }

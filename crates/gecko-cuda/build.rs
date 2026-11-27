@@ -21,6 +21,7 @@ fn main() {
         "cuda/cuda_index.cu",
         "cuda/cuda_query.cu",
         "cuda/cuda_extend.cu",
+        "cuda/cuda_minimizer.cu",
         "cuda/cuda_bridge.cu",
     ];
     for src in &cuda_sources {
@@ -50,6 +51,7 @@ fn main() {
         ("cuda/cuda_index.cu", "cuda_index.o"),
         ("cuda/cuda_query.cu", "cuda_query.o"),
         ("cuda/cuda_extend.cu", "cuda_extend.o"),
+        ("cuda/cuda_minimizer.cu", "cuda_minimizer.o"),
         ("cuda/cuda_bridge.cu", "cuda_bridge.o"),
     ];
 
@@ -78,6 +80,7 @@ fn main() {
     }
 
     let lib_path = out_dir.join("libgecko_cuda_kernels.a");
+    let _ = std::fs::remove_file(&lib_path);
     let mut ar = Command::new("ar");
     ar.arg("rcs").arg(&lib_path);
     for obj in &obj_paths {

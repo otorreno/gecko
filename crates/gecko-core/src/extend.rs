@@ -63,13 +63,13 @@ impl Default for CoverageMatrix {
     }
 }
 
-/// Exact integer reciprocal for `floor((u_max * 100) / length)` on `length in 2..=160`
+/// Exact integer reciprocal for `floor((u_max * 100) / length)` on `length in 2..=288`
 /// (`t[l] = ceil(2^32 / l)`). Zero-division bit-exact match for [`CoverageMatrix::record`]
-/// on short default-scoring (`+4/-4/-1`) extensions.
-const RECIP_100: [u32; 161] = {
-    let mut t = [0u32; 161];
+/// on short default-scoring (`+4/-4/-1`) extensions up to 128-bp bidirectional fast-reject.
+const RECIP_100: [u32; 289] = {
+    let mut t = [0u32; 289];
     let mut l = 2usize;
-    while l <= 160 {
+    while l <= 288 {
         t[l] = (1u64 << 32).div_ceil(l as u64) as u32;
         l += 1;
     }
@@ -95,14 +95,14 @@ impl CoverageMatrix {
     }
 
     /// Zero-division bit-exact coverage recording for short default-scoring (`+4/-4/-1`)
-    /// extensions with `2 <= length <= 160` and `0 <= u_max <= length`.
+    /// extensions with `2 <= length <= 288` and `0 <= u_max <= length`.
     #[inline(always)]
     pub(crate) fn record_unit_exact(&mut self, length: usize, u_max: u32) {
-        debug_assert!((2..=160).contains(&length));
+        debug_assert!((2..=288).contains(&length));
         debug_assert_eq!(self.bins.len(), 1000);
         let recip = unsafe { *RECIP_100.get_unchecked(length) } as u64;
         let col = ((((u_max as u64) * 100) * recip) >> 32).min(99) as usize;
-        // Safety: `bins` has length 1000, `length <= 160 < 1000`, `col <= 99`.
+        // Safety: `bins` has length 1000, `length <= 288 < 1000`, `col <= 99`.
         unsafe {
             *self.bins.get_unchecked_mut(length).get_unchecked_mut(col) += 1;
         }
@@ -132,6 +132,7 @@ pub struct ExtendBatchOutput {
 pub(crate) struct ExtendOutcome {
     pub fragment: Option<Fragment>,
     pub xfil_max: u64,
+    pub exceeded_min_len: bool,
 }
 
 /// Reusable scratch buffers for [`exact_rejected_skip`].
@@ -349,7 +350,8 @@ fn finalize_extend_outcome(
         (ml, Some((sx, sy)))
     };
 
-    if length > min_length {
+    let exceeded_min_len = length > min_length;
+    if exceeded_min_len {
         let similarity = computed_sim.unwrap_or_else(|| {
             let max_possible = (length as f64) * (opts.scoring.match_score as f64);
             ((score as f64) * 100.0 / max_possible) as f32
@@ -387,6 +389,7 @@ fn finalize_extend_outcome(
                     strand: opts.strand,
                 }),
                 xfil_max: fwd.xfil_max,
+                exceeded_min_len: true,
             };
         }
     }
@@ -394,6 +397,7 @@ fn finalize_extend_outcome(
     ExtendOutcome {
         fragment: None,
         xfil_max: fwd.xfil_max,
+        exceeded_min_len,
     }
 }
 
@@ -463,6 +467,7 @@ pub(crate) fn extend_single_hit_outcome(
         return ExtendOutcome {
             fragment: None,
             xfil_max: pos_x + wl.saturating_sub(1),
+            exceeded_min_len: false,
         };
     }
 
@@ -476,7 +481,7 @@ pub(crate) fn extend_single_hit_outcome(
         opts.spaced_seed,
     );
 
-    let (fwd, bwd) = if use_avx2 && opts.scoring.is_default_gecko() {
+    let (fwd, bwd) = if seed_score >= 0 && use_avx2 && opts.scoring.is_default_gecko() {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             let cx = sp_cursor_for(&seq_x_pack.special_runs, pos_x);
@@ -512,7 +517,7 @@ pub(crate) fn extend_single_hit_outcome(
             let b = extend_backward_2bit_portable(seq_x_pack, seq_y_pack, pos_x, pos_y, f);
             (f, b)
         }
-    } else if opts.scoring.is_default_gecko() {
+    } else if seed_score >= 0 && opts.scoring.is_default_gecko() {
         let f = extend_forward_2bit_portable(
             seq_x_pack, seq_y_pack, pos_x, pos_y, wl, seed_ident, seed_score,
         );
@@ -572,10 +577,11 @@ pub(crate) fn extend_single_hit_with_seed_portable(
         return ExtendOutcome {
             fragment: None,
             xfil_max: pos_x + wl.saturating_sub(1),
+            exceeded_min_len: false,
         };
     }
 
-    let (fwd, bwd) = if opts.scoring.is_default_gecko() {
+    let (fwd, bwd) = if seed_score >= 0 && opts.scoring.is_default_gecko() {
         let f = extend_forward_2bit_portable(
             seq_x_pack, seq_y_pack, pos_x, pos_y, wl, seed_ident, seed_score,
         );
@@ -634,10 +640,11 @@ pub(crate) unsafe fn extend_single_hit_with_seed_avx2_bmi2(
         return ExtendOutcome {
             fragment: None,
             xfil_max: pos_x + wl.saturating_sub(1),
+            exceeded_min_len: false,
         };
     }
 
-    let (fwd, bwd) = if opts.scoring.is_default_gecko() {
+    let (fwd, bwd) = if seed_score >= 0 && opts.scoring.is_default_gecko() {
         let cy = sp_cursor_for(&seq_y_pack.special_runs, pos_y);
         let f = unsafe {
             extend_forward_2bit_avx2_bmi2(
@@ -701,10 +708,11 @@ pub(crate) unsafe fn extend_single_hit_with_seed_avx2_swar(
         return ExtendOutcome {
             fragment: None,
             xfil_max: pos_x + wl.saturating_sub(1),
+            exceeded_min_len: false,
         };
     }
 
-    let (fwd, bwd) = if opts.scoring.is_default_gecko() {
+    let (fwd, bwd) = if seed_score >= 0 && opts.scoring.is_default_gecko() {
         let cy = sp_cursor_for(&seq_y_pack.special_runs, pos_y);
         let f = unsafe {
             extend_forward_2bit_avx2_swar(
@@ -903,6 +911,79 @@ fn safe_backward_dist(runs: &[(u64, u64)], pos: u64, cursor: &mut usize) -> u64 
     }
 }
 
+/// If `pos` lies inside an `'N'`-run `[s, e)` of `seq`, return the remaining forward length
+/// `e - pos` (`>= 1`); otherwise return `0`.
+///
+/// Precondition: `cx` was just updated by `safe_forward_dist(&seq.special_runs, pos, &mut cx)`.
+#[inline(always)]
+fn n_run_forward_dist(seq: &PackedSeq, pos: u64, cx: usize) -> u64 {
+    let sp = &seq.special_runs;
+    if cx >= sp.len() || sp[cx].0 > pos {
+        return 0;
+    }
+    if seq.sep_pos.is_empty() && seq.iupac.is_empty() {
+        return sp[cx].1 - pos;
+    }
+    let nr = &seq.n_runs;
+    let idx = nr.partition_point(|&(s, _)| s <= pos);
+    if idx > 0 && pos < nr[idx - 1].1 {
+        nr[idx - 1].1 - pos
+    } else {
+        0
+    }
+}
+
+/// If `pos` lies inside an `'N'`-run `[s, e)` of `seq`, return the remaining backward length
+/// `pos - s + 1` (`>= 1`); otherwise return `0`.
+///
+/// Precondition: `cx` was just updated by `safe_backward_dist(&seq.special_runs, pos, &mut cx)`.
+#[inline(always)]
+fn n_run_backward_dist(seq: &PackedSeq, pos: u64, cx: usize) -> u64 {
+    let sp = &seq.special_runs;
+    if cx == 0 || pos >= sp[cx - 1].1 {
+        return 0;
+    }
+    if seq.sep_pos.is_empty() && seq.iupac.is_empty() {
+        return pos - sp[cx - 1].0 + 1;
+    }
+    let nr = &seq.n_runs;
+    let idx = nr.partition_point(|&(s, _)| s <= pos);
+    if idx > 0 && pos < nr[idx - 1].1 {
+        pos - nr[idx - 1].0 + 1
+    } else {
+        0
+    }
+}
+
+/// Forward distance from `pos` to the next `SEQ_SEP` (`0` if `pos` is `SEQ_SEP`, `u64::MAX` if none).
+#[inline(always)]
+fn sep_forward_dist(sep_pos: &[u64], pos: u64) -> u64 {
+    if sep_pos.is_empty() {
+        return u64::MAX;
+    }
+    let idx = sep_pos.partition_point(|&p| p < pos);
+    if idx < sep_pos.len() {
+        sep_pos[idx] - pos
+    } else {
+        u64::MAX
+    }
+}
+
+/// Backward distance from `pos` (inclusive) to the nearest `SEQ_SEP` at or before `pos`
+/// (`0` if `pos` is `SEQ_SEP`, `u64::MAX` if none).
+#[inline(always)]
+fn sep_backward_dist(sep_pos: &[u64], pos: u64) -> u64 {
+    if sep_pos.is_empty() {
+        return u64::MAX;
+    }
+    let idx = sep_pos.partition_point(|&p| p <= pos);
+    if idx > 0 {
+        pos - sep_pos[idx - 1]
+    } else {
+        u64::MAX
+    }
+}
+
 /// Portable SWAR compaction of even bits (`0, 2, 4, ..., 62`) of `x` into bits `0..31`.
 #[inline(always)]
 pub(crate) fn pack_even_bits_swar(mut x: u64) -> u32 {
@@ -951,6 +1032,24 @@ fn extend_forward_2bit_portable(
             .min(safe_forward_dist(sp_y, ycol, &mut cy));
 
         if safe == 0 {
+            let n_span =
+                n_run_forward_dist(seq_x, xfil, cx).max(n_run_forward_dist(seq_y, ycol, cy));
+            if n_span > 0 {
+                let step = n_span
+                    .min(rem)
+                    .min(sep_forward_dist(&seq_x.sep_pos, xfil))
+                    .min(sep_forward_dist(&seq_y.sep_pos, ycol));
+                if step > 0 {
+                    if fscore < 0 || step > fscore as u64 {
+                        break;
+                    }
+                    fscore -= step as i64;
+                    xfil += step;
+                    ycol += step;
+                    rem -= step;
+                    continue;
+                }
+            }
             let vx = seq_x.byte_upper_at(xfil as usize);
             let vy = seq_y.byte_upper_at(ycol as usize);
             if vx == SEQ_SEP || vy == SEQ_SEP {
@@ -1115,6 +1214,27 @@ fn extend_backward_2bit_portable(
             .min(safe_backward_dist(sp_y, ycol2, &mut cy));
 
         if safe == 0 {
+            let n_span =
+                n_run_backward_dist(seq_x, xfil2, cx).max(n_run_backward_dist(seq_y, ycol2, cy));
+            if n_span > 0 {
+                let step = n_span
+                    .min(rem)
+                    .min(sep_backward_dist(&seq_x.sep_pos, xfil2))
+                    .min(sep_backward_dist(&seq_y.sep_pos, ycol2));
+                if step > 0 {
+                    if fscore < 0 || step > fscore as u64 {
+                        break;
+                    }
+                    fscore -= step as i64;
+                    rem -= step;
+                    if rem == 0 {
+                        break;
+                    }
+                    xfil2 -= step;
+                    ycol2 -= step;
+                    continue;
+                }
+            }
             let vx = seq_x.byte_upper_at(xfil2 as usize);
             let vy = seq_y.byte_upper_at(ycol2 as usize);
             if vx == SEQ_SEP || vy == SEQ_SEP {
@@ -1375,6 +1495,24 @@ macro_rules! impl_extend_2bit_avx2 {
                     .min(safe_forward_dist(sp_y, ycol, &mut cy));
 
                 if safe == 0 {
+                    let n_span = n_run_forward_dist(seq_x, xfil, cx)
+                        .max(n_run_forward_dist(seq_y, ycol, cy));
+                    if n_span > 0 {
+                        let step = n_span
+                            .min(rem)
+                            .min(sep_forward_dist(&seq_x.sep_pos, xfil))
+                            .min(sep_forward_dist(&seq_y.sep_pos, ycol));
+                        if step > 0 {
+                            if fscore < 0 || step > fscore as u64 {
+                                break;
+                            }
+                            fscore -= step as i64;
+                            xfil += step;
+                            ycol += step;
+                            rem -= step;
+                            continue;
+                        }
+                    }
                     let vx = seq_x.byte_upper_at(xfil as usize);
                     let vy = seq_y.byte_upper_at(ycol as usize);
                     if vx == SEQ_SEP || vy == SEQ_SEP {
@@ -1586,6 +1724,27 @@ macro_rules! impl_extend_2bit_avx2 {
                     .min(safe_backward_dist(sp_y, ycol2, &mut cy));
 
                 if safe == 0 {
+                    let n_span = n_run_backward_dist(seq_x, xfil2, cx)
+                        .max(n_run_backward_dist(seq_y, ycol2, cy));
+                    if n_span > 0 {
+                        let step = n_span
+                            .min(rem)
+                            .min(sep_backward_dist(&seq_x.sep_pos, xfil2))
+                            .min(sep_backward_dist(&seq_y.sep_pos, ycol2));
+                        if step > 0 {
+                            if fscore < 0 || step > fscore as u64 {
+                                break;
+                            }
+                            fscore -= step as i64;
+                            rem -= step;
+                            if rem == 0 {
+                                break;
+                            }
+                            xfil2 -= step;
+                            ycol2 -= step;
+                            continue;
+                        }
+                    }
                     let vx = seq_x.byte_upper_at(xfil2 as usize);
                     let vy = seq_y.byte_upper_at(ycol2 as usize);
                     if vx == SEQ_SEP || vy == SEQ_SEP {
@@ -1830,18 +1989,11 @@ unsafe fn extend_backward_2bit_avx2(
     }
 }
 
-/// Compute the exact safe skip boundary along `[pos_x ..= xfil_max]` after a long rejected
-/// extension (`xfil_max - pos_x > 256`).
-///
-/// Partitions `[pos_x ..= xfil_max]` into blocks of size `wl`, computes each block's min/max
-/// cumulative score, takes the backward suffix minimum `suf_min`, and advances `safe_b` while
-/// `running_max(0..=b) <= suf_min[b + 2]` (for any exact `wl`-mer starting in block `b`,
-/// `S(t) > S(p - 1)` holds automatically through block `b + 1`, so its extension is
-/// mathematically guaranteed to reproduce the exact same rejected HSP).
-///
-/// Returns `max(pos_x + safe_b * wl - 1, pos_x + wl / 2)`.
+/// Compute the exact, 100% lossless skip boundary along `[pos_x ..= xfil_max]` after a rejected
+/// extension (contiguous seeds only; returns `pos_x` immediately for spaced seeds or when no
+/// full leading block is provably valley-free).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exact_rejected_skip(
+pub(crate) fn exact_rejected_skip_checked(
     seq_x: &PackedSeq,
     seq_y: &PackedSeq,
     pos_x: u64,
@@ -1849,17 +2001,30 @@ pub(crate) fn exact_rejected_skip(
     xfil_max: u64,
     wl: usize,
     scoring: Scoring,
+    spaced_seed: bool,
     scratch: &mut SkipScratch,
 ) -> u64 {
-    let min_skip = pos_x + (wl / 2) as u64;
-    if xfil_max <= pos_x {
-        return min_skip;
+    if xfil_max <= pos_x || spaced_seed || wl == 0 || scoring.match_score <= 0 {
+        return pos_x;
     }
+
+    // Block-2 lookahead (`suf_min[b + 2]`) holds iff a contiguous `wl`-mer (`+wl * match_score`)
+    // cannot drop below `S(p - 1)` within block `b + 1` and cannot zero-tie before block `b + 2`,
+    // which requires `wl >= 2` and `max(mismatch_penalty, n_penalty) <= match_score`.
+    // Otherwise fall back to unconditionally sound block-1 lookahead (`suf_min[b + 1]`).
+    let lookahead = if wl >= 2
+        && scoring.mismatch_penalty <= scoring.match_score
+        && scoring.n_penalty <= scoring.match_score
+    {
+        2usize
+    } else {
+        1usize
+    };
 
     let span_len = (xfil_max - pos_x + 1) as usize;
     let n_blocks = span_len.div_ceil(wl);
-    if n_blocks < 3 {
-        return min_skip;
+    if n_blocks <= lookahead {
+        return pos_x;
     }
 
     scratch.blk_min.clear();
@@ -1910,7 +2075,7 @@ pub(crate) fn exact_rejected_skip(
                 let vx = seq_x.byte_upper_at(base_x + off);
                 let vy = seq_y.byte_upper_at(base_y + off);
                 if vx == SEQ_SEP || vy == SEQ_SEP {
-                    break;
+                    return pos_x;
                 }
                 if vx == b'N' || vy == b'N' {
                     s -= n_pen;
@@ -1940,21 +2105,38 @@ pub(crate) fn exact_rejected_skip(
 
     let mut run_max = i64::MIN;
     let mut safe_b = 0usize;
-    for b in 0..n_blocks - 2 {
+    for b in 0..n_blocks - lookahead {
         run_max = run_max.max(scratch.blk_max[b]);
-        if run_max <= scratch.suf_min[b + 2] {
+        if run_max <= scratch.suf_min[b + lookahead] {
             safe_b = b + 1;
         } else {
             break;
         }
     }
 
-    let skip_end = if safe_b > 0 {
+    if safe_b > 0 {
         (pos_x + (safe_b * wl) as u64).saturating_sub(1)
     } else {
-        0
-    };
-    skip_end.max(min_skip)
+        pos_x
+    }
+}
+
+/// Contiguous-seed wrapper around [`exact_rejected_skip_checked`] (preserves call compatibility
+/// with `minimizer.rs` while enforcing lossless skipping and scoring guards).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exact_rejected_skip(
+    seq_x: &PackedSeq,
+    seq_y: &PackedSeq,
+    pos_x: u64,
+    pos_y: u64,
+    xfil_max: u64,
+    wl: usize,
+    scoring: Scoring,
+    scratch: &mut SkipScratch,
+) -> u64 {
+    exact_rejected_skip_checked(
+        seq_x, seq_y, pos_x, pos_y, xfil_max, wl, scoring, false, scratch,
+    )
 }
 
 #[cfg(test)]
@@ -2158,14 +2340,362 @@ mod tests {
             skip2 < 128,
             "skip must not step over a valley boundary where a new HSP begins (got {skip2})"
         );
-        assert!(skip2 >= (wl / 2) as u64);
+        assert_eq!(
+            skip2, 0,
+            "safe_b == 0 must return pos_x with no +wl/2 clamp (got {skip2})"
+        );
+
+        // Spaced seed must always return `pos_x` immediately.
+        let skip_spaced = exact_rejected_skip_checked(
+            &g_good.seq,
+            &g_good.seq,
+            0,
+            0,
+            399,
+            wl,
+            Scoring::default(),
+            true,
+            &mut scratch,
+        );
+        assert_eq!(skip_spaced, 0);
+
+        // High mismatch penalty (`mismatch_penalty > match_score`) uses lookahead-1 safely:
+        // on a monotonic all-match span it still skips cleanly (up to n_blocks - 1 blocks),
+        // and when block 1 dips below block 0's peak it returns `pos_x`.
+        let harsh = Scoring {
+            match_score: 4,
+            mismatch_penalty: 8,
+            n_penalty: 1,
+        };
+        let skip_harsh_good = exact_rejected_skip_checked(
+            &g_good.seq,
+            &g_good.seq,
+            0,
+            0,
+            399,
+            wl,
+            harsh,
+            false,
+            &mut scratch,
+        );
+        assert!(skip_harsh_good >= 350);
+
+        let mut sy_dip = vec![b'A'; 400];
+        sy_dip[wl..wl + 8].fill(b'C'); // dips block 1 below block 0's peak under harsh -8
+        let gy_dip = Genome::from_records("ydip", [("y0", sy_dip)]);
+        let skip_harsh_dip = exact_rejected_skip_checked(
+            &g_good.seq,
+            &gy_dip.seq,
+            0,
+            0,
+            399,
+            wl,
+            harsh,
+            false,
+            &mut scratch,
+        );
+        assert_eq!(skip_harsh_dip, 0);
+    }
+
+    #[test]
+    fn exact_rejected_skip_recovers_valley_trimmed_hsp() {
+        use crate::pipeline::{CompareConfig, SeedingMode, compare_genomes};
+
+        let bases = *b"ACGT";
+        let alt_base = |b: u8| match b {
+            b'A' => b'C',
+            b'C' => b'G',
+            b'G' => b'T',
+            _ => b'A',
+        };
+        let mut rng = 0x1234_5678_9ABC_DEF0u64;
+        let mut pseudo_dna = |n: usize| -> Vec<u8> {
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                out.push(bases[((rng >> 32) & 3) as usize]);
+            }
+            out
+        };
+
+        // Helper to build the two valley-trimming scenarios:
+        // - Case 1 (74-bp MEM): Region B = 74 matches, Region C = 34 mismatches
+        // - Case 2 (44-bp MEM): Region B = 44 matches, Region C = 33 mismatches
+        for &(mem_len, valley_len, expected_x_end, expected_len, expected_score) in &[
+            (74usize, 34usize, 1223u64, 1124u64, 3984u64),
+            (44usize, 33usize, 1193u64, 1094u64, 3864u64),
+        ] {
+            let total = 100 + 1050 + mem_len + valley_len + 720 + 1200;
+            let sx = pseudo_dna(total);
+            let mut sy = sx.clone();
+
+            // Prefix [0..100): all mismatches
+            for i in 0..100 {
+                sy[i] = alt_base(sx[i]);
+            }
+            // Region A [100..1150): exact 32-mer at [100..132), then 1 mismatch every 16 bp
+            for i in (132..1150).step_by(16) {
+                sy[i] = alt_base(sx[i]);
+            }
+            // Region B [1150..1150+mem_len): exact matches (MEM)
+            let reg_c = 1150 + mem_len;
+            // Region C [reg_c..reg_c+valley_len): consecutive mismatches
+            for i in reg_c..(reg_c + valley_len) {
+                sy[i] = alt_base(sx[i]);
+            }
+            // Region D [reg_d..reg_d+720): 60 x (7 match + 5 mismatch) -> low-sim right tail
+            let reg_d = reg_c + valley_len;
+            for blk in 0..60 {
+                let start = reg_d + blk * 12;
+                for m in 7..12 {
+                    sy[start + m] = alt_base(sx[start + m]);
+                }
+            }
+            // Region E [reg_d+720..total): all mismatches
+            for i in (reg_d + 720)..total {
+                sy[i] = alt_base(sx[i]);
+            }
+
+            let gx = Genome::from_records("x", [("x0", sx)]);
+            let gy = Genome::from_records("y", [("y0", sy)]);
+            let cfg = CompareConfig {
+                word_length: 32,
+                min_length: 1000,
+                min_similarity: 75.0,
+                freq_limit: 20,
+                seeding_mode: SeedingMode::Exact,
+                compare_reverse: false,
+                soft_mask: false,
+                ..CompareConfig::default()
+            };
+            let res = compare_genomes(&gx, &gy, &cfg, None).unwrap();
+            assert_eq!(
+                res.fragments.len(),
+                1,
+                "expected 1 valley-trimmed HSP for {mem_len}-bp MEM, got {:?}",
+                res.fragments
+            );
+            let f = &res.fragments[0];
+            assert_eq!(f.x_start, 100);
+            assert_eq!(f.x_end, expected_x_end);
+            assert_eq!(f.length, expected_len);
+            assert_eq!(f.score, expected_score);
+        }
+    }
+
+    #[test]
+    fn bulk_n_run_decay_matches_scalar_all_corner_cases() {
+        let scoring = Scoring::default();
+        let avx2 = has_avx2();
+        let bmi2 = has_bmi2();
+
+        let check = |label: &str,
+                     gx: &Genome,
+                     gy: &Genome,
+                     px: u64,
+                     py: u64,
+                     wl: u64,
+                     seed_ident: u64,
+                     seed_score: i64| {
+            let f_scalar = extend_forward_scalar(
+                &gx.seq, &gy.seq, px, py, wl, seed_ident, seed_score, scoring,
+            );
+            let f_port =
+                extend_forward_2bit_portable(&gx.seq, &gy.seq, px, py, wl, seed_ident, seed_score);
+            assert_eq!(f_port, f_scalar, "portable forward mismatch on {label}");
+
+            let b_scalar = extend_backward_scalar(&gx.seq, &gy.seq, px, py, f_scalar, scoring);
+            let b_port = extend_backward_2bit_portable(&gx.seq, &gy.seq, px, py, f_port);
+            assert_eq!(b_port, b_scalar, "portable backward mismatch on {label}");
+
+            #[cfg(target_arch = "x86_64")]
+            if avx2 && has_popcnt() {
+                let cx = sp_cursor_for(&gx.seq.special_runs, px);
+                let cy = sp_cursor_for(&gy.seq.special_runs, py);
+                if bmi2 {
+                    let f_bmi2 = unsafe {
+                        extend_forward_2bit_avx2_bmi2(
+                            &gx.seq, &gy.seq, px, py, wl, seed_ident, seed_score, cx, cy,
+                        )
+                    };
+                    assert_eq!(f_bmi2, f_scalar, "avx2+bmi2 forward mismatch on {label}");
+                    let b_bmi2 = unsafe {
+                        extend_backward_2bit_avx2_bmi2(&gx.seq, &gy.seq, px, py, f_bmi2, cx, cy)
+                    };
+                    assert_eq!(b_bmi2, b_scalar, "avx2+bmi2 backward mismatch on {label}");
+                }
+                let f_swar = unsafe {
+                    extend_forward_2bit_avx2_swar(
+                        &gx.seq, &gy.seq, px, py, wl, seed_ident, seed_score, cx, cy,
+                    )
+                };
+                assert_eq!(f_swar, f_scalar, "avx2+swar forward mismatch on {label}");
+                let b_swar = unsafe {
+                    extend_backward_2bit_avx2_swar(&gx.seq, &gy.seq, px, py, f_swar, cx, cy)
+                };
+                assert_eq!(b_swar, b_scalar, "avx2+swar backward mismatch on {label}");
+            }
+            let _ = (avx2, bmi2);
+        };
+
+        let wl = 16u64;
+        let seed_score = 4 * wl as i64; // 64
+
+        // 1. Long N runs (50, 64 exact survival, 65 death, 200, 1000) on X only, Y only, and both.
+        for &n_len in &[1usize, 50, 64, 65, 200, 1000] {
+            for mode in 0..3 {
+                let prefix = 120usize;
+                let suffix = 128usize;
+                let total = prefix + n_len + wl as usize + n_len + suffix;
+                let mut sx = vec![b'A'; total];
+                let mut sy = vec![b'A'; total];
+                let pos = prefix + n_len;
+                // Backward N-run immediately before seed, forward N-run immediately after seed.
+                if mode == 0 || mode == 2 {
+                    sx[prefix..pos].fill(b'N');
+                    sx[pos + wl as usize..pos + wl as usize + n_len].fill(b'N');
+                }
+                if mode == 1 || mode == 2 {
+                    sy[prefix..pos].fill(b'N');
+                    sy[pos + wl as usize..pos + wl as usize + n_len].fill(b'N');
+                }
+                // Offset overlap for mode 2
+                if mode == 2 && n_len >= 10 {
+                    sy[pos + wl as usize + n_len..pos + wl as usize + n_len + 10].fill(b'N');
+                }
+                let gx = Genome::from_records("x", [("x0", sx)]);
+                let gy = Genome::from_records("y", [("y0", sy)]);
+                check(
+                    &format!("n_run_len={n_len}_mode={mode}"),
+                    &gx,
+                    &gy,
+                    pos as u64,
+                    pos as u64,
+                    wl,
+                    wl,
+                    seed_score,
+                );
+            }
+        }
+
+        // 2. N-run vs SEQ_SEP at offset 0, 17, and end (both X-N/Y-SEP and Y-N/X-SEP).
+        for &sep_off in &[0usize, 17, 40] {
+            for swap in [false, true] {
+                let mut sx = vec![b'A'; 300];
+                let mut sy = vec![b'A'; 300];
+                let pos = 100usize;
+                // Backward N run [60..100), forward N run [116..156)
+                if !swap {
+                    sx[60..100].fill(b'N');
+                    sx[116..156].fill(b'N');
+                    sy[116 + sep_off] = b'*';
+                    sy[99 - sep_off.min(39)] = b'*';
+                } else {
+                    sy[60..100].fill(b'N');
+                    sy[116..156].fill(b'N');
+                    sx[116 + sep_off] = b'*';
+                    sx[99 - sep_off.min(39)] = b'*';
+                }
+                let gx = Genome::from_records("x", [("x0", sx)]);
+                let gy = Genome::from_records("y", [("y0", sy)]);
+                check(
+                    &format!("n_vs_sep_off={sep_off}_swap={swap}"),
+                    &gx,
+                    &gy,
+                    pos as u64,
+                    pos as u64,
+                    wl,
+                    wl,
+                    seed_score,
+                );
+            }
+        }
+
+        // 3. N-run aligned with IUPAC 'R'/'Y' on the other sequence.
+        {
+            let mut sx = vec![b'A'; 260];
+            let mut sy = vec![b'A'; 260];
+            sx[60..100].fill(b'N');
+            sx[116..156].fill(b'N');
+            sy[75] = b'R';
+            sy[120] = b'Y';
+            sy[130] = b'R';
+            let gx = Genome::from_records("x", [("x0", sx)]);
+            let gy = Genome::from_records("y", [("y0", sy)]);
+            check("n_vs_iupac", &gx, &gy, 100, 100, wl, wl, seed_score);
+        }
+
+        // 4. Backward N-run reaching index 0 (`rem == step`) -> verifies zero u64 underflow.
+        for &(px, py) in &[(20u64, 20u64), (20u64, 50u64), (50u64, 20u64)] {
+            let mut sx = vec![b'A'; 200];
+            let mut sy = vec![b'A'; 200];
+            sx[0..px as usize].fill(b'N');
+            sy[0..py as usize].fill(b'N');
+            let gx = Genome::from_records("x", [("x0", sx)]);
+            let gy = Genome::from_records("y", [("y0", sy)]);
+            check(
+                &format!("bwd_rem_eq_step_px={px}_py={py}"),
+                &gx,
+                &gy,
+                px,
+                py,
+                wl,
+                wl,
+                seed_score,
+            );
+        }
+
+        // 5. Reverse-complemented Genome with N-runs + SEQ_SEP + IUPAC.
+        {
+            let mut sx = vec![b'G'; 300];
+            let mut sy = vec![b'C'; 300];
+            sx[80..110].fill(b'N');
+            sx[150..200].fill(b'N');
+            sy[90..130].fill(b'N');
+            sy[220] = b'*';
+            sy[140] = b'R';
+            let gx = Genome::from_records("x", [("x0", sx)]);
+            let gy_rc = Genome::from_records("y", [("y0", sy)]).reverse_complement();
+            // Place a matching seed at pos 120 in rc coordinates.
+            let mut rx = vec![b'G'; 300];
+            for k in 0..wl as usize {
+                rx[120 + k] = gy_rc.seq.byte_upper_at(120 + k);
+            }
+            rx[80..110].fill(b'N');
+            rx[150..190].fill(b'N');
+            let gx2 = Genome::from_records("x2", [("x0", rx)]);
+            check(
+                "rev_comp_n_sep_iupac",
+                &gx2,
+                &gy_rc,
+                120,
+                120,
+                wl,
+                wl,
+                seed_score,
+            );
+            let _ = gx;
+        }
+
+        // 6. Negative initial seed_score = -4 immediately hitting an N-run.
+        {
+            let mut sx = vec![b'A'; 128];
+            let mut sy = vec![b'A'; 128];
+            sx[40 + wl as usize..40 + wl as usize + 30].fill(b'N');
+            sy[20..40].fill(b'N');
+            let gx = Genome::from_records("x", [("x0", sx)]);
+            let gy = Genome::from_records("y", [("y0", sy)]);
+            check("neg_seed_score_n_run", &gx, &gy, 40, 40, wl, 7, -4);
+        }
     }
 
     #[test]
     fn record_unit_exact_matches_fp64_record_exhaustively() {
         let mut cov_exact = CoverageMatrix::new();
         let mut cov_fp = CoverageMatrix::new();
-        for length in 2usize..=160 {
+        for length in 2usize..=288 {
             for u_max in 0u32..=(length as u32) {
                 cov_exact.record_unit_exact(length, u_max);
                 let sim = (((4 * u_max) as f64) * 100.0 / ((length as f64) * 4.0)) as f32;
@@ -2173,5 +2703,263 @@ mod tests {
             }
         }
         assert_eq!(cov_exact.bins, cov_fp.bins);
+    }
+
+    #[test]
+    fn negative_seed_score_spaced_seed_matches_scalar_oracle() {
+        use crate::pipeline::{CompareConfig, compare_genomes};
+        use crate::spaced::SpacedSeed;
+
+        // Custom palindromic spaced seed `10000111100001` (weight=6, span=14):
+        // when all 8 don't-care positions mismatch, `seed_score = 6*4 - 8*4 = -8 < 0`.
+        // Previously, 2-bit/AVX2 Fast-Path 1 (`diff == 0`) omitted `if fscore < 0 { break; }`,
+        // causing default `(4, 4, 1)` to extend past base 0 and diverge from 2x-scaled `(8, 8, 2)`.
+        let seed = SpacedSeed::parse("10000111100001").unwrap();
+        let wl = seed.span as u64;
+        let alt = |b: u8| match b {
+            b'A' => b'C',
+            b'C' => b'G',
+            b'G' => b'T',
+            _ => b'A',
+        };
+
+        let alphabet = *b"ACGT";
+        let mut rng = 0x5EED_CAFE_0001_0002u64;
+        let sx: Vec<u8> = (0..320)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                alphabet[((rng >> 32) & 3) as usize]
+            })
+            .collect();
+        let mut sy: Vec<u8> = sx.iter().map(|&b| alt(b)).collect();
+
+        // Plant a hit at pos=100 matching ONLY the 6 care positions of `10000111100001`
+        // (`seed_score = -8`), followed immediately by a 46-bp exact match `[114..160)`
+        // (and 40-bp exact match before pos=100 in a second test case to exercise backward!).
+        for (i, ch) in "10000111100001".bytes().enumerate() {
+            if ch == b'1' {
+                sy[100 + i] = sx[100 + i];
+            }
+        }
+        sy[114..160].copy_from_slice(&sx[114..160]);
+        let gx = Genome::from_records("x", [("x0", sx.as_slice())]);
+        let gy = Genome::from_records("y", [("y0", sy.as_slice())]);
+
+        // 1. Direct entry-point parity: portable, AVX2+BMI2, AVX2+SWAR, and extend_single_hit_outcome
+        //    vs exact scalar oracle across `seed_score ∈ {-8, -4}` (forward & backward clean matches).
+        for &(seed_ident, seed_score, label) in &[
+            (6u64, -8i64, "neg8_clean_fwd"),
+            (7u64, -4i64, "neg4_clean_fwd"),
+        ] {
+            let opts = ExtendOptions {
+                min_length: 40,
+                min_similarity: 50.0,
+                word_length: seed.span,
+                fixed_length: true,
+                strand: 'f',
+                scoring: Scoring::default(),
+                spaced_seed: true,
+            };
+            let hit = Hit {
+                diag: 0,
+                pos_x: 100,
+            };
+            let f_oracle = extend_forward_scalar(
+                &gx.seq,
+                &gy.seq,
+                100,
+                100,
+                wl,
+                seed_ident,
+                seed_score,
+                opts.scoring,
+            );
+            let b_oracle =
+                extend_backward_scalar(&gx.seq, &gy.seq, 100, 100, f_oracle, opts.scoring);
+            let mut cov_oracle = CoverageMatrix::new();
+            let out_oracle = finalize_extend_outcome(
+                hit,
+                100,
+                100,
+                &gx,
+                &gy,
+                opts,
+                f_oracle,
+                b_oracle,
+                Some(&mut cov_oracle),
+            );
+
+            let mut cov_port = CoverageMatrix::new();
+            let out_port = extend_single_hit_with_seed_portable(
+                hit,
+                &gx,
+                &gy,
+                opts,
+                seed_ident,
+                seed_score,
+                Some(&mut cov_port),
+            );
+            assert_eq!(
+                out_port.fragment, out_oracle.fragment,
+                "portable frag {label}"
+            );
+            assert_eq!(
+                out_port.xfil_max, out_oracle.xfil_max,
+                "portable xfil_max {label}"
+            );
+            assert_eq!(cov_port.bins, cov_oracle.bins, "portable cov {label}");
+
+            if seed_score == -8 {
+                // With seed_score = -8 and base 0 matching, fscore = -4 < 0 -> MUST stop at 100 + wl.
+                assert_eq!(out_oracle.xfil_max, 100 + wl);
+                assert!(out_oracle.fragment.is_none());
+
+                // Also verify extend_single_hit_outcome (computes seed_score = -8 from seq_x/seq_y).
+                let mut cov_entry = CoverageMatrix::new();
+                let out_entry = extend_single_hit_outcome(
+                    hit,
+                    &gx,
+                    &gy,
+                    opts,
+                    has_avx2(),
+                    has_bmi2(),
+                    &mut cov_entry,
+                );
+                assert_eq!(out_entry.fragment, out_oracle.fragment);
+                assert_eq!(out_entry.xfil_max, out_oracle.xfil_max);
+                assert_eq!(cov_entry.bins, cov_oracle.bins);
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            if has_avx2() && has_popcnt() {
+                let cx = sp_cursor_for(&gx.seq.special_runs, 100);
+                if has_bmi2() {
+                    let mut cov_bmi2 = CoverageMatrix::new();
+                    let out_bmi2 = unsafe {
+                        extend_single_hit_with_seed_avx2_bmi2(
+                            hit,
+                            &gx,
+                            &gy,
+                            opts,
+                            seed_ident,
+                            seed_score,
+                            cx,
+                            Some(&mut cov_bmi2),
+                        )
+                    };
+                    assert_eq!(out_bmi2.fragment, out_oracle.fragment, "bmi2 frag {label}");
+                    assert_eq!(
+                        out_bmi2.xfil_max, out_oracle.xfil_max,
+                        "bmi2 xfil_max {label}"
+                    );
+                    assert_eq!(cov_bmi2.bins, cov_oracle.bins, "bmi2 cov {label}");
+                }
+                let mut cov_swar = CoverageMatrix::new();
+                let out_swar = unsafe {
+                    extend_single_hit_with_seed_avx2_swar(
+                        hit,
+                        &gx,
+                        &gy,
+                        opts,
+                        seed_ident,
+                        seed_score,
+                        cx,
+                        Some(&mut cov_swar),
+                    )
+                };
+                assert_eq!(out_swar.fragment, out_oracle.fragment, "swar frag {label}");
+                assert_eq!(
+                    out_swar.xfil_max, out_oracle.xfil_max,
+                    "swar xfil_max {label}"
+                );
+                assert_eq!(cov_swar.bins, cov_oracle.bins, "swar cov {label}");
+            }
+        }
+
+        // 2. Full compare_genomes differential parity: default (4, 4, 1) vs 2x-scaled (8, 8, 2)
+        //    across two isolated contigs:
+        //    - contig 0: 40-bp exact prefix `[60..100)` + `seed_score=-8` at 100 + `[114..160)`
+        //      (exercises backward extension starting from `fwd.fscore_max = -4 < 0`).
+        //    - contig 1: exact minimal repro — `seed_score=-8` at 100 + 55-bp HSP `[105..160)`
+        //      with mismatches `{109..112}` (must emit `[105..=159]` len=55, NOT `[100..=159]` len=60).
+        let mut sy0 = sy.clone();
+        sy0[60..100].copy_from_slice(&sx[60..100]);
+
+        let mut sy1: Vec<u8> = sx.iter().map(|&b| alt(b)).collect();
+        sy1[105..160].copy_from_slice(&sx[105..160]);
+        sy1[100] = sx[100];
+        for pos in 109..113 {
+            sy1[pos] = alt(sx[pos]);
+        }
+
+        let gx_full =
+            Genome::from_records("x_full", [("x0", sx.as_slice()), ("x1", sx.as_slice())]);
+        let gy_full =
+            Genome::from_records("y_full", [("y0", sy0.as_slice()), ("y1", sy1.as_slice())]);
+
+        let cfg_1x = CompareConfig {
+            word_length: seed.span,
+            spaced_seed: Some(seed.clone()),
+            min_length: 50,
+            min_similarity: 50.0,
+            freq_limit: 50,
+            compare_reverse: true,
+            scoring: Scoring {
+                match_score: 4,
+                mismatch_penalty: 4,
+                n_penalty: 1,
+            },
+            collect_coverage: true,
+            ..Default::default()
+        };
+        let cfg_2x = CompareConfig {
+            scoring: Scoring {
+                match_score: 8,
+                mismatch_penalty: 8,
+                n_penalty: 2,
+            },
+            ..cfg_1x.clone()
+        };
+
+        let r1 = compare_genomes(&gx_full, &gy_full, &cfg_1x, None).unwrap();
+        let r2 = compare_genomes(&gx_full, &gy_full, &cfg_2x, None).unwrap();
+
+        let c1_off = sx.len() as u64;
+        assert!(
+            r1.fragments.iter().any(|f| {
+                f.seq_x == 1
+                    && f.seq_y == 1
+                    && f.x_start == c1_off + 105
+                    && f.x_end == c1_off + 159
+                    && f.length == 55
+                    && f.ident == 51
+                    && f.score == 188
+            }),
+            "expected exact 55-bp HSP [105..=159] on contig 1, got {:?}",
+            r1.fragments
+        );
+        assert!(
+            !r1.fragments.iter().any(|f| {
+                f.seq_x == 1 && f.seq_y == 1 && f.x_start == c1_off + 100 && f.length == 60
+            }),
+            "must not emit buggy 60-bp HSP [100..=159] from negative seed_score, got {:?}",
+            r1.fragments
+        );
+        assert_eq!(r1.fragments.len(), r2.fragments.len());
+        for (f1, f2) in r1.fragments.iter().zip(r2.fragments.iter()) {
+            assert_eq!(f1.diag, f2.diag);
+            assert_eq!(f1.x_start, f2.x_start);
+            assert_eq!(f1.y_start, f2.y_start);
+            assert_eq!(f1.x_end, f2.x_end);
+            assert_eq!(f1.y_end, f2.y_end);
+            assert_eq!(f1.length, f2.length);
+            assert_eq!(f1.ident, f2.ident);
+            assert_eq!(f1.strand, f2.strand);
+            assert_eq!(f1.score * 2, f2.score);
+        }
+        assert_eq!(
+            r1.coverage.bins, r2.coverage.bins,
+            "CoverageMatrix (.frags.MAT) must match 2x-scaled scalar oracle bit-for-bit"
+        );
     }
 }

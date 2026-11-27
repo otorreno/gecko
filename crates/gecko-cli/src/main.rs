@@ -201,8 +201,8 @@ struct CompareArgs {
     #[arg(long)]
     spaced_seed: Option<String>,
 
-    /// Seeding mechanism (`exact`, `minimizer` for contiguous k >= 18, or `auto`).
-    #[arg(long, value_enum, default_value_t = SeedingArg::Exact)]
+    /// Seeding mechanism (`auto` [default], `exact`, or `minimizer` for contiguous k >= 18).
+    #[arg(long, value_enum, default_value_t = SeedingArg::Auto)]
     seeding: SeedingArg,
 
     /// Require two non-overlapping seed hits on the same diagonal within WINDOW bp before extension
@@ -393,13 +393,21 @@ struct AllVsAllArgs {
     #[arg(long)]
     spaced_seed: Option<String>,
 
-    /// Seeding mechanism (`exact`, `minimizer` for contiguous k >= 18, or `auto`).
-    #[arg(long, value_enum, default_value_t = SeedingArg::Exact)]
+    /// Seeding mechanism (`auto` [default], `exact`, or `minimizer` for contiguous k >= 18).
+    #[arg(long, value_enum, default_value_t = SeedingArg::Auto)]
     seeding: SeedingArg,
 
     /// Require two non-overlapping seed hits on the same diagonal within WINDOW bp before extension.
     #[arg(long, num_args = 0..=1, default_missing_value = "40", value_name = "WINDOW")]
     two_hit: Option<u32>,
+
+    /// Include lowercase (soft-masked) bases when generating k-mer seeds.
+    #[arg(long)]
+    no_soft_mask: bool,
+
+    /// Compare only the forward strand (skip reverse complement of reference).
+    #[arg(long)]
+    forward_only: bool,
 
     /// File extensions to include (comma-separated).
     #[arg(long, value_delimiter = ',', default_values_t = ["fa".to_string(), "fasta".to_string(), "fna".to_string(), "gz".to_string()])]
@@ -824,7 +832,9 @@ fn cmd_all_vs_all(args: AllVsAllArgs) -> Result<()> {
         word_length,
         spaced_seed,
         freq_limit: args.freq_limit,
+        soft_mask: !args.no_soft_mask,
         memory_budget: args.memory,
+        compare_reverse: !args.forward_only,
         seeding_mode: args.seeding.into(),
         two_hit_window: args.two_hit,
         collect_coverage: formats.contains(&OutputFormat::Mat),

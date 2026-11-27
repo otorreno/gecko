@@ -1989,6 +1989,8 @@ fn tier1_tiny_memory_ondisk_spill_canonical_parity() {
         r.to_str().unwrap(),
         "-k",
         "32",
+        "--seeding",
+        "exact",
         "-l",
         "100",
         "-s",

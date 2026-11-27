@@ -12,6 +12,9 @@
  *    Fast-path 2 popcnt decay shortcut (order-independent on backward), and
  *    1,024-bp coalesced warp stepping in extend_long_warp_kernel.
  *  - F14/F15: Tile-relative HitKeyLayout unpacking and 24-byte GpuFrag output.
+ *  - W3-F13c: __launch_bounds__(256, 4) on both kernels (keeping score_special_pair
+ *    __forceinline__) trims extend_long_warp_kernel from 76 -> <= 64 regs (100% T4
+ *    occupancy) with 0 B stack / 0 STL / 0 LDL across sm_75/80/86/89.
  *
  * NOTE: NEVER #include <cub/cub.cuh> in this translation unit so standalone
  * static verification inspects strictly the extension kernels.
@@ -96,7 +99,7 @@ static __device__ __forceinline__ uint64_t pack_long_seg(uint32_t seg_start, uin
     return ((uint64_t)seg_start << 32) | (uint64_t)seg_len;
 }
 
-static __global__ void extend_short_kernel(
+static __global__ __launch_bounds__(256, 4) void extend_short_kernel(
     const uint64_t * __restrict__ hits,
     uint32_t n_hits,
     HitKeyLayout key_layout,
@@ -519,7 +522,7 @@ static __global__ void extend_short_kernel(
     }
 }
 
-static __global__ void extend_long_warp_kernel(
+static __global__ __launch_bounds__(256, 4) void extend_long_warp_kernel(
     const uint64_t * __restrict__ hits,
     const uint64_t * __restrict__ long_segs,
     uint32_t n_long,
@@ -1009,24 +1012,32 @@ uint32_t gpu_extend_tile_two_tier(
     GpuFrag *d_out_frags,
     uint32_t *d_frag_count,
     uint32_t max_frags,
-    bool &out_overflowed
+    bool &out_overflowed,
+    GeckoCudaProfile *prof
 ) {
     out_overflowed = false;
     CUDA_CHECK_VOID(cudaMemset(d_long_count, 0, sizeof(uint32_t)));
     CUDA_CHECK_VOID(cudaMemset(d_frag_count, 0, sizeof(uint32_t)));
     if (n_hits == 0U) return 0U;
 
-    extend_short_kernel<<<(n_hits + 255U) / 256U, 256>>>(
-        d_filtered_hits, n_hits, key_layout, seqX, seqY, seqY_rc,
-        wl, is_spaced, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
-        d_long_seeds, d_long_count, d_out_frags, d_frag_count, max_frags);
-    CUDA_CHECK_VOID(cudaGetLastError());
+    {
+        CudaEventScope ev(prof, prof ? &prof->extend_short_ms : nullptr);
+        extend_short_kernel<<<(n_hits + 255U) / 256U, 256>>>(
+            d_filtered_hits, n_hits, key_layout, seqX, seqY, seqY_rc,
+            wl, is_spaced, min_len, sim_th, match_score, mismatch_penalty, n_penalty,
+            d_long_seeds, d_long_count, d_out_frags, d_frag_count, max_frags);
+        CUDA_CHECK_VOID(cudaGetLastError());
+    }
 
     uint32_t h_nlong = 0U;
     CUDA_CHECK_VOID(cudaMemcpy(&h_nlong, d_long_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    if (prof && prof->enabled) {
+        prof->long_seeds += h_nlong;
+    }
     if (h_nlong > 0U) {
         const uint32_t warps_per_block = 8U;
         uint32_t grid = (h_nlong + warps_per_block - 1U) / warps_per_block;
+        CudaEventScope ev(prof, prof ? &prof->extend_long_ms : nullptr);
         extend_long_warp_kernel<<<grid, warps_per_block * 32U>>>(
             d_filtered_hits, d_long_seeds, h_nlong, key_layout, seqX, seqY, seqY_rc,
             wl, is_spaced, min_len, sim_th, match_score, mismatch_penalty, n_penalty,

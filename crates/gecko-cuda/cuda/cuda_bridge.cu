@@ -394,10 +394,10 @@ extern "C" GeckoCudaRefHandle *gecko_cuda_prepare_ref(
     /* F16: Query hardware L2 cache size once for L2-resident partitioned probe auto-tuning */
     int dev = 0;
     cudaGetDevice(&dev);
-    cudaDeviceProp prop{};
+    int l2_bytes = 0;
     h->l2_cache_bytes = 4 << 20;
-    if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.l2CacheSize > 0) {
-        h->l2_cache_bytes = prop.l2CacheSize;
+    if (cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, dev) == cudaSuccess && l2_bytes > 0) {
+        h->l2_cache_bytes = l2_bytes;
     }
 
     if (upload_packed_seq(ref_seq, h->seqY, &h->scratch) != 0) {

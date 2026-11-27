@@ -6,17 +6,18 @@
  * and Hash-CSR uint64_t), bit-bounded CUB DeviceRadixSort::SortPairs, exact
  * per-strand freq_limit compaction + global/single-slab 1-bit dropped bitmap,
  * inline 1-bit unique non-palindromic ref k-mer bitmap (F16), fused
- * TransformInputIterator tag selection, and warp-aggregated pure-GPU CSR scan.
+ * thrust::transform_iterator tag selection, and warp-aggregated pure-GPU CSR scan.
  */
 
 #include <utility>
 #include <cub/cub.cuh>
+#include <thrust/iterator/transform_iterator.h>
 
 #include "cuda_common.cuh"
 
 struct ExtractTagOp {
     int tag_shift;
-    __host__ __device__ __forceinline__ uint32_t operator()(const uint64_t &k) const {
+    __host__ __device__ __forceinline__ uint32_t operator()(uint64_t k) const {
         return (uint32_t)(k >> tag_shift);
     }
 };
@@ -952,8 +953,7 @@ GpuRefIndex gpu_build_ref_index(
         CUDA_CHECK_VOID(cudaMalloc(&d_tags, tag_alloc * sizeof(uint32_t)));
 
         if (idx.n_kept > 0U) {
-            cub::TransformInputIterator<uint32_t, ExtractTagOp, const uint64_t *> tag_iter(
-                d_sorted_keys, ExtractTagOp{tag_shift});
+            auto tag_iter = thrust::make_transform_iterator(d_sorted_keys, ExtractTagOp{tag_shift});
             size_t sel_tag_bytes = 0;
             cub::DeviceSelect::Flagged(nullptr, sel_tag_bytes, tag_iter, d_keep, d_tags, d_num_out, (int)idx.n_valid);
             gpu_ensure_cub_temp(d_cub_temp, cub_temp_cap, sel_tag_bytes);

@@ -63,13 +63,17 @@ fn main() {
         cmd.arg("-o");
         cmd.arg(&obj_path);
 
-        let status = cmd.status().unwrap_or_else(|e| {
+        let output = cmd.output().unwrap_or_else(|e| {
             panic!("Failed to execute `{nvcc}` (is CUDA Toolkit installed?): {e}");
         });
-        assert!(
-            status.success(),
-            "nvcc failed compiling {src} with status {status}"
-        );
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!(
+                "nvcc failed compiling {src} with status {}\n--- nvcc stdout ---\n{stdout}\n--- nvcc stderr ---\n{stderr}",
+                output.status
+            );
+        }
         obj_paths.push(obj_path);
     }
 

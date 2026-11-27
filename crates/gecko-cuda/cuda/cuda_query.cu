@@ -14,6 +14,28 @@
 #include <cub/cub.cuh>
 #include "cuda_common.cuh"
 
+static __device__ __forceinline__ void stage_hit_dev(
+    uint64_t *s_hits,
+    uint32_t *s_cnt,
+    uint64_t * __restrict__ out_hits,
+    uint32_t * __restrict__ hit_count,
+    uint32_t max_hits,
+    uint64_t packed_key
+) {
+    uint32_t lslot = atomicAdd(s_cnt, 1U);
+    if (lslot < GECKO_HIT_STAGE_CAP) {
+        s_hits[lslot] = packed_key;
+    } else {
+        /* Lock-free global overflow spill: ZERO __syncthreads() -> 100% deadlock-free! */
+        if (*(volatile const uint32_t *)hit_count <= max_hits) {
+            uint32_t gslot = atomicAdd(hit_count, 1U);
+            if (gslot < max_hits) {
+                out_hits[gslot] = packed_key;
+            }
+        }
+    }
+}
+
 /* ---- F14 + F16: Monolithic / Direct-CSR / Unique-Bypass Tiled Query Kernel ---- */
 template <bool DIRECT_CSR, bool USE_UNIQUE_BM>
 static __global__ void query_left_maximal_kernel(
@@ -81,21 +103,6 @@ static __global__ void query_left_maximal_kernel(
     uint32_t act_posY_prev = 0U;
     uint32_t valid_q_local = 0U;
     uint32_t bypassed_local = 0U;
-
-    auto stage_hit = [&](uint64_t packed_key) {
-        uint32_t lslot = atomicAdd(&s_cnt, 1U);
-        if (lslot < GECKO_HIT_STAGE_CAP) {
-            s_hits[lslot] = packed_key;
-        } else {
-            /* Lock-free global overflow spill: ZERO __syncthreads() -> 100% deadlock-free! */
-            if (*(volatile const uint32_t *)hit_count <= max_hits) {
-                uint32_t gslot = atomicAdd(hit_count, 1U);
-                if (gslot < max_hits) {
-                    out_hits[gslot] = packed_key;
-                }
-            }
-        }
-    };
 
     for (uint32_t wave = 0U; wave < num_waves; ++wave) {
         if (active) {
@@ -208,10 +215,12 @@ static __global__ void query_left_maximal_kernel(
                                             }
                                             if (emit) {
                                                 if (act_strand == 0U) {
-                                                    stage_hit(pack_hit_key_tile(key_layout, 0U, posX, cand_y));
+                                                    stage_hit_dev(s_hits, &s_cnt, out_hits, hit_count, max_hits,
+                                                                  pack_hit_key_tile(key_layout, 0U, posX, cand_y));
                                                 } else {
                                                     uint32_t posY_rc = (uint32_t)(seqY.len - (uint64_t)cand_y - (uint64_t)wl);
-                                                    stage_hit(pack_hit_key_tile(key_layout, 1U, posX, posY_rc));
+                                                    stage_hit_dev(s_hits, &s_cnt, out_hits, hit_count, max_hits,
+                                                                  pack_hit_key_tile(key_layout, 1U, posX, posY_rc));
                                                 }
                                             }
                                             if (stats_buf) bypassed_local++;
@@ -314,7 +323,8 @@ static __global__ void query_left_maximal_kernel(
                                             }
                                         }
                                         if (emit) {
-                                            stage_hit(pack_hit_key_tile(key_layout, 0U, posX, posY_orig));
+                                            stage_hit_dev(s_hits, &s_cnt, out_hits, hit_count, max_hits,
+                                                          pack_hit_key_tile(key_layout, 0U, posX, posY_orig));
                                         }
                                     }
                                 }
@@ -350,7 +360,8 @@ static __global__ void query_left_maximal_kernel(
                                             }
                                         }
                                         if (emit) {
-                                            stage_hit(pack_hit_key_tile(key_layout, 1U, posX, posY_rc));
+                                            stage_hit_dev(s_hits, &s_cnt, out_hits, hit_count, max_hits,
+                                                          pack_hit_key_tile(key_layout, 1U, posX, posY_rc));
                                         }
                                     }
                                 }
@@ -730,20 +741,6 @@ static __global__ void l2_probe_partitioned_kernel(
     }
     __syncthreads();
 
-    auto stage_hit = [&](uint64_t packed_key) {
-        uint32_t lslot = atomicAdd(&s_cnt, 1U);
-        if (lslot < GECKO_HIT_STAGE_CAP) {
-            s_hits[lslot] = packed_key;
-        } else {
-            if (*(volatile const uint32_t *)hit_count <= max_hits) {
-                uint32_t gslot = atomicAdd(hit_count, 1U);
-                if (gslot < max_hits) {
-                    out_hits[gslot] = packed_key;
-                }
-            }
-        }
-    };
-
     uint32_t q_idx = s_q_start + threadIdx.x;
     if (q_idx < s_q_end) {
         uint64_t h = d_q_hash[q_idx];
@@ -809,7 +806,8 @@ static __global__ void l2_probe_partitioned_kernel(
                                 }
                             }
                             if (emit) {
-                                stage_hit(pack_hit_key_tile(key_layout, 0U, posX, posY_orig));
+                                stage_hit_dev(s_hits, &s_cnt, out_hits, hit_count, max_hits,
+                                              pack_hit_key_tile(key_layout, 0U, posX, posY_orig));
                             }
                         }
                     }
@@ -834,7 +832,8 @@ static __global__ void l2_probe_partitioned_kernel(
                                 }
                             }
                             if (emit) {
-                                stage_hit(pack_hit_key_tile(key_layout, 1U, posX, posY_rc));
+                                stage_hit_dev(s_hits, &s_cnt, out_hits, hit_count, max_hits,
+                                              pack_hit_key_tile(key_layout, 1U, posX, posY_rc));
                             }
                         }
                     }

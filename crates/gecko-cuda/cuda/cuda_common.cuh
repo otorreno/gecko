@@ -9,6 +9,7 @@
 #ifndef GECKO_RUST_CUDA_COMMON_CUH
 #define GECKO_RUST_CUDA_COMMON_CUH
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
